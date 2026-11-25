@@ -254,6 +254,59 @@ class Session:
     async def remove_item(self, form_id, count=1):
         return await self.call("Player.removeItem", formID=form_id, count=count, loadEpoch=self.epoch)
 
+    # --- Menus by meaning (see docs/protocol.md, "Menu semantics") ---
+
+    async def ui_get(self, menu, path, depth=None):
+        return await self.call("UI.getVariable", **_params(menu=menu, path=path, depth=depth))
+
+    async def ui_set(self, menu, path, value):
+        return await self.call("UI.setVariable", menu=menu, path=path, value=value)
+
+    async def ui_invoke(self, menu, path, args=None, depth=None):
+        return await self.call("UI.invoke", **_params(menu=menu, path=path, args=args or [], depth=depth))
+
+    async def ui_dump(self, menu, path=None, depth=None):
+        return await self.call("UI.dump", **_params(menu=menu, path=path, depth=depth))
+
+    async def ui_call_delegate(self, menu, name, args=None):
+        return await self.call("UI.callDelegate", menu=menu, name=name, args=args or [])
+
+    async def message_box(self):
+        return await self.call("UI.messageBox")
+
+    async def message_box_select(self, index=None, text=None):
+        return await self.call("UI.messageBoxSelect", **_params(index=index, text=text))
+
+    async def show_message_box(self, text, buttons=None):
+        return await self.call("UI.showMessageBox", **_params(text=text, buttons=buttons))
+
+    async def list_items(self, menu):
+        return await self.call("UI.listItems", menu=menu)
+
+    async def select_item(self, menu, index=None, text=None, action=None, count=None):
+        return await self.call("UI.selectItem", **_params(menu=menu, index=index, text=text, action=action, count=count))
+
+    async def ui_list(self, menu):
+        return await self.call("UI.list", menu=menu)
+
+    async def ui_select(self, menu, index=None, text=None, path=None, press=None):
+        return await self.call("UI.select", **_params(menu=menu, index=index, text=text, path=path, press=press))
+
+    async def notifications(self, since=0):
+        return await self.call("UI.notifications", since=since)
+
+    async def subtitles(self):
+        return await self.call("UI.subtitles")
+
+    async def dialogue_state(self):
+        return await self.call("Dialogue.state")
+
+    async def dialogue_select(self, index=None, text=None):
+        return await self.call("Dialogue.select", **_params(index=index, text=text))
+
+    async def dialogue_start(self, ref_id=None):
+        return await self.call("Dialogue.start", **_params(refID=ref_id, loadEpoch=self.epoch))
+
     async def next_event(self, predicate, timeout):
         """Wait for a queued notification that satisfies predicate, discarding the others."""
         async with asyncio.timeout(timeout):
@@ -300,6 +353,11 @@ class Session:
         while not self.events.empty():
             drained.append(self.events.get_nowait())
         return drained
+
+
+def _params(**values):
+    """Drops unset optional parameters so the plugin applies its own defaults."""
+    return {key: value for key, value in values.items() if value is not None}
 
 
 async def observe(read, predicate, label, timeout):
