@@ -33,6 +33,19 @@ finishes later, its result is dropped. Server notifications have no `id`:
 | UI.openMenu / closeMenu | ui | name, wait?, anyState?, loadEpoch? | Any registered menu. `wait` replies once the menu actually opens or closes. Unless `anyState` is set, the world must be playable. |
 | UI.listMenus | ui | | `[{name, open}]` for every registered menu |
 | UI.isMenuOpen | ui | name | `{menu, open, ready}` |
+| UI.getVariable / dump | ui | menu, path, depth? | Bounded read of a Scaleform value of an open menu, from `_root` (`Menu_mc.ItemCard_mc`, numeric steps index arrays). Objects deeper than `depth` come back as `"[Object]"` and `truncated` marks the node cap. |
+| UI.setVariable / invoke | ui | menu, path, value / args | Writes a variable, or calls an ActionScript function and returns its result |
+| UI.callDelegate | ui | menu, name, args? | Calls a native function the menu registered on its GameDelegate |
+| UI.showMessageBox | ui | text, buttons? (1-4) | Raises a message box. `UI.messageBox` then reports `lastAnswer`. |
+| UI.messageBox | ui | | `{open, text, buttons:[{index, text}], cancelIndex, cancellable}`, or `{open:false, lastAnswer}` |
+| UI.messageBoxSelect | ui | index or text | Presses a button (text matches exactly ignoring case, else a unique substring) |
+| UI.listItems | ui | menu | `{count, selectedIndex, items:[{index, name, count, equipped, equipState, category, favorited, formId, value, weight, owner?}]}` for InventoryMenu, ContainerMenu, BarterMenu, FavoritesMenu. The list is the menu's own cached one: after an equip it shows the old state until the menu is reopened. |
+| UI.selectItem | ui | menu, index or text, action?, count? | `equip`/`use`/`unequip`/`drop` (Inventory, default `equip`), `take`/`transfer` (Container, Barter), through the game's equip and inventory APIs |
+| UI.list / UI.select | ui | menu, index or text, path?, press? | Entries of other list menus and picking one |
+| UI.notifications / subtitles | any / ui | since? | Recent HUD notifications `{seq, text}`; subtitles on screen now |
+| Dialogue.state | ui | | `{open, speaker:{refId, name}, greeting, waitingToAdvance, topics:[{index, text, neverSaid}], subtitles}` |
+| Dialogue.select | ui | index or text | Picks a topic through the dialogue menu's own `TopicClicked` handler |
+| Dialogue.start | main | refID?, loadEpoch? | Activates an NPC (default the nearest living actor) |
 | Console.execute | main | command, target?, loadEpoch? | Runs any console command. `target` is `selected` (default), `player` or `none`. Returns `{command, lines}`, every line printed while it ran. |
 | Console.history | any | since? | Recent console lines from any source, `{lastSeq, lines:[{line, lineSeq}]}` |
 | Input.key | any | key, phase?, holdMs? | DirectInput scancode (1-255) or name (`Tab`, `E`, `Grave`, `F1` ...). `phase` is `tap` (default), `down` or `up`. |
@@ -69,7 +82,7 @@ screen, and a menu ignores input during its opening transition of about 0.2 s, s
 
 Event types are `menuOpenClose {menu, opening}`, `loadGame {success, name, loadEpoch}`,
 `cellChange {formId, name, editorId, entered}`, `console {line, lineSeq}` and `frameHitch {frame, ms, thresholdMs}`
-(only while `Perf.configure` set a `hitchMs` threshold).
+(only while `Perf.configure` set a `hitchMs` threshold). `hudNotification {text, seq}` and `subtitle {speaker, text}` are pushed to subscribers.
 
 The frame hook is a MinHook detour on `IDXGISwapChain::Present` of the renderer's main swap chain.
 When no capture is pending it reads a clock, appends one sample to a ring and loads one atomic.

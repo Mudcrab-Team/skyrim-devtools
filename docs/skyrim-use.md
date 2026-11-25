@@ -40,7 +40,7 @@ server speaks plain stdio. When the client exits the server stops the game, so a
 | Observe | `snapshot`, `list_menus {open_only}`, `events_list`, `events_subscribe`, `events_drain {types?, limit}`, `wait_for` |
 | Act | `open_menu`, `close_menu`, `console {command, target}`, `press_key`, `press_control`, `mouse`, `release_all_input`, `look {yaw_deg, pitch_deg}` |
 | Saves and world | `list_saves`, `load_save`, `reload`, `center_on_cell` |
-| State (newer plugin builds) | `player_state`, `player_inventory`, `world_nearby`, `world_crosshair`, `quest_get`, `quest_active`, `message_box`, `message_box_select`, `dialogue_state`, `dialogue_select`, `ui_list_items`, `ui_select_item`, `screenshot` (image), `perf_frame_stats`, `papyrus_log` |
+| State (newer plugin builds) | `player_state`, `player_inventory`, `world_nearby`, `world_crosshair`, `quest_get`, `quest_active`, `message_box`, `message_box_select`, `dialogue_state`, `dialogue_select`, `ui_list_items`, `ui_select_item`, `ui_dump`, `ui_get`, `ui_set`, `ui_invoke`, `ui_list`, `dialogue_start`, `screenshot` (image), `perf_frame_stats`, `papyrus_log` |
 | Generic | `rpc_methods`, `rpc_call {method, params}` |
 
 The state tools wrap native methods that older plugin builds lack. They answer "method X is not available in
