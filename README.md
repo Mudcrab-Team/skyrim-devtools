@@ -58,6 +58,28 @@ cmake -S native -B "$scratch/build" -G "Visual Studio 17 2022" -A x64 -DCMAKE_TO
 cmake --build "$scratch/build" --config Release --parallel 6
 ~~~
 
+### Fast builds from the Mac
+
+`tools/pc-build` (Python, runs on the Mac, same `--config` as the smoke runner or
+`SKYRIM_DEVTOOLS_CONFIG`) builds the plugin on the test PC with Ninja in a persistent build
+directory per worktree. It sends only the source files whose content changed, so Ninja
+recompiles just those. The DLL target uses a precompiled header (`native/pch.h`).
+
+~~~sh
+tools/pc-build commonlib          # once per CommonLib pin: shared Release build, installed under the scratch root
+tools/pc-build                    # incremental build, prints timings
+tools/pc-build --deploy --lock-wait 900   # build, then copy the DLL while holding agent.lock
+tools/pc-build lock --lock-wait 900       # hold agent.lock for a live run, release with: tools/pc-build unlock
+~~~
+
+Without the shared CommonLib the build falls back to compiling it inside the build directory
+(`-DCOMMONLIB_PREFIX` selects the prebuilt one; `commonlib-options.cmake` keeps both paths on the
+same ABI options). `--deploy` refuses unless it can create `agent.lock` atomically (or already
+owns it) and never copies while another agent holds it; `--keep-lock` keeps it for the live run.
+Measured on the test PC: shared CommonLib 2 min once, cold plugin build 16 s, rebuild after
+editing one module 2 to 6 s, rebuild of every module 15 s (the Visual Studio generator took 7.6 min cold and
+2.5 min after any full source resync).
+
 ## Offline desktop setup
 
 On the interactive test account, use %USERPROFILE%\.local\skyrim-devtools as the

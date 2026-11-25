@@ -1,0 +1,150 @@
+#!/usr/bin/env python3.13
+"""Build the SKSE plugin on the Windows test PC from this worktree (SPDX-License-Identifier: GPL-3.0-or-later).
+
+  tools/pc-build --config mac.json                   incremental build
+  tools/pc-build --config mac.json --deploy          build, then copy the DLL while holding agent.lock
+  tools/pc-build --config mac.json commonlib         (re)build the shared CommonLibSSE-NG once
+  tools/pc-build --config mac.json lock|unlock       hold agent.lock around a live run
+"""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+
+REPO = Path(__file__).resolve().parent.parent
+REMOTE_ROOT = r".local\skyrim-devtools"
+SYNC_DIRS = ["native"]
+NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,40}")
+
+
+def fail(message, code=1):
+    print(f"pc-build: {message}", file=sys.stderr)
+    sys.exit(code)
+
+
+class Host:
+    def __init__(self, config):
+        destination = config["sshDestination"]
+        if not isinstance(destination, str) or not destination or destination.startswith("-"):
+            fail("Set an SSH destination or alias in the local configuration")
+        opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15"]
+        if path := config.get("sshConfig"):
+            opts += ["-F", str(Path(path).expanduser())]
+        self.opts = opts
+        self.destination = destination
+
+    def run(self, command, check=True, stream=False):
+        argv = ["ssh", *self.opts, "-T", self.destination, command]
+        if stream:
+            return subprocess.run(argv).returncode
+        result = subprocess.run(argv, capture_output=True, text=True)
+        if check and result.returncode:
+            fail(f"remote command failed ({result.returncode}): {result.stderr.strip()[:400]}")
+        return result
+
+    def put(self, local, remote):
+        result = subprocess.run(["scp", "-q", *self.opts, str(local), f"{self.destination}:{remote}"],
+                                capture_output=True, text=True)
+        if result.returncode:
+            fail(f"scp failed: {result.stderr.strip()[:400]}")
+
+
+def scan():
+    files = {}
+    for directory in SYNC_DIRS:
+        for path in sorted((REPO / directory).rglob("*")):
+            if path.is_file() and "__pycache__" not in path.parts:
+                relative = path.relative_to(REPO).as_posix()
+                files[relative] = hashlib.sha1(path.read_bytes()).hexdigest()
+    return files
+
+
+def sync(host, name, full):
+    """Ship only files whose content changed; unchanged files keep their remote mtime so Ninja skips them."""
+    state_file = REPO / "build" / f"pc-build-{name}.json"
+    previous = {}
+    if state_file.exists() and not full:
+        previous = json.loads(state_file.read_text())
+    current = scan()
+    changed = [f for f, digest in current.items() if previous.get(f) != digest]
+    removed = [f for f in previous if f not in current]
+    if changed or removed or full or not previous:
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "src.tar"
+            manifest = Path(tmp) / "removed.txt"
+            manifest.write_text("\n".join(r.removeprefix("native/") for r in removed))
+            with tarfile.open(archive, "w") as tar:
+                for relative in changed:
+                    tar.add(REPO / relative, arcname=relative.removeprefix("native/"))
+                tar.add(manifest, arcname="removed.txt")
+            host.put(archive, rf"{REMOTE_ROOT}\pc-build-{name}.tar")
+        wipe = " -Wipe" if (full or not previous) else ""
+        code = run_remote(host, f"-Action sync -Name {name}{wipe}")
+        if code:
+            fail("remote extract failed")
+    state_file.parent.mkdir(exist_ok=True)
+    state_file.write_text(json.dumps(current))
+    return len(changed), len(removed)
+
+
+def run_remote(host, args):
+    script = REPO / "tools" / "pc_build_remote.ps1"
+    host.put(script, rf"{REMOTE_ROOT}\pc_build_remote.ps1")
+    command = (rf"powershell -NoProfile -ExecutionPolicy Bypass -File "
+               rf"{REMOTE_ROOT}\pc_build_remote.ps1 {args}")
+    return host.run(command, stream=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("command", nargs="?", default="build", choices=["build", "commonlib", "lock", "unlock"])
+    parser.add_argument("--config", type=Path, default=os.environ.get("SKYRIM_DEVTOOLS_CONFIG"))
+    parser.add_argument("--name", default=REPO.name, help="build directory and agent name (default: worktree name)")
+    parser.add_argument("--deploy", action="store_true", help="copy the DLL into the game while holding agent.lock")
+    parser.add_argument("--keep-lock", action="store_true", help="with --deploy: keep agent.lock for the live run")
+    parser.add_argument("--lock-wait", type=int, default=0, metavar="SECONDS", help="wait this long for agent.lock")
+    parser.add_argument("--full", action="store_true", help="resend every source file")
+    parser.add_argument("--reconfigure", action="store_true", help="delete the build directory first")
+    parser.add_argument("--no-prebuilt", action="store_true", help="compile CommonLib inside the build directory")
+    options = parser.parse_args()
+    if not options.config:
+        fail("pass --config or set SKYRIM_DEVTOOLS_CONFIG")
+    if not NAME_RE.fullmatch(options.name):
+        fail("name must be letters, digits, dot, dash or underscore")
+    host = Host(json.loads(options.config.read_text()))
+    started = time.monotonic()
+
+    if options.command in {"lock", "unlock"}:
+        sys.exit(run_remote(host, f"-Action {options.command} -Agent {options.name} -LockWait {options.lock_wait}"))
+
+    t = time.monotonic()
+    changed, removed = sync(host, options.name, options.full)
+    print(f"[time] sync {time.monotonic() - t:.1f}s ({changed} changed, {removed} removed)")
+    flags = f"-Name {options.name}"
+    if options.command == "commonlib":
+        code = run_remote(host, f"-Action commonlib {flags}")
+    else:
+        flags += " -Action build"
+        if options.deploy:
+            flags += f" -Deploy -Agent {options.name} -LockWait {options.lock_wait}"
+            if options.keep_lock:
+                flags += " -KeepLock"
+        if options.reconfigure:
+            flags += " -Reconfigure"
+        if options.no_prebuilt:
+            flags += " -NoPrebuilt"
+        code = run_remote(host, flags)
+    print(f"[time] total {time.monotonic() - started:.1f}s")
+    sys.exit(code)
+
+
+if __name__ == "__main__":
+    main()
