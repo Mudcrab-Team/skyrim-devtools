@@ -391,7 +391,7 @@ DEVTOOLS_MODULE(Logs)
         out["statsUpdates"] = updates;
         if (const auto vm = RE::BSScript::Internal::VirtualMachine::GetSingleton()) {
             // The live table is authoritative; the stats event only refreshes while the VM publishes it.
-            RE::BSAutoLock<RE::BSSpinLock> lock(vm->runningStacksLock);
+            RE::BSSpinLockGuard lock(vm->runningStacksLock);
             out["activeStacks"] = vm->allRunningStacks.size();
             out["overstressed"] = vm->overstressed;
         }

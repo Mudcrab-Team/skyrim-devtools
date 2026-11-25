@@ -63,6 +63,31 @@ Event types are `menuOpenClose {menu, opening}`, `loadGame {success, name, loadE
 The frame hook is a MinHook detour on `IDXGISwapChain::Present` of the renderer's main swap chain.
 When no capture is pending it reads a clock, appends one sample to a ring and loads one atomic.
 
+### Logs, game events and liveness
+
+| Method | Thread | Params | Result and meaning |
+| --- | --- | --- | --- |
+| Papyrus.log | any | since?, level?, limit?, contains? | Lines the script VM logged, `{lines:[{seq, ms, severity, text}], lastSeq, dropped, counts, hooked}`. Taken from the VM's own log event; severity is info, warning, error or fatal. |
+| Papyrus.stats | main | | `{runningStacks, suspendedStacks, functionMessages, detachedObjects, activeStacks, overstressed, logCounts}` |
+| Logs.tail | any | source (`papyrus`, `skse`, `plugin`, `rpc`), lines? | Last lines of the file, `{lines, truncated, origin}` |
+| Health.heartbeat | any | | `{uptimeMs, main:{stalledMs, lastLatencyMs}, ui:{...}}`. Answered by the connection thread; `stalledMs` is how long an unanswered probe has waited on that game thread, so a frozen thread shows as a growing number. |
+| GameEvents.configure | any | containerPlayerOnly? | `containerChanged` is limited to moves involving the player by default |
+| GameEvents.counts | any | | `{type:{seen, emitted}}` per game event, counting events nobody subscribed to |
+
+Game event types: `combat {actor, target, state}`, `death {victim, killer, dead}`,
+`hit {aggressor, target, source, projectile, flags}`, `containerChanged {item, count, from, to}`,
+`questStage {quest, stage}`, `activate {activator, target}`, `equip {actor, item, equipped}`,
+`levelUp {level}`, `spellCast {caster, spell}`, `magicEffectApply {target, caster, effect}` and
+`papyrus {seq, severity, text}`. References are `{id, base?, name?}`. Payloads are built only
+while the type is subscribed.
+
+The host enables Papyrus logging, tracing and debug information in the per-run Skyrim.ini and
+removes earlier Papyrus logs. A crashed, forced or unexpectedly exited run gets
+`runs/<session>/evidence/` (Papyrus, SKSE, plugin and RPC tails plus Windows crash events);
+`host.ps1 evidence` prints a summary, and state.json carries `hung` and `evidence`.
+A separate crash-logging DLL would give stack traces but is not used while the plugin
+stays the only SKSE DLL.
+
 ## Errors
 
 | Code | Meaning |
