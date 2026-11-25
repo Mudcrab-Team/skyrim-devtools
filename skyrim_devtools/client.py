@@ -198,6 +198,7 @@ class Session:
         if ring_size is not None:
             params["ringSize"] = ring_size
         return await self.call("Perf.configure", **params)
+
     # Structured game-state queries. Results are compact JSON; form IDs are 8-digit hex strings.
 
     async def player_state(self, avs=None):
