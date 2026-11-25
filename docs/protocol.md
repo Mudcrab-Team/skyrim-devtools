@@ -39,6 +39,17 @@ finishes later, its result is dropped. Server notifications have no `id`:
 | Input.control | any | name, phase?, holdMs? | ControlMap user event (`Journal`, `Tween Menu`, `Activate` ...), resolved to its bound key in the innermost active input context |
 | Input.mouse | any | dx, dy or button, phase?, holdMs? | Relative motion, or button `left`, `right`, `middle` or 0-7 |
 | Input.releaseAll / Input.stats | any | | Releases held keys / `{hooked, polls, msSinceLastPoll, injectedButtons, injectedMoves}` |
+| Player.state | main | avs? | Position, rotation (deg), cell, worldspace, health/magicka/stamina, level, gold, carry weight, stance flags, active effects. `avs` adds named actor values. |
+| Player.inventory | main | filter?, limit? | `{total, items:[{formID, name, type, count, value, weight, equipped}]}`. Filter: weapon, armor, ammo, potion, ingredient, book, misc, key, scroll, soulgem, note, or a 4-letter record type. |
+| Player.equipped / Player.spells | main | kind?, limit? (spells) | Hands, worn armor with slots; known spells, powers and shouts |
+| World.nearby | main | radius?, types?, limit? | References sorted by distance: actor, container, door, item, activator, furniture, flora. Actors carry level, healthPct, hostile, dead, inCombat, race. |
+| World.crosshair | main | | `{ref}` under the crosshair with the activation `prompt`, or null |
+| Form.get / Ref.get | main | formID or editorID / refID | Basic form or reference info. Editor IDs resolve only for record types the engine keeps them for. |
+| Quest.get / Quest.active | main | editorID or formID, allObjectives? / limit? | Stage, flags, objectives with state; quests with a displayed objective |
+| Global.get / Game.time | main | editorID or formID / | Global value; hour, day, month, year, daysPassed, timescale |
+| Game.setTimescale | main | value | Sets the TimeScale global, returns the time |
+| Player.teleport | main | x,y,z or refID, yawDeg? | Position set, or MoveTo a reference (queued by the engine, so the reply carries the target) |
+| Player.setAV / addItem / removeItem | main | av,value / formID,count | Return before and after values |
 | Player.look | main | yawDeg?, pitchDeg? | Turns the player by the given amount, relative to the current view. Pitch is clamped to ±85°. |
 | World.centerOnCell | main | cell, loadEpoch? | `coc <cell>`, returns the console lines |
 | Screen.capture | any (deferred) | maxWidth? (1024), format? (`png` or `jpeg`), quality? (85, jpeg), includeUI? (true), path? | Reads the game's own swap-chain back buffer on the render thread just before Present, so it works headless and off-screen and never uses desktop capture. Scales down (never up) and encodes with WIC. Returns `{frame, width, height, sourceWidth, sourceHeight, format, bytes, data, readbackMs, encodeMs, totalMs}` with base64 `data`. With `path` (a plain file name) the image is written to the run's `screens/` directory and `path` replaces `data`. `includeUI: false` hides menus and the HUD for a few frames and restores them. |
