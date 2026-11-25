@@ -14,7 +14,7 @@ finishes later, its result is dropped. Server notifications have no `id`:
 
 `Session.getInfo` returns the protocol number, build, image hash, session id, `dataLoaded`,
 `loadEpoch`, `headless`, `capabilities` (`console`, `events`, `headless`, `input`, `loadSave`,
-`menus`), every registered method with its thread and timeout, and bus counters.
+`menus`, `perf`, `screen`), every registered method with its thread and timeout, and bus counters.
 
 ## Methods
 
@@ -41,6 +41,10 @@ finishes later, its result is dropped. Server notifications have no `id`:
 | Input.releaseAll / Input.stats | any | | Releases held keys / `{hooked, polls, msSinceLastPoll, injectedButtons, injectedMoves}` |
 | Player.look | main | yawDeg?, pitchDeg? | Turns the player by the given amount, relative to the current view. Pitch is clamped to ±85°. |
 | World.centerOnCell | main | cell, loadEpoch? | `coc <cell>`, returns the console lines |
+| Screen.capture | any (deferred) | maxWidth? (1024), format? (`png` or `jpeg`), quality? (85, jpeg), includeUI? (true), path? | Reads the game's own swap-chain back buffer on the render thread just before Present, so it works headless and off-screen and never uses desktop capture. Scales down (never up) and encodes with WIC. Returns `{frame, width, height, sourceWidth, sourceHeight, format, bytes, data, readbackMs, encodeMs, totalMs}` with base64 `data`. With `path` (a plain file name) the image is written to the run's `screens/` directory and `path` replaces `data`. `includeUI: false` hides menus and the HUD for a few frames and restores them. |
+| Perf.frameStats | any | window? (seconds, default all buffered) | `{frame, count, meanMs, p50Ms, p95Ms, p99Ms, minMs, maxMs, fps, hitches, lastHitchFrame, hitchMs}` over the Present-to-Present intervals in the window. |
+| Perf.reset | any | | Clears the frame-time ring and the hitch count |
+| Perf.configure | any | hitchMs? (0 or null is off, the default), ringSize? (64-1000000 frames, default 20000) | Returns the current settings. Changing `ringSize` clears the ring. |
 | Window.place | ui | mode | `offscreen`, `hide`, `minimize` or `restore` |
 
 Mutations that take `loadEpoch` fail with `-32005` and the current epoch when the world was
@@ -53,7 +57,11 @@ screen, and a menu ignores input during its opening transition of about 0.2 s, s
 `Fader Menu` to close and give a fresh menu a moment before sending keys.
 
 Event types are `menuOpenClose {menu, opening}`, `loadGame {success, name, loadEpoch}`,
-`cellChange {formId, name, editorId, entered}` and `console {line, lineSeq}`.
+`cellChange {formId, name, editorId, entered}`, `console {line, lineSeq}` and `frameHitch {frame, ms, thresholdMs}`
+(only while `Perf.configure` set a `hitchMs` threshold).
+
+The frame hook is a MinHook detour on `IDXGISwapChain::Present` of the renderer's main swap chain.
+When no capture is pending it reads a clock, appends one sample to a ring and loads one atomic.
 
 ## Errors
 

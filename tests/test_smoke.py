@@ -1,5 +1,8 @@
 import asyncio
+import base64
 import json
+import tempfile
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
@@ -114,6 +117,19 @@ class InputSocket(ToySocket):
         return super().handle(method, params)
 
 
+class ScreenSocket(InputSocket):
+    PNG = b"\x89PNG\r\n\x1a\n toy"
+
+    def handle(self, method, params):
+        if method == "Screen.capture":
+            assert params["maxWidth"] == 1024 and params["includeUI"] is True
+            return {"frame": 7, "width": 1024, "height": 576, "format": "png",
+                    "data": base64.b64encode(self.PNG).decode()}
+        if method == "Perf.frameStats":
+            return {"count": 600, "meanMs": 16.7, "fps": 59.9, "window": params.get("window")}
+        return super().handle(method, params)
+
+
 class ToyHost:
     local_port = 48681
 
@@ -165,6 +181,17 @@ class DevToolsSmokeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(names.count("Session.reload"), 1)
         self.assertIn("reloadSeconds", timings)
         self.assertNotIn(INVENTORY, socket.menus)
+
+    async def test_screenshot_writes_both_views_and_samples_frame_times(self):
+        socket = ScreenSocket()
+        timings = {}
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "shot.png"
+            await exercise(Session(socket, SESSION_ID), Counts(), 1, tab_trials=1, timings=timings, screenshot=target)
+            self.assertEqual(target.read_bytes(), ScreenSocket.PNG)
+            self.assertEqual((Path(folder) / "shot-inventory.png").read_bytes(), ScreenSocket.PNG)
+        self.assertNotIn("data", timings["screenshots"]["world"])
+        self.assertEqual(timings["frameStats"]["window"], 10)
 
     async def test_load_failure_stops_before_menu_operations(self):
         socket = ToySocket()

@@ -6,7 +6,9 @@ timed-out call raises RpcError(-32008) and leaves the session usable.
 """
 
 import asyncio
+import base64
 import json
+from pathlib import Path
 
 
 PROTOCOL = 2
@@ -164,6 +166,29 @@ class Session:
 
     async def center_on_cell(self, cell):
         return await self.call("World.centerOnCell", cell=cell, loadEpoch=self.epoch)
+
+    async def capture(self, path=None, max_width=1024, format="png", quality=85, include_ui=True):
+        """Grab the game's rendered frame. With a path, write the image there and return the result
+        without its base64 payload; without one, the result keeps it in `data`."""
+        result = await self.call("Screen.capture", maxWidth=max_width, format=format, quality=quality,
+                                 includeUI=include_ui)
+        if path is not None:
+            Path(path).write_bytes(base64.b64decode(result.pop("data")))
+        return result
+
+    async def frame_stats(self, window=None):
+        return await self.call("Perf.frameStats", **({} if window is None else {"window": window}))
+
+    async def perf_reset(self):
+        return await self.call("Perf.reset")
+
+    async def perf_configure(self, hitch_ms=None, ring_size=None):
+        params = {}
+        if hitch_ms is not None:
+            params["hitchMs"] = hitch_ms
+        if ring_size is not None:
+            params["ringSize"] = ring_size
+        return await self.call("Perf.configure", **params)
 
     async def next_event(self, predicate, timeout):
         """Wait for a queued notification that satisfies predicate, discarding the others."""
