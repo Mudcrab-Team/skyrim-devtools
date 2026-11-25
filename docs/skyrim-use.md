@@ -30,7 +30,7 @@ server speaks plain stdio. When the client exits the server stops the game, so a
 * The game ignores all input while the load fade is on screen, and a menu ignores input for about 0.3 s after it
   opens. `wait_for(playable=true)` accounts for the fade; after `open_menu` wait for the menu, then give it a beat.
 * Do not close the socket without stopping through the host: the game exits on its own, and the host records
-  that as `unrequested-exit`. `game_stop` stops through the host first and reports `cleanExit`.
+  that as `unrequested-exit`. `game_stop` closes open gameplay menus (shutting down with the inventory open crashed the game), stops through the host and reports `cleanExit`.
 
 ## Tools
 

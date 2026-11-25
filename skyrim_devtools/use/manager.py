@@ -20,6 +20,7 @@ EVENT_BUFFER = 5000
 # console lines are already returned by the console tool, so subscribing would only add noise
 QUIET_EVENTS = {"console"}
 NOT_READY = -32004
+KEEP_OPEN = {"HUD Menu", "Cursor Menu", "Main Menu", "Fader Menu", "LoadWaitSpinner", "Mist Menu"}
 HINTS = {
     -32004: "the game is not ready yet (still starting, or no save is loaded); retry shortly",
     -32005: "the world was reloaded since you last looked; take a fresh snapshot",
@@ -249,6 +250,18 @@ class GameManager:
             task.cancel()
         await self._close_link()
 
+    async def _close_game_menus(self):
+        """Shutting the game down with a gameplay menu open crashed it, so close those first (best effort)."""
+        if self.session is None or self.session._closed is not None:
+            return
+        try:
+            state = await self.session.call("Events.snapshot", timeout=8)
+            for menu in state["menus"]:
+                if menu["name"] not in KEEP_OPEN:
+                    await self.session.call("UI.closeMenu", timeout=8, name=menu["name"], wait=True)
+        except Exception:
+            pass
+
     async def stop(self):
         async with self.lock:
             if self.session_id is None or self.phase in {"idle", "stopped"}:
@@ -256,6 +269,7 @@ class GameManager:
             task, self.keepalive_task = self.keepalive_task, None
             if task is not None:
                 task.cancel()
+            await self._close_game_menus()
             # stop through the host first: dropping the socket beforehand makes the game exit on its own,
             # which the host then records as an unrequested exit instead of a clean stop
             try:
