@@ -12,6 +12,7 @@ import re
 import subprocess
 
 from .client import INVENTORY, MAX_MESSAGE, Session, observe
+from .logs import classify_outcome
 
 
 ACTIVE = {"starting", "running"}
@@ -47,7 +48,7 @@ class WindowsHost:
             raise ValueError("Local port must be between 1024 and 65535")
 
     async def command(self, action, session_id="", mode=""):
-        if action not in {"start", "status", "stop"} or (session_id and not re.fullmatch("[a-f0-9]{32}", session_id)):
+        if action not in {"start", "status", "stop", "evidence"} or (session_id and not re.fullmatch("[a-f0-9]{32}", session_id)):
             raise ValueError("Invalid Windows session operation")
         if mode not in {"", "headless", "windowed"}:
             raise ValueError("Invalid display mode")
@@ -98,6 +99,17 @@ class WindowsHost:
             "-L", f"127.0.0.1:{self.local_port}:127.0.0.1:{port}", self.destination,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+
+
+async def stop_outcome(host, state, session_id):
+    """Classifies a finished run; an abnormal end is paired with the evidence the host saved."""
+    evidence = None
+    if state.get("evidence"):
+        try:
+            evidence = await host.command("evidence", session_id)
+        except (RuntimeError, TimeoutError, ValueError):
+            pass
+    return classify_outcome(state, evidence)
 
 
 async def exercise(session, counts, cycles, session_only=False, tab_trials=20, timings=None, screenshot=None):
@@ -235,10 +247,11 @@ async def run(host, connect_ws, counts, cycles, session_only, tab_trials=20, mod
     finally:
         try:
             stopped = await host.stop(session_id)
-            if stopped["phase"] == "stopped" and stopped["exitCode"] == 0:
+            outcome = await stop_outcome(host, stopped, session_id)
+            if outcome.clean:
                 counts.clean_stops += 1
-            elif stopped["phase"] not in {"failed", "cancelled"} or counts.loaded:
-                raise RuntimeError(f"Windows game did not stop cleanly ({stopped['phase']}, {stopped['reason']})")
+            elif outcome.kind != "startup-failure" or counts.loaded:
+                raise RuntimeError(f"Windows game did not stop cleanly - {outcome.summary}")
         except Exception as error:
             if scenario_failure is None:
                 raise

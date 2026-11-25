@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('install-task', 'start', 'run', 'status', 'stop')]
+    [ValidateSet('install-task', 'start', 'run', 'status', 'stop', 'evidence')]
     [string] $Action,
     [ValidatePattern('^[a-f0-9]{32}$')]
     [string] $Session,
@@ -190,6 +190,10 @@ function Write-ProfileSettings($Headless, $Config) {
     Assert-PrivateDirectory $originals
     $main = [IO.File]::ReadAllText((Join-Path $originals 'Skyrim.ini'))
     $prefs = [IO.File]::ReadAllText((Join-Path $originals 'SkyrimPrefs.ini'))
+    # Script errors are the first sign of a broken mod, so every run records them with line numbers.
+    $main = Set-IniValue $main 'Papyrus' 'bEnableLogging' '1'
+    $main = Set-IniValue $main 'Papyrus' 'bEnableTrace' '1'
+    $main = Set-IniValue $main 'Papyrus' 'bLoadDebugInformation' '1'
     if ($Headless) {
         $width = if ($Config.width -is [int]) { $Config.width } else { 1280 }
         $height = if ($Config.height -is [int]) { $Config.height } else { 720 }
@@ -206,6 +210,63 @@ function Write-ProfileSettings($Headless, $Config) {
     }
     [IO.File]::WriteAllText((Join-Path $profile 'Skyrim.ini'), $main)
     [IO.File]::WriteAllText((Join-Path $profile 'SkyrimPrefs.ini'), $prefs)
+}
+
+function Reset-GameLogs {
+    # A run's evidence must hold only that run's lines, so logs from earlier runs are removed.
+    $scripts = Join-Path $profile 'Logs\Script'
+    if (Test-Path -LiteralPath $scripts) {
+        Assert-PrivateDirectory $scripts
+        Get-ChildItem -LiteralPath $scripts -File -Filter 'Papyrus*.log' | Remove-Item -Force
+    }
+}
+
+function Get-CrashEvents($Since) {
+    try {
+        $found = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $Since } -ErrorAction Stop |
+            Where-Object { $_.ProviderName -in @('Application Error', 'Windows Error Reporting', 'Application Hang') -and
+                           $_.Message -match 'SkyrimSE' })
+    } catch {
+        return @()
+    }
+    foreach ($record in ($found | Select-Object -First 10)) {
+        $entry = @{ time = $record.TimeCreated.ToUniversalTime().ToString('o'); id = $record.Id; provider = $record.ProviderName }
+        if ($record.Id -eq 1000 -and $record.Properties.Count -ge 8) {
+            $entry.faultingModule = [string] $record.Properties[3].Value
+            $entry.exceptionCode = [string] $record.Properties[6].Value
+            $entry.faultOffset = [string] $record.Properties[7].Value
+        }
+        $entry.message = (($record.Message -split "`r?`n") | Select-Object -First 12) -join "`n"
+        $entry
+    }
+}
+
+function Save-Tail($Source, $Destination, $Lines) {
+    if (Test-Path -LiteralPath $Source) {
+        Get-Content -LiteralPath $Source -Tail $Lines -ErrorAction SilentlyContinue |
+            Set-Content -LiteralPath $Destination -Encoding UTF8
+    }
+}
+
+function Save-Evidence($Run, $Phase, $Reason, $ExitCode, $Started, $Hung) {
+    # Everything that explains an abnormal end, gathered before the next launch can overwrite it.
+    $evidence = Join-Path $Run 'evidence'
+    New-Item -ItemType Directory -Path $evidence -Force | Out-Null
+    $scripts = Join-Path $profile 'Logs\Script'
+    $papyrus = if (Test-Path -LiteralPath $scripts) {
+        Get-ChildItem -LiteralPath $scripts -File -Filter 'Papyrus*.log' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    }
+    if ($papyrus) { Save-Tail $papyrus.FullName (Join-Path $evidence 'papyrus-tail.log') 300 }
+    Save-Tail (Join-Path $profile 'SKSE\skse64.log') (Join-Path $evidence 'skse64-tail.log') 200
+    Save-Tail (Join-Path $Run 'rpc.jsonl') (Join-Path $evidence 'rpc-tail.jsonl') 100
+    Save-Tail (Join-Path $Run 'devtools.log') (Join-Path $evidence 'plugin-tail.log') 200
+    $summary = @{
+        phase = $Phase; reason = $Reason; exitCode = $ExitCode; hung = $Hung
+        exitCodeHex = if ($null -ne $ExitCode) { '0x{0:X8}' -f [uint32] ([BitConverter]::ToUInt32([BitConverter]::GetBytes([int] $ExitCode), 0)) } else { $null }
+        crashEvents = @(if ($Started) { Get-CrashEvents $Started })
+        files = @(Get-ChildItem -LiteralPath $evidence -File | ForEach-Object Name)
+    }
+    Write-Json $summary (Join-Path $evidence 'evidence.json')
 }
 
 function Stage-Saves {
@@ -259,6 +320,7 @@ function Preflight($Config, $Headless) {
     Assert-LocalProfile
     Write-ProfileSettings $Headless $Config
     Assert-LocalProfile
+    Reset-GameLogs
     Assert-PrivateDirectory $games
     $data = Join-Path $games 'Data'
     $skse = Join-Path $data 'SKSE'
@@ -297,6 +359,8 @@ function Run-Game {
     $reason = 'preflight'
     $exitCode = $null
     $digest = $null
+    $started = $null
+    $hung = $false
     try {
         if (Test-Path -LiteralPath $stop) {
             $phase = 'cancelled'
@@ -329,6 +393,7 @@ function Run-Game {
         if (!$game) { throw 'Loader did not produce a staged game process' }
         # Keep the handle open so the exit code remains available after the process exits.
         $null = $game.Handle
+        $started = $game.StartTime
 
         $running = Result 'running'
         $running.fixtureSha256 = $digest
@@ -336,10 +401,28 @@ function Run-Game {
         Write-Json $running $state
         $reason = 'watchdog'
         $deadline = if ($watchdog -gt 0) { [DateTime]::UtcNow.AddMinutes($watchdog) } else { [DateTime]::MaxValue }
+        $nextProbe = [DateTime]::UtcNow.AddSeconds(5)
+        $unresponsiveSince = $null
         while (!$game.WaitForExit(250)) {
+            if ([DateTime]::UtcNow -ge $nextProbe) {
+                # A window that stops pumping messages for a minute is a hang, not a slow load.
+                $nextProbe = [DateTime]::UtcNow.AddSeconds(5)
+                $game.Refresh()
+                if ($game.Responding) {
+                    $unresponsiveSince = $null
+                } elseif (!$unresponsiveSince) {
+                    $unresponsiveSince = [DateTime]::UtcNow
+                } elseif (!$hung -and [DateTime]::UtcNow -ge $unresponsiveSince.AddSeconds(60)) {
+                    $hung = $true
+                    $running.hangSuspectedSince = $unresponsiveSince.ToString('o')
+                    Write-Json $running $state
+                }
+            }
             if ((Test-Path -LiteralPath $stop) -or [DateTime]::UtcNow -ge $deadline) {
                 $reason = if (Test-Path -LiteralPath $stop) { 'requested' } else { 'watchdog' }
                 if ($game.CloseMainWindow() -and $game.WaitForExit(12000)) { break }
+                $game.Refresh()
+                if (!$game.HasExited -and !$game.Responding) { $hung = $true }
                 $phase = 'forced'
                 return
             }
@@ -378,6 +461,15 @@ function Run-Game {
         Remove-Item -LiteralPath (Join-Path $run 'request.json') -ErrorAction SilentlyContinue
         $final = Result $phase $reason $exitCode
         if ($digest) { $final.fixtureSha256 = $digest }
+        $final.hung = $hung
+        if ($game -and ($phase -in @('crashed', 'forced') -or ($phase -eq 'exited' -and $reason -eq 'unrequested-exit'))) {
+            try {
+                Save-Evidence $run $phase $reason $exitCode $started $hung
+                $final.evidence = 'evidence'
+            } catch {
+                $_.Exception.Message | Set-Content -LiteralPath (Join-Path $run 'evidence-error.txt') -Encoding UTF8
+            }
+        }
         Write-Json $final $state
         Remove-Item -LiteralPath $lease
     }
@@ -425,6 +517,22 @@ switch ($Action) {
     'status' {
         if (!$Session) { throw 'Session id is required' }
         Get-Content -LiteralPath (Join-Path $runs "$Session\state.json") -Raw
+    }
+    'evidence' {
+        if (!$Session) { throw 'Session id is required' }
+        $file = Join-Path $runs "$Session\evidence\evidence.json"
+        if (Test-Path -LiteralPath $file) {
+            $summary = Read-Json $file
+            foreach ($name in @('papyrus-tail.log', 'plugin-tail.log', 'rpc-tail.jsonl')) {
+                $path = Join-Path (Split-Path $file) $name
+                if (Test-Path -LiteralPath $path) {
+                    $summary | Add-Member -NotePropertyName $name -NotePropertyValue (@(Get-Content -LiteralPath $path -Tail 40) -join "`n") -Force
+                }
+            }
+            $summary | ConvertTo-Json -Compress -Depth 5
+        } else {
+            '{}'
+        }
     }
     'stop' {
         if (!$Session) { throw 'Session id is required' }
