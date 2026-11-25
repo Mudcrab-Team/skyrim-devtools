@@ -139,7 +139,7 @@ namespace
                 row.value = const_cast<RE::InventoryEntryData*>(desc)->GetValue();
                 row.weight = const_cast<RE::InventoryEntryData*>(desc)->GetWeight();
             }
-            row.owner = RE::TESObjectREFR::LookupByHandle(data.owner.native_handle()).get();
+            row.owner = RE::TESObjectREFR::LookupByHandle(data.owner).get();
             rows.push_back(std::move(row));
             if (rows.size() >= maxItems) {
                 break;
