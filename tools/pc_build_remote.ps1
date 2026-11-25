@@ -50,13 +50,13 @@ function Acquire-Lock([string]$who, [int]$waitSeconds) {
     $deadline = (Get-Date).AddSeconds($waitSeconds)
     while ($true) {
         if ((Get-LockOwner) -eq $who) { return $true }
-        if (Test-LockStale) { Write-Output "lock held by '$(Get-LockOwner)' is stale; taking it"; Remove-Item $lockPath -Force }
+        if (Test-LockStale) { Write-Host "lock held by '$(Get-LockOwner)' is stale; taking it"; Remove-Item $lockPath -Force }
         try {
             $stream = [IO.File]::Open($lockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
             $bytes = [Text.Encoding]::ASCII.GetBytes($who)
             $stream.Write($bytes, 0, $bytes.Length)
             $stream.Close()
-            Write-Output "lock acquired by $who"
+            Write-Host "lock acquired by $who"
             return $true
         } catch [IO.IOException] {
             if ((Get-Date) -ge $deadline) { return $false }
