@@ -30,12 +30,12 @@ namespace
         if (!calendar) {
             throw RpcError(code::notReady, "The calendar is not available yet");
         }
-        char text[64]{};
-        calendar->GetTimeDateString(text, sizeof(text), true);
-        return Json{ { "hour", Round(calendar->GetHour(), 2) }, { "day", static_cast<int>(calendar->GetDay()) },
-            { "month", calendar->GetMonthName() }, { "year", calendar->GetYear() }, { "dayName", calendar->GetDayName() },
-            { "daysPassed", Round(calendar->GetDaysPassed(), 3) }, { "timescale", Round(calendar->GetTimescale()) },
-            { "text", std::string(text) } };
+        // Read the calendar's globals directly; the engine's formatting helpers are not safe to call here.
+        const auto value = [](const RE::TESGlobal* global) { return global ? global->value : 0.0f; };
+        const auto hour = value(calendar->gameHour);
+        return Json{ { "hour", Round(hour, 2) }, { "day", static_cast<int>(value(calendar->gameDay)) },
+            { "month", static_cast<int>(value(calendar->gameMonth)) }, { "year", static_cast<int>(value(calendar->gameYear)) },
+            { "daysPassed", Round(value(calendar->gameDaysPassed), 3) }, { "timescale", Round(value(calendar->timeScale)) } };
     }
 }
 

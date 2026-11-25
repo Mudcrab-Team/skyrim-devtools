@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
 #include <set>
 
 namespace
@@ -22,13 +23,17 @@ namespace
         return text;
     }
 
+    // The engine's by-name lookup is not safe for unknown names, so match against the enum's own names.
     RE::ActorValue ParseActorValue(const std::string& name)
     {
-        const auto value = RE::ActorValueList::LookupActorValueByName(name.c_str());
-        if (value == RE::ActorValue::kNone || static_cast<int>(value) < 0) {
-            throw RpcError(code::invalidParams, "Unknown actor value '" + name + "'");
+        const auto wanted = Lower(name);
+        for (int i = 0; i < static_cast<int>(RE::ActorValue::kTotal); ++i) {
+            const auto info = RE::ActorValueList::GetActorValueInfo(static_cast<RE::ActorValue>(i));
+            if (info && info->enumName && Lower(info->enumName) == wanted) {
+                return static_cast<RE::ActorValue>(i);
+            }
         }
-        return value;
+        throw RpcError(code::invalidParams, "Unknown actor value '" + name + "'");
     }
 
     const char* SpellKind(RE::MagicItem* item)
@@ -52,7 +57,9 @@ namespace
     {
         Json out{ { "formID", Hex(spell->GetFormID()) }, { "name", Name(spell->GetName()) }, { "kind", SpellKind(spell) } };
         if (const auto skill = spell->GetAssociatedSkill(); skill != RE::ActorValue::kNone) {
-            out["skill"] = RE::ActorValueToString(skill);
+            if (const auto info = RE::ActorValueList::GetActorValueInfo(skill); info && info->enumName) {
+                out["skill"] = info->enumName;
+            }
         }
         if (caster && spell->GetSpellType() == RE::MagicSystem::SpellType::kSpell) {
             out["cost"] = Round(spell->CalculateMagickaCost(caster), 0);
@@ -75,11 +82,11 @@ namespace
             return true;
         }
         const auto type = Lower(FormTypeName(&object));
-        if (filter == "potion") {
-            return type == "alchemyitem";
-        }
-        if (filter == "key") {
-            return type == "keymaster";
+        static const std::map<std::string, std::string> aliases{ { "weapon", "weap" }, { "armor", "armo" }, { "ammo", "ammo" },
+            { "potion", "alch" }, { "ingredient", "ingr" }, { "book", "book" }, { "misc", "misc" }, { "key", "keym" },
+            { "scroll", "scrl" }, { "soulgem", "slgm" }, { "note", "note" } };
+        if (const auto alias = aliases.find(filter); alias != aliases.end()) {
+            return type == alias->second;
         }
         return type == filter;
     }
@@ -293,7 +300,9 @@ DEVTOOLS_MODULE(StatePlayer)
                 throw RpcError(code::invalidParams, "Pass either refID or x,y,z");
             }
             const auto target = RequireRef(params, "refID");
+            // MoveTo is queued by the engine; the reply reports the destination, not the old position.
             player.MoveTo(target);
+            return Json{ { "queued", true }, { "target", Hex(target->GetFormID()) }, { "targetPos", Vec3(target->GetPosition()) } };
         } else {
             const auto position = RE::NiPoint3(Require<float>(params, "x"), Require<float>(params, "y"), Require<float>(params, "z"));
             player.SetPosition(position, true);
