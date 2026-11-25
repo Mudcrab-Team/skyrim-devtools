@@ -379,6 +379,37 @@ def build_server(manager):
         return dumps(await native("UI.selectItem", menu=menu, index=index, text=text, action=action, count=count))
 
     @mcp.tool()
+    async def ui_dump(menu: str, path: str | None = None, depth: int | None = None) -> str:
+        """Bounded Scaleform tree of an open menu (UI.dump), from _root or a dotted path such as
+        Menu_mc.ItemCard_mc. depth defaults to 2. Use ui_get for one value."""
+        return dumps(await native("UI.dump", menu=menu, path=path, depth=depth))
+
+    @mcp.tool()
+    async def ui_get(menu: str, path: str, depth: int | None = None) -> str:
+        """Read one ActionScript variable of an open menu (UI.getVariable)."""
+        return dumps(await native("UI.getVariable", menu=menu, path=path, depth=depth))
+
+    @mcp.tool()
+    async def ui_set(menu: str, path: str, value: object) -> str:
+        """Write an ActionScript variable of an open menu (UI.setVariable)."""
+        return dumps(await native("UI.setVariable", menu=menu, path=path, value=value))
+
+    @mcp.tool()
+    async def ui_invoke(menu: str, path: str, args: list | None = None) -> str:
+        """Call an ActionScript function of an open menu (UI.invoke) and return its result."""
+        return dumps(await native("UI.invoke", menu=menu, path=path, args=args or []))
+
+    @mcp.tool()
+    async def ui_list(menu: str) -> str:
+        """Entries of a list menu without an item API (UI.list), for example the main menu or Journal."""
+        return dumps(await native("UI.list", menu=menu))
+
+    @mcp.tool()
+    async def dialogue_start(ref_id: str | None = None) -> str:
+        """Start a conversation by activating an NPC (Dialogue.start); ref_id is hex, default the nearest living actor."""
+        return dumps(await native("Dialogue.start", refID=ref_id))
+
+    @mcp.tool()
     async def screenshot(max_width: int | None = None, format: str | None = None, quality: int | None = None,
                          include_ui: bool | None = None) -> list:
         """Capture the game's own rendered frame as an image (Screen.capture); works headless. max_width
