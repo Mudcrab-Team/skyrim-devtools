@@ -50,6 +50,10 @@ class Session:
         """Call callback(event) for every notification; event is {type, seq, epoch, data}."""
         self._callbacks.append(callback)
 
+    def off_event(self, callback):
+        if callback in self._callbacks:
+            self._callbacks.remove(callback)
+
     async def _read(self):
         try:
             async for text in self.socket:
@@ -79,7 +83,7 @@ class Session:
             self.events.put_nowait(event)
         except asyncio.QueueFull:
             self.dropped_events += 1
-        for callback in self._callbacks:
+        for callback in list(self._callbacks):
             callback(event)
 
     async def call(self, method, timeout=None, **params):
@@ -197,6 +201,39 @@ class Session:
                 event = await self.events.get()
                 if predicate(event):
                     return event
+
+    def watch(self, *types, limit=10000):
+        """Async context manager and iterator over events of the given types; see logs.EventWatch."""
+        from .logs import EventWatch
+
+        return EventWatch(self, types, limit)
+
+    def papyrus_watch(self, **options):
+        """Collects Papyrus log lines written inside the block; see logs.PapyrusWatch."""
+        from .logs import PapyrusWatch
+
+        return PapyrusWatch(self, **options)
+
+    async def heartbeat(self, **options):
+        """One main/UI-thread liveness reading (ok, busy, hang, unresponsive, lost); see logs.heartbeat."""
+        from .logs import heartbeat
+
+        return await heartbeat(self, **options)
+
+    def monitor(self, **options):
+        """Starts a background hang monitor; see logs.HangMonitor."""
+        from .logs import HangMonitor
+
+        return HangMonitor(self, **options)
+
+    async def papyrus_log(self, since=0, level="info", limit=500, contains=""):
+        return await self.call("Papyrus.log", since=since, level=level, limit=limit, contains=contains)
+
+    async def papyrus_stats(self):
+        return await self.call("Papyrus.stats")
+
+    async def tail_log(self, source="papyrus", lines=100):
+        return await self.call("Logs.tail", source=source, lines=lines)
 
     def drain_events(self):
         drained = []
