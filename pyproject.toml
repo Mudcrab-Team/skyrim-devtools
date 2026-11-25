@@ -10,10 +10,11 @@ readme = "README.md"
 requires-python = ">=3.13"
 license = "MIT"
 license-files = ["licenses/MIT.txt"]
-dependencies = ["websockets==16.0"]
+dependencies = ["websockets==16.0", "mcp>=1.12,<2"]
 
 [project.scripts]
 skyrim-devtools-smoke = "skyrim_devtools.smoke:main"
+skyrim-use = "skyrim_devtools.use.server:main"
 
 [tool.setuptools.packages.find]
-include = ["skyrim_devtools"]
+include = ["skyrim_devtools*"]
