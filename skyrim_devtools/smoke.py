@@ -100,7 +100,7 @@ class WindowsHost:
         )
 
 
-async def exercise(session, counts, cycles, session_only=False, tab_trials=20, timings=None):
+async def exercise(session, counts, cycles, session_only=False, tab_trials=20, timings=None, screenshot=None):
     timings = {} if timings is None else timings
     clock = asyncio.get_running_loop().time
     began = clock()
@@ -123,6 +123,9 @@ async def exercise(session, counts, cycles, session_only=False, tab_trials=20, t
     counts.loaded += 1
     if session_only:
         return
+
+    if screenshot:
+        await take_screenshots(session, Path(screenshot), timings)
 
     for _ in range(cycles):
         await session.set_menu(INVENTORY, True)
@@ -175,6 +178,24 @@ async def exercise(session, counts, cycles, session_only=False, tab_trials=20, t
         raise RuntimeError(f"Tab closed the inventory {counts.tab_taps}/{tab_trials} times")
 
 
+async def take_screenshots(session, path, timings):
+    """Saves the world view to path and the Inventory view next to it, then samples frame times."""
+    clock = asyncio.get_running_loop().time
+    shots = {}
+    started = clock()
+    shots["world"] = await session.capture(path)
+    shots["world"]["roundTripMs"] = round((clock() - started) * 1000)
+    await session.set_menu(INVENTORY, True)
+    await observe(session.snapshot, lambda state: state["open"].get(INVENTORY), "Inventory movie", 8)
+    await asyncio.sleep(MENU_SETTLE)
+    started = clock()
+    shots["inventory"] = await session.capture(path.with_name(f"{path.stem}-inventory{path.suffix}"))
+    shots["inventory"]["roundTripMs"] = round((clock() - started) * 1000)
+    await session.set_menu(INVENTORY, False)
+    timings["screenshots"] = shots
+    timings["frameStats"] = await session.frame_stats(window=10)
+
+
 async def connect(connect_ws, local_port, token):
     uri = f"ws://127.0.0.1:{local_port}/rpc"
     deadline = asyncio.get_running_loop().time() + 45
@@ -190,7 +211,7 @@ async def connect(connect_ws, local_port, token):
             await asyncio.sleep(0.3)
 
 
-async def run(host, connect_ws, counts, cycles, session_only, tab_trials=20, mode="", timings=None):
+async def run(host, connect_ws, counts, cycles, session_only, tab_trials=20, mode="", timings=None, screenshot=None):
     timings = {} if timings is None else timings
     began = asyncio.get_running_loop().time()
     bootstrap = await host.command("start", mode=mode)
@@ -206,7 +227,7 @@ async def run(host, connect_ws, counts, cycles, session_only, tab_trials=20, mod
         tunnel = await host.tunnel(bootstrap["port"])
         socket = await connect(connect_ws, host.local_port, token)
         session = Session(socket, session_id)
-        await exercise(session, counts, cycles, session_only, tab_trials, timings)
+        await exercise(session, counts, cycles, session_only, tab_trials, timings, screenshot)
         timings["sessionSeconds"] = round(asyncio.get_running_loop().time() - began, 1)
     except Exception as error:
         scenario_failure = error
@@ -239,6 +260,8 @@ def main():
     parser.add_argument("--tab-trials", type=int, default=20)
     parser.add_argument("--session-only", action="store_true")
     parser.add_argument("--mode", choices=["headless", "windowed"], help="override the host's display mode")
+    parser.add_argument("--screenshot", type=Path, metavar="PNG",
+                        help="save the world view here and the Inventory view as <name>-inventory.png")
     options = parser.parse_args()
     if not 1 <= options.cycles <= 100:
         parser.error("--cycles must be between 1 and 100")
@@ -257,7 +280,7 @@ def main():
     try:
         config = json.loads(options.config.read_text())
         asyncio.run(run(WindowsHost(config), connect_ws, counts, options.cycles, options.session_only,
-                        options.tab_trials, options.mode or "", timings))
+                        options.tab_trials, options.mode or "", timings, options.screenshot))
     except (OSError, ValueError, RuntimeError, KeyError, WebSocketException) as error:
         print(f"FAIL {error}")
         result = 1

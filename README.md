@@ -11,8 +11,9 @@ current menu, open Inventory, and run a repeatable UI scenario against an
 isolated save. The repository currently provides the plugin, Python client,
 and smoke runner.
 
-**Skyrim Profiler** is a future project idea for measuring frame times and
-finding slow work in Skyrim's game loop.
+`Screen.capture` returns the game's own rendered frame (also headless) and `Perf.frameStats`
+reports frame-time percentiles. **Skyrim Profiler** remains a future project idea for finding
+slow work in Skyrim's game loop.
 
 ## What works today
 
@@ -124,6 +125,7 @@ skyrim-devtools-smoke --config .local/devtools-mac.json --cycles 5 --tab-trials 
 python -m unittest discover -s tests
 ~~~
 
+`--screenshot out.png` also saves the world and Inventory views and samples frame times.
 Use --session-only to exercise launch, handshake, fixture load and shutdown. --mode overrides
 the host's `headless` setting for one run. The runner
 prints aggregate counts. The private Windows runs directory holds the launcher status
