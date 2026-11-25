@@ -129,6 +129,10 @@ the host's `headless` setting for one run. The runner
 prints aggregate counts. The private Windows runs directory holds the launcher status
 and RPC transcript. The profile holds the game and loader logs.
 
+## Playtest from Claude
+
+`skyrim-use` is an MCP server that lets an LLM start the game, drive it and read its state; see [docs/skyrim-use.md](docs/skyrim-use.md).
+
 ## RPC protocol
 
 See [docs/protocol.md](docs/protocol.md) for the protocol 2 method list and event types, and

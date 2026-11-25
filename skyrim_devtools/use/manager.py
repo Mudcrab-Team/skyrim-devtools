@@ -1,0 +1,325 @@
+"""One long-lived game session shared by every MCP tool call.
+
+The manager owns the Windows host session, the SSH tunnel, the WebSocket and a background keepalive.
+When the link drops it asks the host whether the game is still alive: a live game is reconnected, a
+dead one is reported with the host's phase and reason so the caller can decide to start again.
+"""
+
+import asyncio
+from collections import deque
+import contextlib
+import re
+import subprocess
+import time
+
+from ..client import MAX_MESSAGE, TIMEOUT, ConnectionLost, RpcError, Session, observe
+from ..smoke import ACTIVE, WindowsHost
+
+KEEPALIVE_SECONDS = 15
+EVENT_BUFFER = 5000
+# console lines are already returned by the console tool, so subscribing would only add noise
+QUIET_EVENTS = {"console"}
+NOT_READY = -32004
+HINTS = {
+    -32004: "the game is not ready yet (still starting, or no save is loaded); retry shortly",
+    -32005: "the world was reloaded since you last looked; take a fresh snapshot",
+    -32006: "the plugin's input hook is not available",
+    -32007: "the console is not available yet",
+    -32008: "the game did not answer in time (it may be loading or stalled)",
+    -32010: "not found (unknown menu name or save name)",
+}
+
+
+class GameError(RuntimeError):
+    """A failure to report to the playtester as-is."""
+
+
+def describe_rpc_error(error):
+    text = f"{error} ({HINTS[error.code]})" if error.code in HINTS else str(error)
+    if error.data:
+        text += f" data={error.data}"
+    return text
+
+
+async def default_connect(port, token):
+    from websockets.asyncio.client import connect
+
+    return await connect(
+        f"ws://127.0.0.1:{port}/rpc", additional_headers={"Authorization": f"Bearer {token}"},
+        max_size=MAX_MESSAGE, open_timeout=10, ping_interval=None,
+    )
+
+
+def compact_event(event):
+    return {"type": event.get("type"), "seq": event.get("seq"), "epoch": event.get("epoch"),
+            "data": event.get("data")}
+
+
+class GameManager:
+    def __init__(self, config, host=None, connect=default_connect, keepalive=KEEPALIVE_SECONDS):
+        self.config = config
+        self.host = host or WindowsHost(config)
+        self._connect = connect
+        self.keepalive_seconds = keepalive
+        self.lock = asyncio.Lock()
+        self.reset()
+
+    def reset(self):
+        self.phase = "idle"
+        self.session = None
+        self.session_id = None
+        self.token = None
+        self.port = None
+        self.tunnel = None
+        self.info = {}
+        self.methods = {}
+        self.mode = None
+        self.crash = None
+        self.keepalive_task = None
+        self.events = deque(maxlen=EVENT_BUFFER)
+        self.event_total = 0
+        self.drain_cursor = 0
+        self.subscribed = []
+
+    @property
+    def alive(self):
+        return self.session is not None and self.phase == "running"
+
+    def _on_event(self, event):
+        self.events.append(compact_event(event))
+        self.event_total += 1
+
+    def events_since(self, cursor):
+        """Buffered events with absolute index >= cursor, plus how many were lost to the ring."""
+        first = self.event_total - len(self.events)
+        start = max(cursor, first)
+        items = list(self.events)[start - first:]
+        return items, max(0, first - cursor)
+
+    def drain_events(self, types=None, limit=200):
+        items, lost = self.events_since(self.drain_cursor)
+        taken = []
+        consumed = 0
+        for item in items:
+            if types and item["type"] not in types:
+                consumed += 1
+                continue
+            if len(taken) >= limit:
+                break
+            taken.append(item)
+            consumed += 1
+        self.drain_cursor = max(self.drain_cursor, self.event_total - len(items)) + consumed
+        return taken, lost, len(items) - consumed
+
+    async def start(self, headless=True, save=None):
+        async with self.lock:
+            if self.alive:
+                return await self._status_locked(note="game already running; reusing the session")
+            await self._teardown()
+            self.reset()
+            self.phase = "starting"
+            self.mode = "headless" if headless else "windowed"
+            try:
+                bootstrap = await self.host.command("start", mode=self.mode)
+                self.session_id, self.token, self.port = bootstrap["sessionId"], bootstrap["token"], bootstrap["port"]
+                if not re.fullmatch("[a-f0-9]{32}", self.session_id) or not re.fullmatch("[a-f0-9]{64}", self.token):
+                    raise GameError("Invalid session bootstrap from the host")
+                await self.host.wait_ready(self.session_id)
+                await self._attach()
+                self.info = await observe(self._get_info, lambda s: s["dataLoaded"], "Game data", 120)
+                await self._subscribe()
+                await observe(self._snapshot_raw, lambda s: any(m["name"] == "Main Menu" for m in s["menus"]),
+                              "Main menu", 60)
+                self.phase = "running"
+                self.keepalive_task = asyncio.create_task(self._keepalive())
+                if save:
+                    await self._load_save_locked(save)
+            except BaseException as error:
+                await self._abort(error)
+                if isinstance(error, (GameError, asyncio.CancelledError)):
+                    raise
+                raise GameError(f"game_start failed: {type(error).__name__}: {error}") from error
+            return await self._status_locked(note="game started")
+
+    async def _get_info(self):
+        info = await self.session.call("Session.getInfo")
+        self.methods = {item["name"]: item for item in info.get("methods", [])}
+        return info
+
+    async def _snapshot_raw(self):
+        # while the UI thread is still starting, a deadline miss means "not yet", not failure
+        try:
+            return await self.session.call("Events.snapshot")
+        except RpcError as error:
+            if error.code == TIMEOUT:
+                raise RpcError(NOT_READY, "UI not answering yet") from error
+            raise
+
+    async def _attach(self):
+        self.tunnel = await self.host.tunnel(self.port)
+        socket = None
+        # the forward needs a moment to accept connections
+        for attempt in range(20):
+            try:
+                socket = await self._connect(self.host.local_port, self.token)
+                break
+            except OSError:
+                if attempt == 19:
+                    raise
+                await asyncio.sleep(0.3)
+        self.session = Session(socket, self.session_id, event_limit=1)
+        self.session.on_event(self._on_event)
+
+    async def _subscribe(self):
+        listed = await self.session.call("Events.list")
+        names = [item["type"] for item in listed]
+        self.subscribed = [name for name in names if name not in QUIET_EVENTS] or ["menuOpenClose", "loadGame", "cellChange"]
+        await self.session.call("Events.subscribe", types=self.subscribed)
+
+    async def _load_save_locked(self, name):
+        await self.session.call("Session.loadSave", timeout=120, name=name, wait=True)
+        await observe(self._snapshot_raw, lambda s: s["playable"], "Save load", 90)
+
+    async def _keepalive(self):
+        while True:
+            await asyncio.sleep(self.keepalive_seconds)
+            if self.session is None:
+                return
+            try:
+                await self.session.call("Session.ping", timeout=20)
+            except (ConnectionLost, OSError, TimeoutError, RpcError, asyncio.TimeoutError):
+                async with self.lock:
+                    if self.phase == "running":
+                        await self._recover()
+                return
+
+    async def _host_status(self):
+        try:
+            return await self.host.command("status", self.session_id)
+        except Exception as error:
+            return {"phase": "unknown", "reason": f"host status failed: {error}"}
+
+    async def _recover(self):
+        """Link lost: reconnect if the game is still alive, otherwise record how it ended."""
+        status = await self._host_status()
+        if status.get("phase") in ACTIVE:
+            try:
+                await self._close_link()
+                await self._attach()
+                await self._get_info()
+                await self._subscribe()
+                self.keepalive_task = asyncio.create_task(self._keepalive())
+                return True
+            except Exception as error:
+                status = {**status, "reason": f"reconnect failed: {error}"}
+        self.crash = {"hostPhase": status.get("phase"), "reason": status.get("reason"),
+                      "exitCode": status.get("exitCode")}
+        self.phase = "crashed"
+        await self._close_link()
+        return False
+
+    async def _close_link(self):
+        session, self.session = self.session, None
+        if session is not None:
+            session._reader.cancel()
+            with contextlib.suppress(Exception):
+                await session.socket.close()
+        tunnel, self.tunnel = self.tunnel, None
+        if tunnel is not None and tunnel.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                tunnel.terminate()
+            with contextlib.suppress(Exception):
+                await tunnel.wait()
+
+    async def _abort(self, error):
+        self.phase = "failed"
+        self.crash = {"hostPhase": "start-failed", "reason": str(error), "exitCode": None}
+        task = self.keepalive_task
+        self.keepalive_task = None
+        if task and task is not asyncio.current_task():
+            task.cancel()
+        await self._close_link()
+        if self.session_id:
+            with contextlib.suppress(Exception):
+                await self.host.stop(self.session_id)
+
+    async def _teardown(self):
+        task, self.keepalive_task = self.keepalive_task, None
+        if task is not None:
+            task.cancel()
+        await self._close_link()
+
+    async def stop(self):
+        async with self.lock:
+            if self.session_id is None or self.phase in {"idle", "stopped"}:
+                return {"phase": self.phase, "note": "no game is running"}
+            task, self.keepalive_task = self.keepalive_task, None
+            if task is not None:
+                task.cancel()
+            # stop through the host first: dropping the socket beforehand makes the game exit on its own,
+            # which the host then records as an unrequested exit instead of a clean stop
+            try:
+                result = await self.host.stop(self.session_id)
+            except Exception as error:
+                result = {"phase": "unknown", "reason": str(error)}
+            await self._close_link()
+            self.phase = "stopped"
+            clean = result.get("phase") == "stopped" and result.get("exitCode") == 0
+            return {"phase": "stopped", "cleanExit": clean, "host": {k: result.get(k) for k in ("phase", "exitCode", "reason")}}
+
+    async def call(self, method, timeout=None, **params):
+        """Call a native method; transparently recovers a dropped link once."""
+        if self.phase == "crashed":
+            raise GameError(self._crash_text())
+        if not self.alive:
+            raise GameError(f"no game is running (phase: {self.phase}); call game_start first")
+        for attempt in range(2):
+            try:
+                return await self.session.call(method, timeout=timeout, **params)
+            except RpcError as error:
+                raise GameError(describe_rpc_error(error)) from error
+            except (ConnectionLost, OSError) as error:
+                async with self.lock:
+                    if self.phase == "running" and (self.session is None or self.session._closed is not None):
+                        recovered = await self._recover()
+                    else:
+                        recovered = self.alive
+                if not recovered:
+                    raise GameError(self._crash_text()) from error
+                if attempt:
+                    raise GameError(f"connection lost during {method}") from error
+        raise GameError(f"connection lost during {method}")
+
+    def _crash_text(self):
+        crash = self.crash or {}
+        return (f"the game is gone (host phase {crash.get('hostPhase')}, reason {crash.get('reason')}, "
+                f"exit code {crash.get('exitCode')}); call game_start to launch it again")
+
+    def has_method(self, name):
+        return name in self.methods
+
+    async def _status_locked(self, note=None):
+        result = {"phase": self.phase}
+        if note:
+            result["note"] = note
+        if self.session_id:
+            result.update(sessionId=self.session_id, mode=self.mode)
+        if self.crash:
+            result["crash"] = self.crash
+        if self.alive:
+            result["info"] = {key: self.info.get(key) for key in
+                              ("protocol", "dataLoaded", "loadEpoch", "headless", "capabilities") if key in self.info}
+            result["methodCount"] = len(self.methods)
+            result["bufferedEvents"] = self.event_total - self.drain_cursor
+        return result
+
+    async def status(self):
+        """Phase plus, for a live game, a fresh probe so a silent crash is noticed now."""
+        if self.alive:
+            try:
+                self.info = await self._get_info()
+            except (ConnectionLost, OSError, RpcError, TimeoutError):
+                async with self.lock:
+                    if self.phase == "running":
+                        await self._recover()
+        return await self._status_locked()
