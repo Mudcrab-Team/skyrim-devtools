@@ -3,7 +3,9 @@ param(
     [ValidateSet('install-task', 'start', 'run', 'status', 'stop')]
     [string] $Action,
     [ValidatePattern('^[a-f0-9]{32}$')]
-    [string] $Session
+    [string] $Session,
+    [ValidateSet('', 'headless', 'windowed')]
+    [string] $Mode = ''
 )
 $ErrorActionPreference = 'Stop'
 $taskName = 'SkyrimDevTools'
@@ -46,7 +48,7 @@ function Refuse-Launch($Check, $Message) {
     throw $failure
 }
 
-function Assert-InteractiveDesktop {
+function Assert-InteractiveDesktop($Headless) {
     # A scheduled task can still run in a disconnected desktop session.
     Add-Type -TypeDefinition @'
 using System;
@@ -98,7 +100,8 @@ public static class SkyrimDevToolsDesktop
     if (![SkyrimDevToolsDesktop]::IsActive($sessionId)) {
         Refuse-Launch 'desktop-inactive' 'The test account must have an active interactive desktop session'
     }
-    if (![SkyrimDevToolsDesktop]::IsUnlocked()) {
+    # Headless runs inject input inside the game, so only the window needs a live session.
+    if (!$Headless -and ![SkyrimDevToolsDesktop]::IsUnlocked()) {
         Refuse-Launch 'desktop-locked' 'The interactive test desktop is locked or inaccessible'
     }
 }
@@ -156,14 +159,93 @@ function Assert-OfflineSteam {
     }
 }
 
+function Set-IniValue([string] $Text, [string] $Section, [string] $Key, [string] $Value) {
+    $line = "$Key=$Value"
+    $header = [regex]::Match($Text, "(?im)^\s*\[$([regex]::Escape($Section))\]\s*$")
+    if (!$header.Success) {
+        return $Text.TrimEnd() + "`r`n[$Section]`r`n$line`r`n"
+    }
+    $bodyStart = $header.Index + $header.Length
+    $next = [regex]::Match($Text.Substring($bodyStart), '(?m)^\s*\[')
+    $bodyEnd = if ($next.Success) { $bodyStart + $next.Index } else { $Text.Length }
+    $body = $Text.Substring($bodyStart, $bodyEnd - $bodyStart)
+    $pattern = "(?im)^[ \t]*$([regex]::Escape($Key))[ \t]*=[^\r\n]*"
+    if ([regex]::IsMatch($body, $pattern)) {
+        $body = [regex]::Replace($body, $pattern, $line.Replace('$', '$$'))
+    } else {
+        $body = "`r`n$line" + $body
+    }
+    $Text.Substring(0, $bodyStart) + $body + $Text.Substring($bodyEnd)
+}
+
+function Write-ProfileSettings($Headless, $Config) {
+    # Every run starts from the pristine copies, so overrides never accumulate in the profile.
+    $originals = Join-Path $profile 'ini-original'
+    if (!(Test-Path -LiteralPath $originals)) {
+        New-Item -ItemType Directory -Path $originals | Out-Null
+        foreach ($name in @('Skyrim.ini', 'SkyrimPrefs.ini')) {
+            Copy-Item -LiteralPath (Join-Path $profile $name) -Destination (Join-Path $originals $name)
+        }
+    }
+    Assert-PrivateDirectory $originals
+    $main = [IO.File]::ReadAllText((Join-Path $originals 'Skyrim.ini'))
+    $prefs = [IO.File]::ReadAllText((Join-Path $originals 'SkyrimPrefs.ini'))
+    if ($Headless) {
+        $width = if ($Config.width -is [int]) { $Config.width } else { 1280 }
+        $height = if ($Config.height -is [int]) { $Config.height } else { 720 }
+        # The setting is read from either file depending on the runtime; both copies are harmless.
+        $main = Set-IniValue $main 'General' 'bAlwaysActive' '1'
+        $prefs = Set-IniValue $prefs 'General' 'bAlwaysActive' '1'
+        $prefs = Set-IniValue $prefs 'Display' 'bFull Screen' '0'
+        $prefs = Set-IniValue $prefs 'Display' 'bBorderless' '1'
+        $prefs = Set-IniValue $prefs 'Display' 'iSize W' "$width"
+        $prefs = Set-IniValue $prefs 'Display' 'iSize H' "$height"
+        if ($Config.muteAudio -ne $false) {
+            $prefs = Set-IniValue $prefs 'AudioMenu' 'fAudioMasterVolume' '0.0000'
+        }
+    }
+    [IO.File]::WriteAllText((Join-Path $profile 'Skyrim.ini'), $main)
+    [IO.File]::WriteAllText((Join-Path $profile 'SkyrimPrefs.ini'), $prefs)
+}
+
+function Stage-Saves {
+    # Saves the game wrote during an earlier run are disposable; only fixtures are restored.
+    $saves = Join-Path $profile 'Saves'
+    foreach ($entry in Get-ChildItem -LiteralPath $saves -Force) {
+        if ($entry.PSIsContainer -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'The scratch save directory contains an unexpected entry'
+        }
+        Remove-Item -LiteralPath $entry.FullName -Force
+    }
+    $destination = Join-Path $saves 'Fixture.ess'
+    Copy-Item -LiteralPath (Join-Path $root 'fixture.ess') -Destination $destination
+    $fixtures = Join-Path $root 'fixtures'
+    if (Test-Path -LiteralPath $fixtures) {
+        Assert-PrivateDirectory $fixtures
+        foreach ($entry in Get-ChildItem -LiteralPath $fixtures -File) {
+            if ($entry.Extension -in @('.ess', '.skse') -and $entry.Name -match '^[A-Za-z0-9_ .-]+$' -and
+                !($entry.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                Copy-Item -LiteralPath $entry.FullName -Destination (Join-Path $saves $entry.Name) -Force
+            }
+        }
+    }
+    (Get-FileHash -LiteralPath $destination).Hash.ToLowerInvariant()
+}
+
+function Read-Seconds($Value, $Default) {
+    if ($null -eq $Value) { return $Default }
+    if ($Value -isnot [int] -or $Value -lt 0) { throw 'Timeouts must be non-negative whole seconds' }
+    $Value
+}
+
 function Find-OwnedGame($LoaderPid) {
     Get-CimInstance Win32_Process -Filter "Name = 'SkyrimSE.exe' AND ParentProcessId = $LoaderPid" |
         Where-Object ExecutablePath -EQ (Join-Path $games 'SkyrimSE.exe') |
         Select-Object -First 1
 }
 
-function Preflight($Config) {
-    Assert-InteractiveDesktop
+function Preflight($Config, $Headless) {
+    Assert-InteractiveDesktop $Headless
     Assert-OfflineSteam
     if ($Config.cloudSyncDisabled -ne $true) {
         Refuse-Launch 'steam-cloud-unconfirmed' 'Disable Steam Cloud for Skyrim and confirm it in the local configuration'
@@ -174,6 +256,8 @@ function Preflight($Config) {
     if (Get-Process SkyrimSE, skse64_loader -ErrorAction SilentlyContinue) {
         throw 'A game or loader process is already running'
     }
+    Assert-LocalProfile
+    Write-ProfileSettings $Headless $Config
     Assert-LocalProfile
     Assert-PrivateDirectory $games
     $data = Join-Path $games 'Data'
@@ -198,16 +282,7 @@ function Preflight($Config) {
     if ($dlls.Count -ne 1 -or $dlls[0].Name -ne 'SkyrimDevTools.dll') {
         throw 'The test plugin must be the only SKSE plugin DLL'
     }
-    $fixture = Join-Path $root 'fixture.ess'
-    $destination = Join-Path $profile 'Saves\Fixture.ess'
-    foreach ($entry in Get-ChildItem -LiteralPath (Split-Path $destination) -Force) {
-        if ($entry.Name -ne 'Fixture.ess' -or $entry.PSIsContainer -or
-            ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-            throw 'The scratch save directory contains an unexpected entry'
-        }
-    }
-    Copy-Item -LiteralPath $fixture -Destination $destination -Force
-    (Get-FileHash -LiteralPath $destination).Hash.ToLowerInvariant()
+    Stage-Saves
 }
 
 function Run-Game {
@@ -229,13 +304,20 @@ function Run-Game {
             return
         }
         $config = Read-Json (Join-Path $root 'config.json')
-        $digest = Preflight $config
-        $env:SKYRIM_DEVTOOLS_TOKEN = (Read-Json (Join-Path $run 'request.json')).token
+        $request = Read-Json (Join-Path $run 'request.json')
+        $headless = if ($request.mode) { $request.mode -eq 'headless' } else { $config.headless -eq $true }
+        $watchdog = Read-Seconds $config.watchdogMinutes 240
+        $digest = Preflight $config $headless
+        $env:SKYRIM_DEVTOOLS_TOKEN = $request.token
         Remove-Item -LiteralPath (Join-Path $run 'request.json')
         $env:SKYRIM_DEVTOOLS_SESSION = $Session
         $env:SKYRIM_DEVTOOLS_IMAGE = $pin
         $env:SKYRIM_DEVTOOLS_PORT = $config.port
         $env:SKYRIM_DEVTOOLS_RUN_DIR = $run
+        $env:SKYRIM_DEVTOOLS_SAVES_DIR = Join-Path $profile 'Saves'
+        $env:SKYRIM_DEVTOOLS_HEADLESS = if ($headless) { '1' } else { '0' }
+        $env:SKYRIM_DEVTOOLS_IDLE_TIMEOUT = Read-Seconds $config.idleTimeoutSeconds 1800
+        $env:SKYRIM_DEVTOOLS_CONNECT_TIMEOUT = Read-Seconds $config.connectTimeoutSeconds 600
         $reason = 'loader'
         $loaderProcess = Start-Process -FilePath (Join-Path $games 'skse64_loader.exe') -WorkingDirectory $games -PassThru
         $deadline = [DateTime]::UtcNow.AddSeconds(25)
@@ -250,9 +332,10 @@ function Run-Game {
 
         $running = Result 'running'
         $running.fixtureSha256 = $digest
+        $running.headless = $headless
         Write-Json $running $state
         $reason = 'watchdog'
-        $deadline = [DateTime]::UtcNow.AddMinutes(15)
+        $deadline = if ($watchdog -gt 0) { [DateTime]::UtcNow.AddMinutes($watchdog) } else { [DateTime]::MaxValue }
         while (!$game.WaitForExit(250)) {
             if ((Test-Path -LiteralPath $stop) -or [DateTime]::UtcNow -ge $deadline) {
                 $reason = if (Test-Path -LiteralPath $stop) { 'requested' } else { 'watchdog' }
@@ -325,7 +408,7 @@ switch ($Action) {
         } finally { $stream.Dispose() }
         try {
             New-Item -ItemType Directory -Path $run | Out-Null
-            Write-Json @{ token = $token } (Join-Path $run 'request.json')
+            Write-Json @{ token = $token; mode = $Mode } (Join-Path $run 'request.json')
             Write-Json (Result 'starting') (Join-Path $run 'state.json')
             Start-ScheduledTask -TaskName $taskName
         } catch {

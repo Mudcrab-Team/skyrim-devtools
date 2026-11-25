@@ -14,15 +14,21 @@ set(COMMONLIB_ENABLE_IPO OFF CACHE BOOL "")
 set(SKSE_SUPPORT_PATCH_SAFETY OFF CACHE BOOL "")
 add_subdirectory("${COMMONLIB_SOURCE}" commonlib)
 find_package(nlohmann_json CONFIG REQUIRED)
+find_package(minhook CONFIG REQUIRED)
 
-add_library(SkyrimDevToolsRpc STATIC rpc.cpp)
-target_compile_features(SkyrimDevToolsRpc PRIVATE cxx_std_20)
-target_include_directories(SkyrimDevToolsRpc PRIVATE "${HTTPLIB_SOURCE}")
-target_compile_definitions(SkyrimDevToolsRpc PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
-    _WIN32_WINNT=0x0A00 CPPHTTPLIB_WEBSOCKET_MAX_PAYLOAD_LENGTH=8192)
-target_link_libraries(SkyrimDevToolsRpc PUBLIC nlohmann_json::nlohmann_json PRIVATE ws2_32)
+# The transport is kept apart from CommonLib so httplib and the game headers never share a unit.
+add_library(SkyrimDevToolsServer STATIC server/server.cpp)
+target_compile_features(SkyrimDevToolsServer PRIVATE cxx_std_20)
+target_include_directories(SkyrimDevToolsServer PRIVATE "${HTTPLIB_SOURCE}" "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(SkyrimDevToolsServer PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
+    _WIN32_WINNT=0x0A00 CPPHTTPLIB_WEBSOCKET_MAX_PAYLOAD_LENGTH=16777216)
+target_link_libraries(SkyrimDevToolsServer PUBLIC nlohmann_json::nlohmann_json PRIVATE ws2_32)
 
-add_library(SkyrimDevTools SHARED plugin.cpp)
+# Every module .cpp is linked straight into the DLL, so its static registrar is never dropped.
+file(GLOB DEVTOOLS_MODULES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+add_library(SkyrimDevTools SHARED ${DEVTOOLS_MODULES})
+target_compile_features(SkyrimDevTools PRIVATE cxx_std_23)
+target_include_directories(SkyrimDevTools PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(SkyrimDevTools PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(SkyrimDevTools PRIVATE
-    CommonLibSSE::CommonLibSSE SkyrimDevToolsRpc user32)
+    CommonLibSSE::CommonLibSSE SkyrimDevToolsServer minhook::minhook user32)

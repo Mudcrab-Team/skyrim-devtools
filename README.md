@@ -16,17 +16,18 @@ finding slow work in Skyrim's game loop.
 
 ## What works today
 
-The Mac runner starts an SKSE session on the Windows test desktop, loads a disposable save,
-and waits for the game to report that it is playable. It opens Inventory, waits for the
-game's UI to report both the open menu and its Scaleform root, and closes it. After the
-configured number of cycles it checks one Tab tap in Inventory and reads the observed
-result of the read-only GetSKSEVersion console command. The host records a clean stop
-only when the owned process exits with code zero after a stop request.
+The Mac runner starts an SKSE session on the Windows test PC, loads a disposable save and
+drives it through the [protocol 2 API](docs/protocol.md). It opens any menu, runs any console
+command and returns its output, injects keys, mouse input and controls inside the game, loads
+saves while the game is running, moves the player between cells and pushes menu, load, cell
+and console events. In headless mode the game runs in a small borderless window off-screen
+and does not need focus or an unlocked desktop.
 
-The first live test loaded a fresh fixture, completed five Inventory open and
-close cycles, and observed SKSE 2.3.1 in a separate console check. The single Tab
-check after the cycles remains intermittent. The runner reports that failure
-and closes Inventory before shutting down.
+The smoke runner loads the fixture, cycles Inventory through `UI.openMenu`, closes Inventory
+with an injected Tab key repeatedly, checks `GetSKSEVersion` and `GetAV Health` console output,
+reloads the save and prints counts and timings. Two headless runs on the test PC closed
+Inventory with Tab 100 out of 100 times while the game was not the foreground window. A boot
+reaches the main menu in about 7 s, a save loads in about 3 s and a reload takes under 1 s.
 
 ## Windows build
 
@@ -40,9 +41,11 @@ Target Windows x64 with Visual Studio 2022, CMake, and these local source checko
   The transport includes the upstream [WebSocket server header](https://github.com/yhirose/cpp-httplib/tree/7800c3dc5b33285cbb18baa5998de4ff7ef63515).
 - COMMUNITY(nlohmann/json@55f93686c01528224f448c19128836e7df245f72, MIT).
   [JSON for Modern C++ v3.12.0](https://github.com/nlohmann/json/tree/55f93686c01528224f448c19128836e7df245f72).
+- [MinHook](https://github.com/TsudaKageyu/minhook) (BSD-2-Clause) from the same vcpkg tree detours the
+  input poll and the console printer.
 - The Python client uses [websockets 16.0](https://github.com/python-websockets/websockets/tree/16.0) (BSD-3-Clause).
 
-Install directxmath, directxtk, fmt, nlohmann-json, rapidcsv and spdlog with the
+Install directxmath, directxtk, fmt, minhook, nlohmann-json, rapidcsv and spdlog with the
 x64-windows-static-md triplet of [vcpkg 2026.10.16](https://github.com/microsoft/vcpkg/tree/5d4a3dc90c0b3773f3bac81bf41297b54328f471).
 Set `$deps` to the directory containing your local dependency checkouts. The Release build selects CommonLib's AE
 configuration. Keep the library, dependency tree, generated DLL, and PDB under the owner's
@@ -66,19 +69,32 @@ scratch root with the following layout.
   directory stage SkyrimDevTools.dll and the matching
   [Address Library](https://www.nexusmods.com/skyrimspecialedition/mods/32444) table
   versionlib-1-7-104-0.bin. Use a clean load order and one plugin DLL.
-- **profile/** with private Skyrim.ini and SkyrimPrefs.ini copies and an empty Saves subdirectory.
+- **profile/** with private Skyrim.ini and SkyrimPrefs.ini copies and a Saves subdirectory.
   Set [General] sLocalSavePath=Saves\ in Skyrim.ini. Set bSaveOnPause, bSaveOnRest, bSaveOnTravel
   and bSaveOnWait to 0 in SkyrimPrefs.ini. On this test account only, point the Documents
   My Games\Skyrim Special Edition junction to the private profile so logs and saves land there.
 - **fixture.ess** with a locally owned vanilla save that loads with that load order and starts
-  in a quiet location with prompts dismissed. The launcher copies it into the scratch save directory before launch.
+  in a quiet location with prompts dismissed. Each launch empties the scratch save directory,
+  so saves the game wrote in an earlier run are discarded. It then copies this file in as
+  Fixture.ess, along with any .ess and .skse files from an optional **fixtures/** directory.
 - **config.json** with {"port":48682,"cloudSyncDisabled":true} after disabling Steam Cloud for Skyrim.
+  Optional keys are `headless` (default false), `width` and `height` (1280x720),
+  `muteAudio` (true), `watchdogMinutes` (240, 0 turns it off), `idleTimeoutSeconds` (1800) and
+  `connectTimeoutSeconds` (600). For the two timeouts, 0 turns them off.
+
+The first launch copies Skyrim.ini and SkyrimPrefs.ini to profile/ini-original/. Every launch
+writes the effective INIs from those copies. A headless launch adds bAlwaysActive=1, bFull
+Screen=0, bBorderless=1, the configured iSize W/H and fAudioMasterVolume=0. A windowed launch
+restores the originals unchanged. Edit settings in ini-original/ from then on.
 
 Put Steam in [Offline Mode](https://help.steampowered.com/en/faqs/view/0E18-319B-E34B-B2C8)
-and leave the test desktop logged in and unlocked. Run the setup command once as that user.
-The task uses the interactive token so that the game's window can receive input.
-Preflight reports an inactive or locked desktop, unavailable Steam, unconfirmed Offline Mode
-or unconfirmed Steam Cloud settings before it starts the loader.
+and keep the test account logged in. Run the setup command once as that user. The task runs
+in that interactive session because the game needs a desktop window. A windowed launch also
+requires the desktop to be unlocked. A headless launch only requires an active session: the
+plugin moves the window off-screen and hands focus back to the shell, and the game keeps
+rendering there with bAlwaysActive. Preflight reports an inactive or locked desktop,
+unavailable Steam, unconfirmed Offline Mode or unconfirmed Steam Cloud settings before it
+starts the loader. Headless runs on a locked desktop have not been tested yet.
 
 Keep the original Documents profile backed up while the junction is active.
 After Skyrim closes, remove the junction and restore the original profile if
@@ -104,25 +120,22 @@ Set `sshConfig` if the alias is in a separate SSH config file.
 python3.13 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e .
-skyrim-devtools-smoke --config .local/devtools-mac.json --cycles 5
+skyrim-devtools-smoke --config .local/devtools-mac.json --cycles 5 --tab-trials 20 --mode headless
 python -m unittest discover -s tests
 ~~~
 
-Use --session-only to exercise launch, handshake, fixture load and shutdown. The runner
+Use --session-only to exercise launch, handshake, fixture load and shutdown. --mode overrides
+the host's `headless` setting for one run. The runner
 prints aggregate counts. The private Windows runs directory holds the launcher status
 and RPC transcript. The profile holds the game and loader logs.
 
 ## RPC protocol
 
-Protocol 1 uses one JSON-RPC 2.0 call with a numeric ID per WebSocket text message at /rpc.
-The locked-down listener binds to Windows loopback, authenticates a per-run bearer token,
-rejects browser origins and holds a single controller lease. SSH forwards loopback to
-loopback. Session.getInfo, Session.loadFixture, Session.close, Events.snapshot,
-UI.openMenu, UI.closeMenu, Input.dispatchKey and Console.execute are the supported calls.
-Console.execute accepts GetSKSEVersion and Events.snapshot reports its fresh output in
-consoleVersion once the console has published it.
-Menu and input mutations carry the current load epoch. The snapshot sequence counts observed
-UI tasks. Native event streaming, menu locators and equipment assertions belong to later work.
+See [docs/protocol.md](docs/protocol.md) for the protocol 2 method list and event types, and
+for how to add a method or event. The listener binds to Windows loopback, authenticates a
+per-run bearer token, rejects browser origins and accepts a single controller. SSH forwards
+loopback to loopback. `skyrim_devtools.client.Session` keeps several calls in flight, queues
+events and survives timed-out calls.
 
 ## Prior art reviewed
 
@@ -138,6 +151,9 @@ UI tasks. Native event streaming, menu locators and equipment assertions belong 
   is a GPLv3 JavaScript and TypeScript runtime with a broader scripting surface and Chromium integration.
 - [SkyLink AI](https://github.com/maksidze/Skyrim-MCP/tree/82a0a80d31ae7d2254d40c129650d1e260da38a2)
   states MIT in its README. It uses a named pipe and a separate .NET MCP bridge for many game actions.
+
+- [devbench](https://github.com/alandtse/devbench) (GPL-3.0) injects input at the same input
+  poll. Its approach was studied. No code was copied.
 
 These projects were reviewed as source references. The runner uses the pinned libraries above
 directly and includes original host, protocol, and game adapter code.
