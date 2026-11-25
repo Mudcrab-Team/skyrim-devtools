@@ -21,6 +21,11 @@ NOT_READY = -32004
 TIMEOUT = -32008
 
 
+def _params(**values):
+    """Drop unset optional parameters so the plugin's own defaults apply."""
+    return {key: value for key, value in values.items() if value is not None}
+
+
 class RpcError(RuntimeError):
     def __init__(self, code, message, data=None):
         super().__init__(f"RPC {code} · {message}")
@@ -193,6 +198,61 @@ class Session:
         if ring_size is not None:
             params["ringSize"] = ring_size
         return await self.call("Perf.configure", **params)
+
+    # Structured game-state queries. Results are compact JSON; form IDs are 8-digit hex strings.
+
+    async def player_state(self, avs=None):
+        return await self.call("Player.state", **({"avs": avs} if avs else {}))
+
+    async def inventory(self, filter=None, limit=100):
+        return await self.call("Player.inventory", **_params(filter=filter, limit=limit))
+
+    async def equipped(self):
+        return await self.call("Player.equipped")
+
+    async def spells(self, kind=None, limit=100):
+        return await self.call("Player.spells", **_params(kind=kind, limit=limit))
+
+    async def nearby(self, radius=1000, types=None, limit=20):
+        return await self.call("World.nearby", **_params(radius=radius, types=types, limit=limit))
+
+    async def crosshair(self):
+        return (await self.call("World.crosshair"))["ref"]
+
+    async def form(self, form_id=None, editor_id=None):
+        return await self.call("Form.get", **_params(formID=form_id, editorID=editor_id))
+
+    async def ref(self, ref_id):
+        return await self.call("Ref.get", refID=ref_id)
+
+    async def quest(self, editor_id=None, form_id=None, all_objectives=False):
+        return await self.call("Quest.get", **_params(
+            editorID=editor_id, formID=form_id, allObjectives=all_objectives or None))
+
+    async def active_quests(self, limit=30):
+        return await self.call("Quest.active", limit=limit)
+
+    async def global_value(self, editor_id=None, form_id=None):
+        return (await self.call("Global.get", **_params(editorID=editor_id, formID=form_id)))["value"]
+
+    async def game_time(self):
+        return await self.call("Game.time")
+
+    async def set_timescale(self, value):
+        return await self.call("Game.setTimescale", value=value)
+
+    async def teleport(self, x=None, y=None, z=None, ref_id=None, yaw_deg=None):
+        return await self.call("Player.teleport", **_params(
+            x=x, y=y, z=z, refID=ref_id, yawDeg=yaw_deg, loadEpoch=self.epoch))
+
+    async def set_av(self, av, value):
+        return await self.call("Player.setAV", av=av, value=value, loadEpoch=self.epoch)
+
+    async def add_item(self, form_id, count=1):
+        return await self.call("Player.addItem", formID=form_id, count=count, loadEpoch=self.epoch)
+
+    async def remove_item(self, form_id, count=1):
+        return await self.call("Player.removeItem", formID=form_id, count=count, loadEpoch=self.epoch)
 
     async def next_event(self, predicate, timeout):
         """Wait for a queued notification that satisfies predicate, discarding the others."""
