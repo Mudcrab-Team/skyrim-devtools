@@ -1,0 +1,14 @@
+SkyrimDevtools licensing
+
+MIT covers the Python client, Windows launcher, native transport, build scripts
+and tests. See licenses/MIT.txt.
+
+The Windows plugin adapter, native/plugin.cpp, carries GPL-3.0-or-later. See
+licenses/CommonLibSSE-GPL-3.0.txt and the pinned CommonLibSSE-NG notices and
+linking exceptions in README.md.
+
+Project documentation is dedicated under CC0 1.0 Universal. See
+licenses/CC0-1.0.txt.
+
+Third-party dependencies retain their licenses. Skyrim and related game assets
+and trademarks are the property of their respective owners.

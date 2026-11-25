@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "status": "pinned",
+  "build_id": "sse-steam-1-7-104",
+  "game": "The Elder Scrolls V: Skyrim Special Edition",
+  "store": "Steam (app 489830, Steam build 24914197)",
+  "version": "1.7.104.0",
+  "architecture": "x86-64",
+  "image_sha256": "846efccf0c1374d71f892907f46549560f2fcb0a75cb87a3eed438baa0f1402f",
+  "scope_notes": "SkyrimSE.exe as installed by Steam. Version is the executable's own VERSIONINFO FileVersion/ProductVersion, cross-checked against the Steam app manifest build id. Image hash covers the file as installed, including the Steam wrapper section."
+}

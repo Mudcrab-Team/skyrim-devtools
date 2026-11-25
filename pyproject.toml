@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skyrim-devtools"
+version = "0.1.0"
+description = "Offline Skyrim Special Edition automation over SKSE and JSON-RPC"
+readme = "README.md"
+requires-python = ">=3.13"
+license = "MIT"
+license-files = ["licenses/MIT.txt"]
+dependencies = ["websockets==16.0"]
+
+[project.scripts]
+skyrim-devtools-smoke = "skyrim_devtools.smoke:main"
+
+[tool.setuptools.packages.find]
+include = ["skyrim_devtools"]
