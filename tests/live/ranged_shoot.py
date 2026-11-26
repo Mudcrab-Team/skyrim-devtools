@@ -5,6 +5,10 @@ stands in for the archer so nothing shoots back. Returns {"pass", "details"} wit
 """
 import asyncio
 import math
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from skyrim_devtools.use import ranged
 
@@ -14,6 +18,11 @@ CANDIDATES = ("EncBandit01Missile", "EncBandit02Missile", "EncBandit01Melee", "E
 MAX_SHOTS = 8
 MIN_HIT_RATE = 0.5
 MIN_DRAW_S = 1.5
+
+
+def xyz(pos):
+    """Player.state and World.models give positions as [x, y, z]; accept a dict too."""
+    return tuple(pos) if isinstance(pos, (list, tuple)) else (pos["x"], pos["y"], pos["z"])
 
 
 def clean(params):
@@ -83,9 +92,10 @@ async def run(ctx):
 
     details = {}
     state = await native("Player.state")
-    pos = state["pos"]
-    yaw = (state.get("rotation") or {}).get("z", 0.0)
-    start = {"x": pos["x"], "y": pos["y"], "z": pos["z"], "yawDeg": yaw}
+    pos = xyz(state["pos"])
+    rotation = state.get("rotation")
+    yaw = rotation[2] if isinstance(rotation, (list, tuple)) else (rotation or {}).get("z", 0.0)
+    start = {"x": pos[0], "y": pos[1], "z": pos[2], "yawDeg": yaw}
     for bow in BOWS:
         try:
             await native("Player.addItem", editorID=bow, count=1)
@@ -106,7 +116,7 @@ async def run(ctx):
     if not models:
         details["bridge"] = {"pass": False, "error": "no bridge model within 6000 units"}
     else:
-        deck = models[0]["pos"]
+        deck = xyz(models[0]["pos"])
         under = None
         for radius in (0, 150, 300):
             for k in range(8 if radius else 1):
@@ -114,9 +124,9 @@ async def run(ctx):
                 x, y = deck[0] + radius * math.sin(a), deck[1] + radius * math.cos(a)
                 await native("Player.teleport", x=x, y=y, z=deck[2] - 60.0, yawDeg=yaw)
                 await asyncio.sleep(1.5)
-                here = (await native("Player.state"))["pos"]
-                if here["z"] < deck[2] - 40:
-                    under = (x, y, here["z"])
+                here = xyz((await native("Player.state"))["pos"])
+                if here[2] < deck[2] - 40:
+                    under = (x, y, here[2])
                     break
             if under:
                 break
@@ -130,3 +140,64 @@ async def run(ctx):
             details["bridge"]["playerStart"] = under
     await native("Console.execute", command="tgm", target="player")
     return {"pass": all(details.get(k, {}).get("pass") for k in ("flat", "bridge")), "details": details}
+
+
+class DryCtx:
+    """A scripted stand-in for the game so the script's own logic runs without one (`--dry-run`)."""
+
+    class Manager:
+        def __init__(self, world):
+            self.world = world
+
+        async def call(self, method, timeout=None, **params):
+            return await self.world.call(method, **params)
+
+    def __init__(self):
+        self.manager = DryCtx.Manager(self)
+        self.health = 100.0
+        self.shot = 0
+        self.placed = False
+        self.marks = []
+
+    def mark(self, text):
+        self.marks.append(text)
+
+    async def screenshot(self, label):
+        return label
+
+    async def call(self, method, **p):
+        if method == "Player.state":
+            return {"pos": [0.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0]}
+        if method == "World.nearby":
+            return {"refs": [{"refID": "00AA", "dead": False}] if self.placed else []}
+        if method == "Console.execute":
+            self.placed = self.placed or p["command"].startswith("placeatme")
+            return {"lines": []}
+        if method == "World.models":
+            return {"refs": [{"pos": [500.0, 0.0, 300.0]}]}
+        if method == "Ranged.loadout":
+            return {"ready": True, "equipQueued": False, "bowEquipped": True, "ammoEquipped": True, "bow": {"speed": 1.0},
+                    "ammo": {"projectile": {"speed": 3000, "gravity": 0.69}}}
+        if method == "Ranged.state":
+            return {"drawn": True, "position": [0, 0, 0], "ammoLeft": 50}
+        if method == "Ranged.los":
+            return {"clear": True, "from": [0, 0, 110], "torso": [0, 1000, 60], "head": [0, 1000, 120], "target": [0, 1000, 0],
+                    "health": self.health, "dead": self.health <= 0, "distance": 1000}
+        if method == "Combat.attack":
+            self.health -= 40
+            return {}
+        if method == "Ranged.arrows":
+            return {"arrows": []}
+        return {}
+
+
+if __name__ == "__main__":
+    import json
+    import sys
+
+    if "--dry-run" in sys.argv:
+        ranged.SETTLE_S = 0.0
+        ranged.rm.default_draw_s = lambda speed: 0.2
+        result = asyncio.run(run(DryCtx()))
+        print(json.dumps(result, default=str))
+        sys.exit(0 if result["details"].get("flat", {}).get("checks") else 1)
