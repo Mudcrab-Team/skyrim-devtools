@@ -105,6 +105,11 @@ fast path (and the one that works with muted audio). A trainer, merchant or gift
 the dialogue; `dialogue_wait` then answers `submenu` and the conversation stays frozen until that menu is closed
 so act in it first and leave it with the exit key (`press_control Cancel`) or `dialogue_close`; hiding a training menu with `close_menu` was followed by a frozen game within two minutes in two of two runs, so `open_menu` now refuses trainer, barter, gift, container, lockpicking, crafting, dialogue and book menus (pass `force` to override) and `close_menu` leaves them with the Cancel control. Muted (headless) audio does not stall a conversation, but every line still lasts as long as its voice, so use `skip`. The plugin turns dialogue subtitles on so NPC lines can be read.
 
+## Mod testing
+
+`dialogue_topics`, `dialogue_explore`, `coverage_start` and `coverage_report` check what a mod's dialogue, quests
+and scenes do in a play session; see [mod-testing.md](mod-testing.md).
+
 ## Performance
 
 Call `perf_check` first in every playtest, once the world is loaded and before any other tool. It waits 10 s,

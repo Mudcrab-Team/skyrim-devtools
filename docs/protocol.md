@@ -132,6 +132,18 @@ source=plugin`), at most six times per run.
 `host.ps1 stop <session> -Grace N` asks the game to quit and kills it after N seconds (default 12);
 state.json then carries `stopPath`: `graceful`, `killed-after-Ns` or `closing-crashed`.
 
+### Dialogue records and coverage
+
+| Method | Thread | Params | Result and meaning |
+| --- | --- | --- | --- |
+| Dialogue.topics | main | refID, includeGeneric? (false), onlyPassing? (false), plugins?, quest? (substring of editor ID or name), kinds? (`player`, `command`, `scene`, `combat`, `favors`, `detection`, `service`, `misc`), limit? (300), responses? (true) | Topics the actor could say or offer: `{speaker, topicTotal, infoTotal, passing, saidOnce, truncated, topics:[{formID, editorID, text, kind, subtype, plugin, quest:{formID, editorID, name, plugin, running}, offeredNow, infos:[{formID, plugin, passes, sayOnce, said, addressed, failing?, questFailing?, text?}]}]}`. Conditions are evaluated by the engine with the actor as subject and the player as target; `failing` lists the function indexes of false items. Lines whose info or quest conditions name another speaker are left out; `includeGeneric` adds lines with no speaker condition. |
+| Dialogue.offered | ui | | `{open, currentInfo, topics:[{index, text, neverSaid, topic, info, quest}]}`: the dialogue menu's list with record ids. |
+| Coverage.start | main | plugins? (plugin file names, case-insensitive) | Resets and starts a session; `{started, plugins, unknownPlugins, infosAlreadySaid, papyrusHooked}`. |
+| Coverage.report | main | limit? (100), stop? | `{active, plugins, durationS, stages:{hit, defined, covered, quests, missed}, infos:{said, defined, covered, missed}, scenes:{started, defined}, questsStarted, papyrus:{errors, errorCount, warnings, warningCount, scriptsLogging}}`, filtered to the plugins by the plugin that created each record. |
+
+Events: `dialogueInfo {info, topic, topicText, quest, questEditorID, plugin}` when an NPC begins a dialogue info
+and `papyrusError {severity, text, script, form}` for each Papyrus warning, error or fatal log line.
+
 ### Movement, camera, navigation and recording
 
 Headings are degrees clockwise from north (+Y), so 90 is east (+X). Distances are game units

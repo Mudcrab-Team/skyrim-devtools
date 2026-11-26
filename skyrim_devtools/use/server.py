@@ -11,7 +11,7 @@ import time
 
 from mcp.server.fastmcp import FastMCP, Image
 
-from . import capture, combat, perception, saves
+from . import capture, combat, modtest, perception, saves
 from .manager import GameError, GameManager
 from .timeline import Recorder
 
@@ -582,6 +582,7 @@ def build_server(manager, recorder=None):
     combat.register(mcp, native, manager)
     perception.register(mcp, native, manager)
     saves.register(mcp, manager, native)
+    modtest.register(mcp, native, manager, recorder)
 
     # ---- movement, camera, navigation, recording ----------------------------------------------
 
