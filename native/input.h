@@ -21,6 +21,8 @@ namespace devtools::input
     using PollListener = std::function<void(float seconds, Drive& drive)>;
     void SetPollListener(PollListener listener);
     [[nodiscard]] bool Hooked();
+    // QPC seconds (perf::Now) of the latest key, control or mouse request; 0 before the first.
+    [[nodiscard]] double LastRequestAt();
     // Controls actually injected on the latest poll, for recordings.
     [[nodiscard]] std::vector<std::string> DrivenControls();
 }

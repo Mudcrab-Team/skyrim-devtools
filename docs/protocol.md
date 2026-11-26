@@ -279,6 +279,21 @@ call into the engine. The chosen target is remembered between calls.
 | Ranged.arrows | main | | The player's own projectiles in the manager: `{arrows:[{refID, pos, velocity, distance, power, destroyed}]}` (velocity in units per second), for flight tracking and calibration. |
 | Ranged.state | main | | `{attackState, weaponState, drawn, eye, position, headingDeg, ammoLeft?}`. |
 
+### Alerts
+
+| Method | Thread | Params | Result |
+|---|---|---|---|
+| Alerts.state | any | history? (bool), limit? (history entries, default 50, max 200) | `{active[], history?[], cost, thresholds, disabled[]}`; an alert is `{kind, severity (info\|warn\|error), sinceMs, ageS, hint, detail}`; a history entry `{action: raised\|cleared, ms, kind, ...}`; `cost` is `{ticks, mainMeanUs, mainMaxUs, mainLastUs, pollerMeanUs, pollerMaxUs}` |
+| Alerts.configure | any | thresholds? (name to number), disable? / enable? (kind lists), reset? | Current `{thresholds, disabled}`. Names: pollMs, questStalledMin, combatStalemateS, deathCount, deathWindowMin, deathNearDist, fallDrop, fallTimeS, swimStallS, swimProgressDist, pitchLimitDeg, pitchBlindS, menuOpenS, notFocusedS, lowFpsBelow, lowFpsS, hitchMs, lowHealthPct, targetCheckS, questCheckS, healCheckS |
+| Alerts.dismiss | any | kind, forS? (default 300) | Clears the alert and suppresses re-raising it for that long |
+
+Events: `alertRaised {kind, severity, sinceMs, ageS, hint, detail}` and `alertCleared {kind, sinceMs, durationMs, why}`.
+Kinds the plugin raises: questStalled, combatStalemate, deathLoop, fellOrOutOfBounds, blindCamera (pitch),
+menuLeftOpen, paused, lowFps, overEncumbered, crime, targetDead, targetUnreachable, lowHealthNoHeal; the skyrim-use
+server adds actionLoop, a screenshot-based blindCamera and moveStuck (from `moveStuck`/`moveUnstuck`).
+`Screen.capture` replies also carry `meanLuma` (0-255) and `dominantShare` of the encoded frame. See
+docs/skyrim-use.md, Alerts.
+
 ## Errors
 
 | Code | Meaning |

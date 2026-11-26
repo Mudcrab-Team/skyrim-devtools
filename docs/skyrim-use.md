@@ -47,6 +47,7 @@ server speaks plain stdio. When the client exits the server stops the game, so a
 | Combat | `combat_state {radius}`, `combat_target`, `combat_face`, `combat_draw`, `combat_equip {name, hand}`, `combat_unequip`, `combat_attack {kind=light\|power, hand}`, `combat_block`, `combat_cast`, `combat_drink {kind}`, `combat_shoot {target, shots, draw_s, part, reposition, weapon}`, `combat_fight {style, rounds, drink_below}` (a bounded loop over the primitives), `player_equipped`, `player_spells` |
 | Navigate | `nav_nearby {radius, kind}`, `nav_places {contains}`, `nav_goto {goal, mode=input\|ai, timeout_s, on_combat, on_dialogue, on_message_box, on_menu, invulnerable, via, route, activate}`, `nav_plan {ref_id \| x, y, z, route}`, `nav_status`, `nav_wait {timeout_s}`, `nav_cancel` |
 | Record | `record_start {hz, fields, name}`, `record_stop`, `record_fetch {name, dest_dir?, plot}`, `trajectory_plot {file, color_by, route}`, `record_replay_camera {name, speed}` |
+| Alerts | `agent_alerts {history, limit, dismiss, dismiss_seconds, configure}` (every other reply also carries the active alerts, see Alerts) |
 | Generic | `rpc_methods`, `rpc_call {method, params}` |
 
 `game_start` and `game_status` report `plugin` {buildId, missingMethods, stale} and, when the plugin DLL on the host is older than this client, a top-level `warning`; redeploy with `tools/pc-build --deploy` rather than debugging tools that silently do nothing.
@@ -135,6 +136,42 @@ so act in it first and leave it with the exit key (`press_control Cancel`) or `d
 
 `dialogue_topics`, `dialogue_explore`, `coverage_start` and `coverage_report` check what a mod's dialogue, quests
 and scenes do in a play session; see [mod-testing.md](mod-testing.md).
+## Alerts
+
+Alerts tell you when you are wasting time. Every tool reply carries the active ones as a short `alerts` field
+(`[{kind, severity, since, hint}]`; a JSON reply gets the key, a plain-text reply an `alerts: [...]` line, an
+image reply an extra text part). The field is absent when nothing is active. `agent_alerts` returns them in full
+(`sinceMs`, `ageS`, `detail`), with `history=true` the last raised and cleared entries, the plugin's per-tick
+`cost`, and the current thresholds. `agent_alerts {dismiss: kind}` hides one you have dealt with for
+`dismiss_seconds` (default 300). Each raise and clear is also a `{"t":"alert"}` line in the session timeline, and
+the showcase composer shows the active kinds in the status panel.
+
+| Kind | Raised when (default) | What to try |
+|---|---|---|
+| `questStalled` | the tracked quest's stage and objectives are unchanged for `questStalledMin` (8 min) | re-read `quest_targets`, try another approach |
+| `actionLoop` | the same tool with the same arguments gave the same result `actionLoopCount` (3) times within `actionLoopWindowS` (120 s); waiting and status tools are exempt | change the approach |
+| `combatStalemate` | in combat `combatStalemateS` (20 s) with neither the player's nor any hostile's health changing | reposition, ranged attack, leave |
+| `deathLoop` | `deathCount` (2) deaths within `deathWindowMin` (10 min), or that many within `deathNearDist` (1500 units) of one spot | kit up, level, avoid, or the invulnerable fallback |
+| `fellOrOutOfBounds` | falling `fallTimeS` (3 s), `fallDrop` (2000 units) below the last ground, or swimming `swimStallS` (30 s) without getting `swimProgressDist` (600) away | `player.moveto`, `coc`, or reload |
+| `blindCamera` | the camera pitch is beyond `pitchLimitDeg` (70) for `pitchBlindS` (15 s), or a `screenshot` is mostly black (`blindMeanLuma` 12) or one colour (`blindDominantShare` 0.92) | look level, check for a menu or fade |
+| `menuLeftOpen` | a non-HUD menu is open `menuOpenS` (30 s) with no input request | close it |
+| `paused` | the game is paused with no menu open, or (windowed runs) not the foreground window, for `notFocusedS` (5 s) | close the menu or refocus |
+| `lowFps` | fps under `lowFpsBelow` (30) for `lowFpsS` (10 s), or one frame over `hitchMs` (1000 ms; held 30 s) | pause actions, `perf_hitches` |
+| `overEncumbered` | carried weight above the carry limit | drop or store items |
+| `crime` | a bounty gained, stolen goods value rising, or a hostile guard (held 60 s) | pay, jail or avoid |
+| `targetDead`, `targetUnreachable` | a tracked quest's target actor is dead (the detail says if it is essential), or is disabled or in no cell; checked every `targetCheckS` (10 s) | re-check the quest, reload, or another route |
+| `lowHealthNoHeal` | health under `lowHealthPct` (30) with no restoring potion and no healing spell | retreat, rest, console heal |
+| `moveStuck` | the movement stuck detector's `moveStuck` event, until `moveUnstuck` | another route, open the door |
+
+Change thresholds with `agent_alerts {configure: {"thresholds": {"questStalledMin": 3}, "disable": ["crime"]}}`;
+the plugin owns the native keys (`Alerts.configure`), the MCP server the `actionLoop*` and `blind*` ones. Alerts
+are not shown before a save is loaded, and a save load resets every timer.
+
+Cost: a poller thread asks the game thread for one sample about every `pollMs` (500 ms), and all detectors run on
+the poller thread. The game-thread part is a handful of reads (the quest and target checks every 5 s and 10 s,
+the potion scan only while health is low). `agent_alerts` reports it as `cost`: `mainMeanUs` and `mainMaxUs` are the
+game-thread time per sample, `pollerMeanUs` the detector time; the sample also appears in `Perf.hitches`
+`slowCalls` as `Alerts.tick` if it ever exceeds 5 ms.
 
 ## Performance
 

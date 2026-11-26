@@ -10,5 +10,15 @@ namespace devtools::perf
     [[nodiscard]] double Now();
 
     // A handler that held the game thread (or waited for it) long enough to matter for frame pacing.
+    // Frame pacing over the last `seconds`: presents counted, and the longest gap between two of them.
+    // Reads the frame ring under its lock, so it is cheap enough for a 2 Hz poller.
+    struct RecentFrames
+    {
+        std::size_t count = 0;
+        double maxMs = 0.0;
+        bool hooked = false;
+    };
+    [[nodiscard]] RecentFrames Recent(double seconds);
+
     void NoteCall(const std::string& method, const char* thread, double startedAt, double queuedMs, double ranMs);
 }
