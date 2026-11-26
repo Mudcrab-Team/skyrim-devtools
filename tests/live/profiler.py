@@ -1,9 +1,11 @@
 #!/usr/bin/env python3.13
 """Live check of the sampling profiler (SPDX-License-Identifier: GPL-3.0-or-later).
 
+    skyrim-devtools-livetest run REQUEST.yaml          as a harness module: async run(ctx) on the shared session
     python3.13 tests/live/profiler.py --config host.json [--case idle,walk,cellload,watch] [--seconds 20]
+    python3.13 tests/live/profiler.py --dry-run         every case against a fake plugin, no game
 
-One visible game session in Riverwood. Each profiling case measures frame times for `seconds` without the
+All cases share one game session in Riverwood. Each profiling case measures frame times for `seconds` without the
 profiler, then the same load with it, fetches and symbolises the profile and writes the outputs under --out.
 Prints {"pass": bool, "details": {case: {...}}}; each case lists the checks it failed.
 """
@@ -11,6 +13,7 @@ Prints {"pass": bool, "details": {case: {...}}}; each case lists the checks it f
 import argparse
 import asyncio
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -68,7 +71,7 @@ async def profile_case(manager, symbols, name, spec, seconds, out):
     await manager.call("Profile.start", threads=spec["threads"], hz=1000, durationS=seconds + 60)
     on = await frame_window(manager, spec["phase"], seconds)
     began = time.monotonic()
-    raw, head = await profiling.fetch(manager.call)
+    raw, fetched = await profiling.fetch(manager.call)
     fetch_s = time.monotonic() - began
     raw["context"] = {"phase": spec["phase"], "off": off, "on": on}
     began = time.monotonic()
@@ -98,7 +101,7 @@ async def profile_case(manager, symbols, name, spec, seconds, out):
     return {
         "pass": not failed, "failed": failed, "off": off, "on": on, "fpsRatio": fps_ratio,
         "overhead": overhead, "coverage": summary["coverage"], "symbolSources": summary["symbolSources"],
-        "threads": len(raw.get("threads", [])), "bytes": head.get("bytes"),
+        "threads": len(raw.get("threads", [])), "transfer": fetched.get("transfer"),
         "fetchS": round(fetch_s, 1), "analyseS": round(analyse_s, 1), "modules": main["modules"],
         "topSelf": [f"{r['pct']}% {r['function']} [{r['module']}]" for r in main["topSelf"][:10]],
         "topWaits": [f"{r['pct']}% {r['function']}" for r in main["topWaits"][:3]],
@@ -136,44 +139,120 @@ async def watch_case(manager, symbols, seconds, out):
     }
 
 
+async def run_cases(manager, symbols, cases, seconds, out):
+    details = {"symbols": symbols.loaded, "out": str(out)}
+    for name in cases:
+        try:
+            if name == "watch":
+                details[name] = await watch_case(manager, symbols, seconds, out)
+            else:
+                details[name] = await profile_case(manager, symbols, name, CASES[name], seconds, out)
+        except Exception as error:  # noqa: BLE001 - one broken case must not hide the others
+            details[name] = {"pass": False, "failed": [f"{type(error).__name__}: {error}"[:300]]}
+            for method, params in (("Profile.stop", {}), ("Profile.watch", {"enabled": False})):
+                try:
+                    await manager.call(method, **params)
+                except Exception:  # noqa: BLE001 - nothing was running
+                    pass
+    ran = [details[n] for n in cases if n in details]
+    return {"pass": bool(ran) and all(c.get("pass") for c in ran), "details": details}
+
+
+def stamp_out(explicit=None):
+    return Path(explicit) if explicit else profiling.default_out("live-" + time.strftime("%Y%m%d-%H%M%S"))
+
+
+async def run(ctx):
+    """Harness entry: the shared session already has the request's save loaded."""
+    config = json.loads(Path(ctx.config_path).expanduser().read_text()) if ctx.config_path else {}
+    symbols = profiling.GameSymbols(profiling.research_root(None, config))
+    cases = os.environ.get("SKYRIM_PROFILER_CASES", "idle,walk,cellload,watch").split(",")
+    await wait_playable(ctx.manager)
+    return await run_cases(ctx.manager, symbols, cases, float(os.environ.get("SKYRIM_PROFILER_SECONDS", 20)),
+                           stamp_out(os.environ.get("SKYRIM_PROFILER_OUT")))
+
+
+class FakeManager:
+    """Just enough of the plugin to run every case without a game: a fixed toy profile, steady frames."""
+
+    def __init__(self):
+        frames = [{"m": 0, "rva": 0x1010, "start": 0x1000}, {"m": 1, "rva": 0x10, "sym": "NtWaitForSingleObject"}]
+        modules = [{"name": "SkyrimSE.exe", "path": "SkyrimSE.exe", "base": 0, "size": 0x100000, "game": True},
+                   {"name": "ntdll.dll", "path": "ntdll.dll", "base": 0, "size": 0x1000, "game": False}]
+        hitch = {"frame": 2, "ms": 134.0, "startMs": 16.0, "stacks": [[0], [1, 0]],
+                 "samples": [[0.0, 0, 0], [1.0, 1, 1]], "waitChain": None}
+        self.profile = {"format": "skyrim-devtools-profile", "version": 1, "hz": 1000.0, "threadsSpec": "all",
+                        "durationS": 1.0, "samplerCpuMs": 5.0, "frames": frames, "stacks": [[None, 0], [0, 1]],
+                        "modules": modules, "hitchThresholdMs": 100.0, "frameMarks": [[0.0, 16.0, 1]],
+                        "threads": [{"tid": t, "name": "", "main": t == 1, "frameThread": t == 1, "samples": 30000,
+                                     "walked": 29000, "suspendedMs": 1.0, "runs": [[0.0, 0, 20000, 0], [20.0, 1, 10000, 1]]}
+                                    for t in (1, 2, 3)],
+                        "hitches": [hitch], "hitchFrames": frames}
+        self.hitch = hitch
+
+    async def call(self, method, timeout=None, **params):
+        await asyncio.sleep(0)
+        if method == "Perf.frameStats":
+            return {"frame": 10, "fps": 60.0, "meanMs": 16.7, "p50Ms": 16.7, "p99Ms": 16.8, "maxMs": 17.0, "count": 1200}
+        if method == "Events.snapshot":
+            return {"playable": True, "menus": []}
+        if method == "Profile.stop":
+            if params.get("encoding") not in (None, "json"):
+                raise RuntimeError("Unexpected parameter 'encoding'")
+            text = json.dumps(self.profile)
+            return {"bytes": len(text), "chunks": 1, "summary": {}}
+        if method == "Profile.read":
+            return {"chunk": 0, "data": json.dumps(self.profile), "last": True}
+        if method == "Profile.hitches":
+            return {"modules": self.profile["modules"], "hitches": [self.hitch], "frames": self.profile["frames"]}
+        if method == "Perf.hitches":
+            return {"hitches": [{"frame": 2, "ms": 134.0}]}
+        return {}
+
+    async def stop(self):
+        pass
+
+
 async def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True)
+    parser.add_argument("--config", default=os.environ.get("SKYRIM_LIVETEST_CONFIG"))
     parser.add_argument("--case", default="idle,walk,cellload,watch")
     parser.add_argument("--seconds", type=float, default=20.0)
     parser.add_argument("--save", default="Fixture")
     parser.add_argument("--symbols", default=None, help="skyrim-research checkout (default: config researchCheckout)")
     parser.add_argument("--out", default=None, help="default .local/profiles/live-<stamp>")
+    parser.add_argument("--dry-run", action="store_true", help="run every case against a fake plugin, no game")
     options = parser.parse_args()
+    cases = options.case.split(",")
+    if options.dry_run:
+        global home  # noqa: PLW0603 - the dry run skips the cell changes
+        home = no_home
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            result = await run_cases(FakeManager(), profiling.GameSymbols(), cases, 0.05, Path(tmp))
+        print(json.dumps(result))
+        return 0 if result["pass"] else 1
+    if not options.config:
+        parser.error("--config is required (or SKYRIM_LIVETEST_CONFIG)")
     config = json.loads(Path(options.config).expanduser().read_text())
     symbols = profiling.GameSymbols(profiling.research_root(options.symbols, config))
-    out = Path(options.out) if options.out else profiling.default_out("live-" + time.strftime("%Y%m%d-%H%M%S"))
     manager = GameManager(config)
-    details = {"symbols": symbols.loaded, "out": str(out)}
     try:
         began = time.monotonic()
         await manager.start(headless=False, save=options.save)
         await wait_playable(manager)
-        details["startS"] = round(time.monotonic() - began, 1)
-        for name in options.case.split(","):
-            try:
-                if name == "watch":
-                    details[name] = await watch_case(manager, symbols, options.seconds, out)
-                else:
-                    details[name] = await profile_case(manager, symbols, name, CASES[name], options.seconds, out)
-            except Exception as error:  # noqa: BLE001 - one broken case must not hide the others
-                details[name] = {"pass": False, "failed": [f"{type(error).__name__}: {error}"[:300]]}
-                try:
-                    await manager.call("Profile.stop")
-                    await manager.call("Profile.watch", enabled=False)
-                except Exception:  # noqa: BLE001 - nothing was running
-                    pass
+        started = round(time.monotonic() - began, 1)
+        result = await run_cases(manager, symbols, cases, options.seconds, stamp_out(options.out))
+        result["details"]["startS"] = started
     finally:
         await manager.stop()
-    cases = [details[n] for n in options.case.split(",") if n in details]
-    result = {"pass": bool(cases) and all(c.get("pass") for c in cases), "details": details}
-    print(json.dumps(result, indent=1))
+    # one line, so a harness that reads the last stdout line gets the whole verdict
+    print(json.dumps(result))
     return 0 if result["pass"] else 1
+
+
+async def no_home(manager):
+    pass
 
 
 if __name__ == "__main__":

@@ -1,9 +1,11 @@
 import asyncio
+import base64
 import gzip
 import json
 from pathlib import Path
 import tempfile
 import unittest
+import zlib
 
 from skyrim_devtools import profiling
 
@@ -60,6 +62,17 @@ def raw_profile(runs, hz=1000.0):
 
 
 RUNS = [[0.0, 2, 4, 0], [4.0, 1, 2, 0], [6.0, 4, 3, 1], [9.0, 5, 1, 0]]
+
+
+def mszip_encode(data, block=32768):
+    """The Windows Compression API's MSZIP buffer layout, for decoder tests."""
+    out = bytearray(bytes.fromhex("0a51e5c01800c402") + len(data).to_bytes(8, "little") + block.to_bytes(8, "little"))
+    for start in range(0, len(data), block):
+        history = data[max(0, start - 32768):start]
+        packer = zlib.compressobj(9, zlib.DEFLATED, -15, zdict=history) if history else zlib.compressobj(9, zlib.DEFLATED, -15)
+        body = b"CK" + packer.compress(data[start:start + block]) + packer.flush()
+        out += len(body).to_bytes(4, "little") + body
+    return bytes(out)
 
 
 class SymbolTests(unittest.TestCase):
@@ -184,6 +197,44 @@ class ProfileTests(unittest.TestCase):
 
         raw, _ = asyncio.run(profiling.fetch(call))
         self.assertEqual(raw["hz"], 1000.0)
+
+    def test_fetch_decodes_mszip(self):
+        text = json.dumps(raw_profile(RUNS)) * 1
+        packed = base64.b64encode(mszip_encode(text.encode())).decode()
+        parts = [packed[:50], packed[50:]]
+
+        async def call(method, **params):
+            if method == "Profile.stop":
+                self.assertEqual(params.get("encoding"), "mszip")
+                return {"bytes": len(text), "encoding": "mszip", "encodedBytes": len(packed), "chunks": 2, "summary": {}}
+            return {"chunk": params["chunk"], "data": parts[params["chunk"]], "last": params["chunk"] == 1}
+
+        raw, summary = asyncio.run(profiling.fetch(call))
+        self.assertEqual(raw["hz"], 1000.0)
+        self.assertEqual(summary["transfer"]["encoding"], "mszip")
+
+    def test_mszip_blocks_share_a_dictionary(self):
+        data = ("".join(f"[{i % 977},{i % 13},1,0]," for i in range(40000))).encode()
+        self.assertEqual(profiling.mszip_decode(mszip_encode(data)), data)
+        with self.assertRaises(ValueError):
+            profiling.mszip_decode(b"not mszip" * 4)
+
+    def test_fetch_falls_back_for_an_older_plugin(self):
+        text = json.dumps(raw_profile(RUNS))
+        calls = []
+
+        async def call(method, **params):
+            calls.append((method, params))
+            if method == "Profile.stop":
+                if "encoding" in params:
+                    raise RuntimeError("Unknown parameter: encoding")
+                return {"bytes": len(text), "chunks": 1, "summary": {}}
+            return {"chunk": 0, "data": text, "last": True}
+
+        raw, summary = asyncio.run(profiling.fetch(call))
+        self.assertEqual(raw["hz"], 1000.0)
+        self.assertEqual(summary["transfer"]["encoding"], "json")
+        self.assertEqual(calls[1], ("Profile.stop", {}))
 
 
 if __name__ == "__main__":

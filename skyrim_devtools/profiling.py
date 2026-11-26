@@ -8,6 +8,8 @@ and project names. Everything written here goes to a local output directory.
 
 import argparse
 import asyncio
+import base64
+import binascii
 import bisect
 from collections import Counter, defaultdict
 import gzip
@@ -520,17 +522,72 @@ def flamegraph_svg(folded, title="Flame graph", kinds=None, width=1600, row=17):
     return "\n".join(out)
 
 
+MSZIP_MAGIC = bytes.fromhex("0a51e5c0")
+
 # ---- reading and writing --------------------------------------------------------------------------
 
 
+def mszip_decode(data):
+    """Inflate a Windows Compression API MSZIP buffer: a 24-byte header (magic, header size, algorithm,
+    uncompressed size, block size), then per block a 32-bit length and "CK" plus a raw deflate stream that
+    uses the previous 32 KiB of output as its dictionary."""
+    if len(data) < 24 or data[:4] != MSZIP_MAGIC:
+        raise ValueError("not an MSZIP buffer")
+    total = int.from_bytes(data[8:16], "little")
+    out = bytearray()
+    pos = 24
+    while len(out) < total:
+        if pos + 4 > len(data):
+            raise ValueError("MSZIP buffer is truncated")
+        size = int.from_bytes(data[pos:pos + 4], "little")
+        block = data[pos + 4:pos + 4 + size]
+        pos += 4 + size
+        if block[:2] != b"CK":
+            raise ValueError("MSZIP block without its CK signature")
+        inflater = zlib.decompressobj(-15, zdict=bytes(out[-32768:])) if out else zlib.decompressobj(-15)
+        out += inflater.decompress(block[2:]) + inflater.flush()
+    if len(out) != total:
+        raise ValueError("MSZIP size mismatch")
+    return bytes(out)
+
+
+async def _read_payload(call, head):
+    # Every chunk is requested at once: the plugin answers in order and the link stays busy.
+    replies = await asyncio.gather(*(call("Profile.read", chunk=chunk) for chunk in range(head["chunks"])))
+    text = "".join(reply["data"] for reply in replies)
+    if head.get("encoding") == "mszip":
+        return mszip_decode(base64.b64decode(text)).decode("utf-8")
+    return text
+
+
 async def fetch(call):
-    """Stop the running profile and read it whole; `call(method, **params)` is any RPC caller."""
-    head = await call("Profile.stop")
-    parts = []
-    for chunk in range(head["chunks"]):
-        parts.append((await call("Profile.read", chunk=chunk))["data"])
-    raw = json.loads("".join(parts))
-    return raw, head.get("summary", {})
+    """Stop the running profile and read it whole; `call(method, **params)` is any RPC caller.
+
+    Returns (raw, summary); summary["transfer"] holds sizes and timings of the read."""
+    began = time.monotonic()
+    try:
+        head = await call("Profile.stop", encoding="mszip")
+    except Exception as error:  # noqa: BLE001 - a plugin older than compressed reads rejects the parameter
+        if "encoding" not in str(error):
+            raise
+        head = await call("Profile.stop")
+    stopped = time.monotonic()
+    try:
+        text = await _read_payload(call, head)
+    except (ValueError, zlib.error, binascii.Error):
+        head = await call("Profile.stop", encoding="json")
+        text = await _read_payload(call, head)
+    read = time.monotonic()
+    raw = json.loads(text)
+    summary = dict(head.get("summary") or {})
+    summary["transfer"] = {
+        "bytes": head.get("bytes"), "encoding": head.get("encoding", "json"),
+        "encodedBytes": head.get("encodedBytes", head.get("bytes")), "chunks": head.get("chunks"),
+        "waitMs": head.get("waitMs"), "serializeMs": head.get("serializeMs"), "encodeMs": head.get("encodeMs"),
+        "stopS": round(stopped - began, 2), "readS": round(read - stopped, 2),
+        "parseS": round(time.monotonic() - read, 2),
+    }
+    return raw, summary
 
 
 def save_outputs(profile, out_dir, title="Skyrim SE"):

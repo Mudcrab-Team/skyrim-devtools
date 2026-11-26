@@ -453,7 +453,10 @@ namespace
     std::thread sampler;
     std::unique_ptr<Session> pending;   // configured by Profile.start, adopted by the sampler
     std::unique_ptr<Session> finished;  // handed back by the sampler when it stops
-    std::string serialized;             // the last stopped profile, read in chunks
+    std::string serialized;             // the last stopped profile as JSON
+    std::string payload;                // `serialized` in the encoding last asked for, read in chunks
+    std::string payloadEncoding;
+    double serializeMs = 0.0;
 
     std::mutex frameMutex;
     std::vector<FrameMark> pendingHitches;
@@ -1095,6 +1098,78 @@ namespace
         return out.dump(-1, ' ', false, Json::error_handler_t::replace);
     }
 
+    std::string Base64(const unsigned char* data, std::size_t size)
+    {
+        static constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string out;
+        out.reserve((size + 2) / 3 * 4);
+        std::size_t i = 0;
+        for (; i + 2 < size; i += 3) {
+            const std::uint32_t v = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2];
+            out += alphabet[v >> 18];
+            out += alphabet[(v >> 12) & 63];
+            out += alphabet[(v >> 6) & 63];
+            out += alphabet[v & 63];
+        }
+        if (i < size) {
+            const std::uint32_t v = (data[i] << 16) | (i + 1 < size ? data[i + 1] << 8 : 0);
+            out += alphabet[v >> 18];
+            out += alphabet[(v >> 12) & 63];
+            out += i + 1 < size ? alphabet[(v >> 6) & 63] : '=';
+            out += '=';
+        }
+        return out;
+    }
+
+    // MSZIP through the Windows Compression API: deflate blocks a Python client decodes with zlib alone.
+    // A threads=all profile is tens of MB of JSON and the link to a remote client can be slow, so the
+    // transfer, not the plugin, dominated reading one.
+    // The project targets an SDK level below the one compressapi.h declares, so cabinet.dll is bound by hand.
+    std::optional<std::string> Mszip(const std::string& text)
+    {
+        using Create = BOOL(WINAPI*)(DWORD, void*, HANDLE*);
+        using Run = BOOL(WINAPI*)(HANDLE, const void*, SIZE_T, void*, SIZE_T, SIZE_T*);
+        using Close = BOOL(WINAPI*)(HANDLE);
+        constexpr DWORD algorithmMszip = 2;
+        static const HMODULE cabinet = LoadLibraryW(L"cabinet.dll");
+        const auto create = cabinet ? reinterpret_cast<Create>(GetProcAddress(cabinet, "CreateCompressor")) : nullptr;
+        const auto compress = cabinet ? reinterpret_cast<Run>(GetProcAddress(cabinet, "Compress")) : nullptr;
+        const auto close = cabinet ? reinterpret_cast<Close>(GetProcAddress(cabinet, "CloseCompressor")) : nullptr;
+        HANDLE compressor = nullptr;
+        if (!create || !compress || !close || !create(algorithmMszip, nullptr, &compressor)) {
+            return std::nullopt;
+        }
+        SIZE_T size = 0;
+        compress(compressor, text.data(), text.size(), nullptr, 0, &size);
+        std::vector<unsigned char> buffer(size);
+        const bool ok = size && compress(compressor, text.data(), text.size(), buffer.data(), buffer.size(), &size);
+        close(compressor);
+        if (!ok) {
+            return std::nullopt;
+        }
+        return Base64(buffer.data(), size);
+    }
+
+    // Encodes the stopped profile for Profile.read; falls back to plain JSON when compression fails.
+    Json PayloadHead(const std::string& encoding)
+    {
+        if (payload.empty() || payloadEncoding != encoding) {
+            const double started = perf::Now();
+            std::optional<std::string> packed;
+            if (encoding == "mszip") {
+                packed = Mszip(serialized);
+            }
+            payloadEncoding = packed ? encoding : "json";
+            payload = packed ? std::move(*packed) : serialized;
+            const double ms = (perf::Now() - started) * 1000.0;
+            return Json{ { "bytes", serialized.size() }, { "encoding", payloadEncoding }, { "encodedBytes", payload.size() },
+                { "chunks", (payload.size() + chunkBytes - 1) / chunkBytes }, { "serializeMs", std::round(serializeMs) },
+                { "encodeMs", std::round(ms) } };
+        }
+        return Json{ { "bytes", serialized.size() }, { "encoding", payloadEncoding }, { "encodedBytes", payload.size() },
+            { "chunks", (payload.size() + chunkBytes - 1) / chunkBytes }, { "serializeMs", std::round(serializeMs) } };
+    }
+
     Json Status()
     {
         Json out{ { "profiling", profiling.load() }, { "watching", watching.load() }, { "watchHz", watchHz.load() },
@@ -1161,6 +1236,7 @@ DEVTOOLS_MODULE(Profiler)
         session->deadline = perf::Now() + duration;
         finished.reset();
         serialized.clear();
+        payload.clear();
         pending = std::move(session);
         profiling.store(true);
         EnsureSampler();
@@ -1169,12 +1245,19 @@ DEVTOOLS_MODULE(Profiler)
     }, { .thread = Thread::Any });
 
     Register("Profile.stop", [](const Json& params) {
-        AllowOnly(params, {});
+        AllowOnly(params, { "encoding" });
+        const auto encoding = Optional<std::string>(params, "encoding", "json");
+        if (encoding != "json" && encoding != "mszip") {
+            throw RpcError(code::invalidParams, "encoding is json or mszip");
+        }
+        const double stopAsked = perf::Now();
         {
             std::lock_guard lock(controlMutex);
             if (!profiling.load() && !finished && !pending) {
                 if (!serialized.empty()) {
-                    return Json{ { "bytes", serialized.size() }, { "chunks", (serialized.size() + chunkBytes - 1) / chunkBytes }, { "again", true } };
+                    auto head = PayloadHead(encoding);
+                    head["again"] = true;
+                    return head;
                 }
                 throw RpcError(code::notReady, "No profile is running");
             }
@@ -1197,27 +1280,36 @@ DEVTOOLS_MODULE(Profiler)
         if (!session) {
             throw RpcError(code::internal, "The sampler did not hand the profile back");
         }
-        serialized = SerializeSession(*session);
+        const double serializeStarted = perf::Now();
+        const double waitMs = (serializeStarted - stopAsked) * 1000.0;
+        std::string text = SerializeSession(*session);
+        std::lock_guard lock(controlMutex);
+        serialized = std::move(text);
+        serializeMs = (perf::Now() - serializeStarted) * 1000.0;
+        payload.clear();
         Json summary{ { "durationS", session->stopped - session->started }, { "samples", session->sampleCount }, { "runs", session->runCount },
             { "threads", session->threads.size() }, { "stacks", session->interner.stacks.size() },
             { "frames", session->interner.frames.size() }, { "ticks", session->ticks }, { "lateTicks", session->lateTicks },
             { "samplerCpuMs", std::round(session->samplerCpuSeconds * 1e5) / 100.0 }, { "truncated", session->truncated } };
-        return Json{ { "bytes", serialized.size() }, { "chunks", (serialized.size() + chunkBytes - 1) / chunkBytes }, { "summary", summary } };
+        auto head = PayloadHead(encoding);
+        head["waitMs"] = std::round(waitMs);
+        head["summary"] = std::move(summary);
+        return head;
     }, { .thread = Thread::Any, .timeout = std::chrono::milliseconds(120000) });
 
     Register("Profile.read", [](const Json& params) {
         AllowOnly(params, { "chunk" });
         const auto chunk = Require<std::size_t>(params, "chunk");
         std::lock_guard lock(controlMutex);
-        if (serialized.empty()) {
+        if (payload.empty()) {
             throw RpcError(code::notReady, "No stopped profile to read");
         }
         const std::size_t offset = chunk * chunkBytes;
-        if (offset >= serialized.size()) {
+        if (offset >= payload.size()) {
             throw RpcError(code::invalidParams, "chunk is past the end");
         }
-        return Json{ { "chunk", chunk }, { "data", serialized.substr(offset, chunkBytes) },
-            { "last", offset + chunkBytes >= serialized.size() } };
+        return Json{ { "chunk", chunk }, { "encoding", payloadEncoding }, { "data", payload.substr(offset, chunkBytes) },
+            { "last", offset + chunkBytes >= payload.size() } };
     }, { .thread = Thread::Any, .timeout = std::chrono::milliseconds(30000) });
 
     Register("Profile.status", [](const Json& params) {
