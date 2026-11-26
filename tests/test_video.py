@@ -109,6 +109,13 @@ class ComposeTests(unittest.TestCase):
         self.assertEqual(video.current_status(timeline, 10.0), {"cell": "Riverwood", "health": [40, 100]})
         self.assertEqual(video.current_status(video.Timeline(), 1.0), {})
 
+    def test_state_flags_come_from_the_latest_sample_only(self):
+        timeline = video.Timeline(statuses=[(1.0, {"cell": "Mine", "inCombat": True, "sneaking": True}),
+                                            (9.0, {"cell": "Shop", "health": [90, 100]})])
+        self.assertTrue(video.current_status(timeline, 5.0)["inCombat"])
+        later = video.current_status(timeline, 20.0)
+        self.assertEqual(later, {"cell": "Shop", "health": [90, 100]})
+
     def test_status_block_always_lists_quest_health_location(self):
         image = video.draw_frame(video.panel_state(video.Timeline(), 0.0, 1.0), "t")
         self.assertEqual(image.size, (video.W, video.H))

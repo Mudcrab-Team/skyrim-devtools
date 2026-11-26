@@ -99,6 +99,8 @@ class Recorder:
                 @functools.wraps(function)
                 async def logged(*args, **kwargs):
                     start = now_ms()
+                    if board is not None:
+                        board.call_started(name)
                     record = {"t": "tool", "name": name, "args": compact_args(kwargs, defaults), "startMs": start}
                     try:
                         result = await function(*args, **kwargs)
@@ -171,9 +173,9 @@ class Recorder:
                 health = state.get("health")
                 if isinstance(health, dict):
                     sample["health"] = [health.get("cur"), health.get("max")]
+                # a flag that is off is written as false: an absent key would leave the panel on the last true value
                 for flag in ("inCombat", "dead", "sneaking"):
-                    if state.get(flag):
-                        sample[flag] = True
+                    sample[flag] = bool(state.get(flag))
         quest = None
         if self.track_quest and manager.has_method("Quest.get"):
             with contextlib.suppress(Exception):
