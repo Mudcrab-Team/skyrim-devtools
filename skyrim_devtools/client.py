@@ -279,6 +279,10 @@ class Session:
         """Start a navigation process; follow it with nav_status or wait_nav."""
         return await self._call_set("Nav.goto", goal=goal, mode=mode, timeoutS=timeout_s, **options)
 
+    async def nav_plan(self, ref_id=None, x=None, y=None, z=None, route=None):
+        """Plan without moving; route "global" adds the long-range route over the worldspace graph."""
+        return await self._call_set("Nav.plan", refID=ref_id, x=x, y=y, z=z, route=route)
+
     async def nav_nearby(self, radius=None, kind=None, limit=None):
         return await self._call_set("Nav.nearby", radius=radius, kind=kind, limit=limit)
 

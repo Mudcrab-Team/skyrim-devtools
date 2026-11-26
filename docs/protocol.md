@@ -132,8 +132,8 @@ would press, so animation, collision, stamina and encumbrance all apply.
 | Camera.state | main | | `{mode, stateId, pos, yawDeg, pitchDeg, worldFov, firstPersonFov, zoom, targetZoom, freeRotationDeg, player:{headingDeg, pitchDeg}}`; mode is `firstPerson`, `thirdPerson`, `free`, `furniture`, ... |
 | Camera.set | main | mode? (`first`, `third`), yawDeg?, pitchDeg?, zoom? (0-1, third person), fov? (20-150) | Applies the given fields in that order; read Camera.state a frame later for the result |
 | Camera.lookAt | main | refID or x, y, z | Turns the player's view at a reference (actors at chest height) or a point |
-| Nav.plan | main | refID or x, y, z; from? | Path over the loaded navmeshes, `{found, complete, goalOnMesh, points, triangles, meshes, expanded, ms}`. For debugging Nav.goto. |
-| Nav.goto | main | goal, mode? (`input`), timeoutS? (300), run? (true), sprint?, onCombat? (`flee`, `fight`, `stop`, `ignore`), onDialogue? (`close`, `stop`, `wait`), onMessageBox? (`firstButton`, `stop`, `wait`), onMenu? (`close`, `stop`, `wait`), invulnerable? (false), via? ([[x,y,z]...]), route? (recording name), routeSpacing? (600) | Starts a background navigation and replies at once with `{id, mode, goal, goalPos, straightDistance}`. Goals: `{refID}`, `{x, y, z, worldspace?}`, `{cell}` (editor id), `{place}` (a location's displayed name or form id, see Nav.places) or `{near: refID, radius}`. Fails with `-32009` while one runs. |
+| Nav.plan | main | refID or x, y, z; from?; route? (`local`, `global`) | Path over the loaded navmeshes, `{found, complete, goalOnMesh, points, triangles, meshes, expanded, ms}`. With `route: "global"` it is the local path to the first gate plus `global {available, world, file, found, cost, length, expanded, startLinks, goalLinks, ms, note, points}` from the worldspace graph (see below). For debugging Nav.goto. |
+| Nav.goto | main | goal, mode? (`input`), timeoutS? (300), run? (true), sprint?, onCombat? (`flee`, `fight`, `stop`, `ignore`), onDialogue? (`close`, `stop`, `wait`), onMessageBox? (`firstButton`, `stop`, `wait`), onMenu? (`close`, `stop`, `wait`), invulnerable? (false), via? ([[x,y,z]...]), route? (`global`, `local` or a recording name), routeSpacing? (600) | Starts a background navigation and replies at once with `{id, mode, goal, goalPos, straightDistance, route, globalLength?, globalNote?}`. Goals: `{refID}`, `{x, y, z, worldspace?}`, `{cell}` (editor id), `{place}` (a location's displayed name or form id, see Nav.places) or `{near: refID, radius}`. Fails with `-32009` while one runs. |
 | Nav.status | main | | `{active: true, nav:{id, state, mode, goal, elapsedS, distanceRemaining, etaS, waypoint, stuckCount, replans, travelled, combat, interruption, interruptions:{count, recent}, stalls:{count, totalS, offPathCount, offPathTotalS, offPathNow, recent}, ...}}`, or `{active: false, last}` whose `state` is the outcome (`arrived`, `failed`, `cancelled`) with a `reason` |
 | Nav.cancel | main | | Stops the navigation and releases controls |
 | Nav.places | main | contains? (substring, case-sensitive), limit? (50) | Locations with a world map marker: `{count, places:[{name, location, marker, pos, world, distance}]}`. Names are in the game's language; `{place}` goals accept the name or the location id. |
@@ -153,7 +153,7 @@ mode, fov}` (camera); `running`, `sprinting`, `sneaking`, `swimming`, `midair`, 
 Navigation events carry the Nav.status fields: `navProgress` (once a second), `navStuck` (plus the
 recovery `attempt`), `navArrived` and `navFailed` (with `reason`). `navInterrupted {id, reason,
 details, action, pos}` and `navResumed {id, after}` bracket every interruption; `navStall {id, kind,
-atS, durationS, pos, cause | maxDistance}` reports each stall or off-path episode as it ends. Recording events: `recordStopped`, `replayFinished`.
+atS, durationS, pos, cause | maxDistance}` reports each stall or off-path episode as it ends. `navRoute {id, why, global}` reports each global route (`why`: `start`, `offRoute`, `teleport`). Recording events: `recordStopped`, `replayFinished`.
 
 **Navigation modes.** `input` is Baritone-like. It runs A* over the triangles of every loaded
 navmesh, with links across mesh borders through navmesh portals and preferred triangles made
@@ -168,6 +168,24 @@ leading there (one hop) and activates it. `ai` sets the player AI-driven and cal
 cross-cell routes drive the player. A leg that ends away from the goal is redispatched; six legs
 in a row without 1500 units of progress fail the trip.
 
+**Global routes.** The loaded navmeshes reach only a few cells, so a long trip needs a coarse
+map of the whole worldspace. `skyrim-devtools-navgraph build --data <Data> --world Tamriel -o
+<scratch>/navgraph/Tamriel.navg` reads the user's own installed plugins (Skyrim.esm, its masters
+and Creation Club plugins, later plugins overriding earlier) and writes a graph: nodes are gates
+(stretches of border where two cells' navmeshes join through portal edges), edges are walking
+costs across one navmesh (Dijkstra through triangle edge midpoints, preferred triangles cheaper).
+The plugin looks for `<World>.navg` in the `navgraph` folder beside its run directories, or in
+`SKYRIM_DEVTOOLS_NAVGRAPH`, and reloads it when the file changes. The file is game-derived: keep
+it on the machine that made it. With a graph present, an `input` trip without `via` to a goal in
+the same worldspace more than 8000 units away (plan view) goes global by default; `route:
+"global"` forces it (failing if no graph or route) and `route: "local"` opts out. The start joins
+the graph through the loaded navmeshes (A* costs to nearby gates), the goal by straight lines,
+and A* picks the gates; they become via points (accepted within 400 units) walked one at a time
+by the local planner, with all interruption, watchdog and stall handling unchanged. Gates
+already passed are skipped, a dead end skips the current gate, and the route is recomputed after
+a teleport or when the player is more than 3000 units off it (at most every 15 s). Nav.status
+adds `global {length, routes, skips}`; `distanceRemaining` follows the route.
+
 **Interruptions.** Every poll checks, most severe first: death (fails the trip), loading or fader
 screens, a paused game, Dialogue Menu, MessageBoxMenu, other blocking menus (lockpicking, book,
 sleep/wait, container, barter and the like), knockdown or ragdoll, paralysis, and combat (in
@@ -178,7 +196,10 @@ Cancel, then hiding); `firstButton` (selects option 0, then Accept, then hides);
 attack the nearest enemy, then carry on) or `ignore`; `stop` fails with the reason. When the
 interruption clears the trip resumes from wherever the player is, replanning or dispatching a
 new engine leg. A watchdog recovers after 20 s without 150 units of movement and fails after 4
-rounds. `invulnerable: true` turns god mode on for the trip and restores it afterwards.
+rounds. A round in which the player moved under 40 units at all (wedged in collision, which no
+key press undoes) instead puts it back on its own trail at least 300 units behind, up to 10
+times a trip; each is a `navStuck` with `action: "unstick"` and counted in `unsticks`. Caught
+again at the same spot on a global route, it also skips the current gate. `invulnerable: true` turns god mode on for the trip and restores it afterwards.
 
 **Stalls.** A stall is speed under 40 units/s over 0.5 s (ending above 80); off-path, in input
 mode, is more than 120 units from the planned segment (ending under 60). Each episode gets a
@@ -186,7 +207,7 @@ cause guess: engine leg ended, recovering, replan latency, actor in the way, doo
 (waypoint overshoot), steep slope or obstacle. Input mode steers by pure pursuit 150 units along
 the plan, accepts waypoints within 90 units, sprints only within 35 degrees of the heading and
 replans before the end of a partial plan. `skyrim-devtools-trajectory plot --episodes` marks the
-episodes on the plot.
+episodes on the plot, and `--route` overlays a saved Nav.plan reply or navRoute events.
 
 **Time scale.** `sgtm <n>` (console) speeds up the whole simulation, movement included, and
 navigation times scale with it; `etaS` and `elapsedS` are real seconds. Values above about 4

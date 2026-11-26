@@ -69,6 +69,15 @@ namespace
         std::vector<RE::NiPoint3> via;
         std::size_t viaIndex = 0;
 
+        // A long-range route over the worldspace graph, walked a gate at a time: the gates are
+        // the via points and the local planner gets the player from one to the next.
+        bool global = false;
+        double globalPlanned = -1e9;
+        double globalLength = 0.0;
+        int globalRoutes = 0;
+        int globalSkips = 0;
+        int globalTeleports = 0;
+
         Plan plan;
         std::size_t waypoint = 0;
         std::uint64_t generation = 0;
@@ -138,6 +147,11 @@ namespace
         RE::NiPoint3 progressPos;
         double progressAt = 0.0;
         int watchdogRounds = 0;
+        // Spots the player walked through, a few hundred units apart, to step back to when caught
+        // in collision geometry that no key press gets out of.
+        std::deque<RE::NiPoint3> trail;
+        int unsticks = 0;
+        std::vector<RE::NiPoint3> traps;
 
         RE::NiPoint3 start;
         RE::NiPoint3 last;
@@ -192,7 +206,7 @@ namespace
     RE::NiPoint3 CurrentTarget(Process& p, double& radius)
     {
         if (p.viaIndex < p.via.size()) {
-            radius = 250.0;
+            radius = p.global ? 400.0 : 250.0;
             return p.via[p.viaIndex];
         }
         if (const auto door = LookupRef(p.door)) {
@@ -297,12 +311,24 @@ namespace
         return total;
     }
 
+    graph::V3 V(const RE::NiPoint3& p) { return { p.x, p.y, p.z }; }
+
+    std::vector<graph::V3> GlobalPoints(const Process& p)
+    {
+        std::vector<graph::V3> out;
+        out.reserve(p.via.size());
+        for (const auto& v : p.via) {
+            out.push_back(V(v));
+        }
+        return out;
+    }
+
     Json Status(Process& p)
     {
         Json out{ { "id", p.id }, { "state", p.state }, { "mode", p.mode }, { "goal", p.goal.describe },
             { "elapsedS", Round((p.ended > 0 ? p.ended : Now()) - p.started, 10.0) }, { "stuckCount", p.stuckCount },
             { "replans", p.replans }, { "travelled", Round(p.travelled) }, { "combat", p.combat },
-            { "reason", p.reason.empty() ? Json(nullptr) : Json(p.reason) }, { "teleports", p.teleports } };
+            { "reason", p.reason.empty() ? Json(nullptr) : Json(p.reason) }, { "teleports", p.teleports }, { "unsticks", p.unsticks } };
         if (const auto player = RE::PlayerCharacter::GetSingleton()) {
             const auto pos = player->GetPosition();
             const auto goalPos = GoalPosition(p);
@@ -311,7 +337,10 @@ namespace
             out["straightDistance"] = Round(Dist3D(pos, goalPos));
             double radius = 0.0;
             const auto target = CurrentTarget(p, radius);
-            const auto remaining = p.viaIndex < p.via.size() || p.door ? Dist3D(pos, goalPos) : PathRemaining(p, pos, target);
+            auto remaining = p.viaIndex < p.via.size() || p.door ? Dist3D(pos, goalPos) : PathRemaining(p, pos, target);
+            if (p.global && p.viaIndex < p.via.size()) {
+                remaining = global::Remaining(GlobalPoints(p), p.viaIndex, V(pos)) + Dist3D(p.via.back(), goalPos);
+            }
             out["distanceRemaining"] = Round(remaining);
             const auto speed = SpeedOf(p);
             out["speed"] = Round(speed);
@@ -325,6 +354,9 @@ namespace
         }
         if (!p.via.empty()) {
             out["via"] = { { "index", p.viaIndex }, { "count", p.via.size() } };
+        }
+        if (p.global) {
+            out["global"] = { { "length", Round(p.globalLength) }, { "routes", p.globalRoutes }, { "skips", p.globalSkips } };
         }
         if (const auto door = LookupRef(p.door)) {
             out["door"] = DescribeRef(door);
@@ -385,6 +417,35 @@ namespace
             CurrentDrive() = {};
         }
         active.reset();
+    }
+
+    // Plans the long-range route from where the player is now and makes its gates the via
+    // points; false (route unchanged) when the graph has none.
+    bool RouteGlobal(Process& p, RE::PlayerCharacter& player, double now, const char* why, std::string* note = nullptr)
+    {
+        p.globalPlanned = now;
+        const auto plan = PlanGlobal(player.GetWorldspace(), player.GetPosition(), GoalPosition(p));
+        Json event{ { "id", p.id }, { "why", why }, { "global", GlobalJson(plan, true) } };
+        Emit("navRoute", std::move(event));
+        if (!plan.route.found) {
+            if (note) {
+                *note = plan.note;
+            }
+            return false;
+        }
+        p.via.clear();
+        // Neither the start nor the goal: the goal is reached the ordinary way after the last gate.
+        for (std::size_t i = 1; i + 1 < plan.route.points.size(); ++i) {
+            const auto& v = plan.route.points[i];
+            p.via.push_back({ static_cast<float>(v.x), static_cast<float>(v.y), static_cast<float>(v.z) });
+        }
+        p.viaIndex = 0;
+        p.global = true;
+        p.globalLength = plan.route.length;
+        ++p.globalRoutes;
+        p.plan = {};
+        p.deadEnds = 0;
+        return true;
     }
 
     bool DispatchPath(RE::PlayerCharacter& player, RE::TESObjectREFR* target, float speed, std::shared_ptr<std::atomic_int> out)
@@ -558,10 +619,38 @@ namespace
         return p.plan.points.back();
     }
 
+    // Keeps a long-range route current: moves past gates already passed (a fight or a detour can
+    // carry the player beyond one), and plans again after a teleport or once well off the route.
+    void FollowGlobal(Process& p, RE::PlayerCharacter& player, double now)
+    {
+        const auto pos = player.GetPosition();
+        if (p.teleports != p.globalTeleports) {
+            p.globalTeleports = p.teleports;
+            if (RouteGlobal(p, player, now, "teleport")) {
+                return;
+            }
+        }
+        if (p.viaIndex >= p.via.size()) {
+            return;
+        }
+        const auto points = GlobalPoints(p);
+        const auto next = global::Advance(points, p.viaIndex, V(pos));
+        if (next != p.viaIndex) {
+            p.viaIndex = next;
+            p.plan = {};
+        }
+        if (global::OffRoute(points, p.viaIndex, V(pos)) > 3000.0 && now - p.globalPlanned > 15.0) {
+            RouteGlobal(p, player, now, "offRoute");
+        }
+    }
+
     void TickInput(Process& p, RE::PlayerCharacter& player, Tick& tick)
     {
         const auto now = tick.now;
         const auto pos = player.GetPosition();
+        if (p.global) {
+            FollowGlobal(p, player, now);
+        }
         double radius = 0.0;
         auto target = CurrentTarget(p, radius);
 
@@ -622,6 +711,15 @@ namespace
         }
         if ((stale || deviated) && now - p.lastPlan > 0.5) {
             Plan(p, player, target, now, p.lastPlan > -1e8);
+            if (p.deadEnds > 5 && p.global && p.viaIndex < p.via.size() && p.globalSkips < 30) {
+                // A gate the local planner cannot get closer to (a seam the graph joins but the
+                // loaded navmeshes do not): aim for the one after it instead.
+                ++p.viaIndex;
+                ++p.globalSkips;
+                p.deadEnds = 0;
+                p.plan = {};
+                return;
+            }
             if (p.deadEnds > 5) {
                 Finish(p, "failed", "Dead end: the loaded navmeshes have no way closer to the goal");
                 return;
@@ -1157,6 +1255,43 @@ namespace
 
     // Backstop for every other check: no real movement for 20 s means recover, and give up
     // after a few rounds.
+    // Last resort for a player wedged in collision (seen at high sgtm against rocks): jumping,
+    // strafing and backing up all leave it within a few units, so put it back on its own trail.
+    bool Unstick(Process& p, RE::PlayerCharacter& player, double now)
+    {
+        const auto pos = player.GetPosition();
+        for (auto it = p.trail.rbegin(); it != p.trail.rend(); ++it) {
+            if (Dist2D(*it, pos) < 300.0) {
+                continue;
+            }
+            const RE::NiPoint3 to{ it->x, it->y, it->z + 30.0F };
+            // Caught at the same spot again: the corridor to this gate runs through it, so aim
+            // for the next gate instead.
+            const bool again = std::any_of(p.traps.begin(), p.traps.end(), [&](const auto& t) { return Dist2D(t, pos) < 300.0; });
+            if (again && p.global && p.viaIndex < p.via.size() && p.globalSkips < 30) {
+                ++p.viaIndex;
+                ++p.globalSkips;
+            }
+            p.traps.push_back(pos);
+            player.SetPosition(to, true);
+            ++p.unsticks;
+            p.last = to;
+            p.history.clear();
+            p.plan = {};
+            p.replanWanted = true;
+            p.stuckSinceProgress = 0;
+            p.progressPos = to;
+            p.progressAt = now;
+            Json data = Status(p);
+            data["action"] = "unstick";
+            data["from"] = Point(pos);
+            data["to"] = Point(to);
+            Emit("navStuck", std::move(data));
+            return true;
+        }
+        return false;
+    }
+
     void Watchdog(Process& p, RE::PlayerCharacter& player, double now)
     {
         const auto pos = player.GetPosition();
@@ -1170,6 +1305,12 @@ namespace
             return;
         }
         p.progressAt = now;
+        // Pinned: every sample of the last few seconds within a step of where it is now.
+        const bool pinned = !p.history.empty() && now - p.history.front().t > 6.0 &&
+                            std::all_of(p.history.begin(), p.history.end(), [&](const auto& h) { return Dist2D(h.pos, pos) < 40.0; });
+        if (pinned && p.unsticks < 10 && Unstick(p, player, now)) {
+            return;
+        }
         if (++p.watchdogRounds > 4) {
             Finish(p, "failed", "No progress for 20 s through 4 recovery rounds");
             return;
@@ -1194,12 +1335,19 @@ namespace
         if (step > 1500.0) {
             ++p.teleports;
             p.history.clear();
+            p.trail.clear();
             p.plan = {};
             p.door = 0;
         } else {
             p.travelled += step;
         }
         p.last = pos;
+        if (p.trail.empty() || Dist2D(pos, p.trail.back()) > 250.0) {
+            p.trail.push_back(pos);
+            if (p.trail.size() > 12) {
+                p.trail.pop_front();
+            }
+        }
         p.history.push_back({ now, pos });
         while (!p.history.empty() && now - p.history.front().t > 8.5) {
             p.history.pop_front();
@@ -1434,6 +1582,7 @@ DEVTOOLS_MODULE(NavGoto)
     events::Declare("navInterrupted", "Something stopped Nav.goto (dialogue, message box, menu, loading, combat, knockdown, death): {id, reason, details, action, pos}");
     events::Declare("navResumed", "An interruption cleared and Nav.goto picked the route up again: {id, after}");
     events::Declare("navStone", "Nav.goto ai mode routes the engine through a map marker after the goal reported no path: {id, marker, pos}");
+    events::Declare("navRoute", "Nav.goto planned a long-range route over the worldspace graph: {id, why, global: Nav.plan's global fields}");
     events::Declare("navStall", "A stall (speed under 40 units/s) or off-path episode ended: {id, kind, atS, durationS, pos, cause?, offPath?, maxDistance?}");
     AddTicker(TickNav);
     if (const auto source = RE::ScriptEventSourceHolder::GetSingleton()) {
@@ -1493,7 +1642,10 @@ DEVTOOLS_MODULE(NavGoto)
                 p.via.push_back({ v[0].get<float>(), v[1].get<float>(), v.size() > 2 ? v[2].get<float>() : player.GetPosition().z });
             }
         }
-        if (params.contains("route")) {
+        const auto routeName = Optional<std::string>(params, "route", "");
+        const bool wantGlobal = routeName == "global";
+        const bool wantLocal = routeName == "local";
+        if (params.contains("route") && !wantGlobal && !wantLocal) {
             auto route = ReadRoute(Require<std::string>(params, "route"), Optional<double>(params, "routeSpacing", 600.0));
             // Start from the route point nearest the player, so a route can be joined mid-way.
             std::size_t nearest = 0;
@@ -1525,8 +1677,28 @@ DEVTOOLS_MODULE(NavGoto)
         p.progressPos = player.GetPosition();
         p.progressAt = p.started;
         p.start = p.last = player.GetPosition();
+        // Far goals in the same worldspace take the long-range route when a graph exists for it:
+        // the loaded navmeshes reach only a few cells, and the engine's own pathfinder reports
+        // no path from some places.
+        const auto world = player.GetWorldspace();
+        const bool distant = SameSpace(player, p.goal) && world && Dist2D(player.GetPosition(), p.goal.point) > 8000.0;
+        std::string globalNote;
+        if (wantGlobal && (p.mode != "input" || !p.via.empty() || !SameSpace(player, p.goal) || !world)) {
+            throw RpcError(code::invalidParams, "route global is an input-mode option for a goal in the player's worldspace, without via");
+        }
+        if (wantGlobal || (!wantLocal && p.mode == "input" && p.via.empty() && distant && HasGlobalGraph(world))) {
+            if (!RouteGlobal(p, player, p.started, "start", &globalNote) && wantGlobal) {
+                throw RpcError(code::notFound, globalNote);
+            }
+        }
         Json reply{ { "id", p.id }, { "mode", p.mode }, { "goal", p.goal.describe }, { "goalPos", Point(p.goal.point) },
-            { "straightDistance", Round(Dist3D(player.GetPosition(), p.goal.point)) }, { "via", p.via.size() } };
+            { "straightDistance", Round(Dist3D(player.GetPosition(), p.goal.point)) }, { "via", p.via.size() },
+            { "route", p.global ? "global" : "local" } };
+        if (p.global) {
+            reply["globalLength"] = Round(p.globalLength);
+        } else if (!globalNote.empty()) {
+            reply["globalNote"] = globalNote;
+        }
         active = std::move(p);
         if (active->mode == "ai") {
             StartAiLeg(*active, player, Now());
