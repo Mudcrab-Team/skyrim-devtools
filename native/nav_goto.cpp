@@ -147,6 +147,11 @@ namespace
         RE::NiPoint3 progressPos;
         double progressAt = 0.0;
         int watchdogRounds = 0;
+        // Spots the player walked through, a few hundred units apart, to step back to when caught
+        // in collision geometry that no key press gets out of.
+        std::deque<RE::NiPoint3> trail;
+        int unsticks = 0;
+        std::vector<RE::NiPoint3> traps;
 
         RE::NiPoint3 start;
         RE::NiPoint3 last;
@@ -323,7 +328,7 @@ namespace
         Json out{ { "id", p.id }, { "state", p.state }, { "mode", p.mode }, { "goal", p.goal.describe },
             { "elapsedS", Round((p.ended > 0 ? p.ended : Now()) - p.started, 10.0) }, { "stuckCount", p.stuckCount },
             { "replans", p.replans }, { "travelled", Round(p.travelled) }, { "combat", p.combat },
-            { "reason", p.reason.empty() ? Json(nullptr) : Json(p.reason) }, { "teleports", p.teleports } };
+            { "reason", p.reason.empty() ? Json(nullptr) : Json(p.reason) }, { "teleports", p.teleports }, { "unsticks", p.unsticks } };
         if (const auto player = RE::PlayerCharacter::GetSingleton()) {
             const auto pos = player->GetPosition();
             const auto goalPos = GoalPosition(p);
@@ -1250,6 +1255,43 @@ namespace
 
     // Backstop for every other check: no real movement for 20 s means recover, and give up
     // after a few rounds.
+    // Last resort for a player wedged in collision (seen at high sgtm against rocks): jumping,
+    // strafing and backing up all leave it within a few units, so put it back on its own trail.
+    bool Unstick(Process& p, RE::PlayerCharacter& player, double now)
+    {
+        const auto pos = player.GetPosition();
+        for (auto it = p.trail.rbegin(); it != p.trail.rend(); ++it) {
+            if (Dist2D(*it, pos) < 300.0) {
+                continue;
+            }
+            const RE::NiPoint3 to{ it->x, it->y, it->z + 30.0F };
+            // Caught at the same spot again: the corridor to this gate runs through it, so aim
+            // for the next gate instead.
+            const bool again = std::any_of(p.traps.begin(), p.traps.end(), [&](const auto& t) { return Dist2D(t, pos) < 300.0; });
+            if (again && p.global && p.viaIndex < p.via.size() && p.globalSkips < 30) {
+                ++p.viaIndex;
+                ++p.globalSkips;
+            }
+            p.traps.push_back(pos);
+            player.SetPosition(to, true);
+            ++p.unsticks;
+            p.last = to;
+            p.history.clear();
+            p.plan = {};
+            p.replanWanted = true;
+            p.stuckSinceProgress = 0;
+            p.progressPos = to;
+            p.progressAt = now;
+            Json data = Status(p);
+            data["action"] = "unstick";
+            data["from"] = Point(pos);
+            data["to"] = Point(to);
+            Emit("navStuck", std::move(data));
+            return true;
+        }
+        return false;
+    }
+
     void Watchdog(Process& p, RE::PlayerCharacter& player, double now)
     {
         const auto pos = player.GetPosition();
@@ -1263,6 +1305,12 @@ namespace
             return;
         }
         p.progressAt = now;
+        // Pinned: every sample of the last few seconds within a step of where it is now.
+        const bool pinned = !p.history.empty() && now - p.history.front().t > 6.0 &&
+                            std::all_of(p.history.begin(), p.history.end(), [&](const auto& h) { return Dist2D(h.pos, pos) < 40.0; });
+        if (pinned && p.unsticks < 10 && Unstick(p, player, now)) {
+            return;
+        }
         if (++p.watchdogRounds > 4) {
             Finish(p, "failed", "No progress for 20 s through 4 recovery rounds");
             return;
@@ -1287,12 +1335,19 @@ namespace
         if (step > 1500.0) {
             ++p.teleports;
             p.history.clear();
+            p.trail.clear();
             p.plan = {};
             p.door = 0;
         } else {
             p.travelled += step;
         }
         p.last = pos;
+        if (p.trail.empty() || Dist2D(pos, p.trail.back()) > 250.0) {
+            p.trail.push_back(pos);
+            if (p.trail.size() > 12) {
+                p.trail.pop_front();
+            }
+        }
         p.history.push_back({ now, pos });
         while (!p.history.empty() && now - p.history.front().t > 8.5) {
             p.history.pop_front();

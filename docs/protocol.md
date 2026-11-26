@@ -196,7 +196,10 @@ Cancel, then hiding); `firstButton` (selects option 0, then Accept, then hides);
 attack the nearest enemy, then carry on) or `ignore`; `stop` fails with the reason. When the
 interruption clears the trip resumes from wherever the player is, replanning or dispatching a
 new engine leg. A watchdog recovers after 20 s without 150 units of movement and fails after 4
-rounds. `invulnerable: true` turns god mode on for the trip and restores it afterwards.
+rounds. A round in which the player moved under 40 units at all (wedged in collision, which no
+key press undoes) instead puts it back on its own trail at least 300 units behind, up to 10
+times a trip; each is a `navStuck` with `action: "unstick"` and counted in `unsticks`. Caught
+again at the same spot on a global route, it also skips the current gate. `invulnerable: true` turns god mode on for the trip and restores it afterwards.
 
 **Stalls.** A stall is speed under 40 units/s over 0.5 s (ending above 80); off-path, in input
 mode, is more than 120 units from the planned segment (ending under 60). Each episode gets a
