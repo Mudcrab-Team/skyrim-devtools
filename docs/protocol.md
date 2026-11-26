@@ -131,6 +131,12 @@ logs `main thread has not run a queued task ... frames: module+offset ...` to th
 source=plugin`), at most six times per run.
 `host.ps1 stop <session> -Grace N` asks the game to quit and kills it after N seconds (default 12);
 state.json then carries `stopPath`: `graceful`, `killed-after-Ns` or `closing-crashed`.
+`host.ps1 reset` ends the `SkyrimDevTools` scheduled task and removes the `active` lease marker when no game
+process runs (with `-Force` it first kills a leftover game or loader). The Python host calls it after every stop,
+with `-Force` when the session never ended, and `host.ps1 start` runs the same cleanup itself for a lease older
+than 90 s, listing what it removed as `staleCleared` in its reply. `host.ps1 health` prints the game process as
+JSON (`threads`, `handles`, `privateBytes`, `workingSetBytes`, `cpuSeconds`, `cpuCores`, `responding`,
+`uptimeSeconds`), read from the operating system so it works while the main thread is hung.
 
 ### Dialogue records and coverage
 

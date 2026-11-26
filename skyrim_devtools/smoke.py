@@ -47,8 +47,8 @@ class WindowsHost:
         if type(self.local_port) is not int or not 1024 <= self.local_port <= 65535:
             raise ValueError("Local port must be between 1024 and 65535")
 
-    async def command(self, action, session_id="", mode="", grace=None):
-        if action not in {"start", "status", "stop", "evidence", "crashes"} or (session_id and not re.fullmatch("[a-f0-9]{32}", session_id)):
+    async def command(self, action, session_id="", mode="", grace=None, force=False):
+        if action not in {"start", "status", "stop", "evidence", "crashes", "health", "reset"} or (session_id and not re.fullmatch("[a-f0-9]{32}", session_id)):
             raise ValueError("Invalid Windows session operation")
         if mode not in {"", "headless", "windowed"}:
             raise ValueError("Invalid display mode")
@@ -57,6 +57,8 @@ class WindowsHost:
             if type(grace) is not int or not 1 <= grace <= 120:
                 raise ValueError("Grace period must be 1 to 120 seconds")
             argument += f" -Grace {grace}"
+        if force:
+            argument += " -Force"
         script = rf"& (Join-Path $env:USERPROFILE '.local\skyrim-devtools\host.ps1') {action} {argument}"
         encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
         process = await asyncio.create_subprocess_exec(
@@ -94,7 +96,22 @@ class WindowsHost:
         async def read():
             return await self.command("status", session_id)
 
-        return await observe(read, lambda state: state["phase"] not in ACTIVE, "Windows shutdown", grace + 10)
+        try:
+            state = await observe(read, lambda state: state["phase"] not in ACTIVE, "Windows shutdown", grace + 10)
+        except (TimeoutError, asyncio.TimeoutError):
+            # the runner is hung too: kill what is left so the next start does not meet a busy task
+            await self.reset(session_id, force=True)
+            raise
+        await self.reset(session_id)
+        return state
+
+    async def reset(self, session_id="", force=False):
+        """End the scheduled task and drop the lease marker of a finished session, so the next start works.
+        Nothing is touched while a game process runs unless force is set."""
+        try:
+            return await self.command("reset", session_id, force=force)
+        except (RuntimeError, TimeoutError, asyncio.TimeoutError, ValueError):
+            return {"cleared": [], "error": "reset failed"}
 
     async def tunnel(self, port):
         if type(port) is not int or not 1024 <= port <= 65535:

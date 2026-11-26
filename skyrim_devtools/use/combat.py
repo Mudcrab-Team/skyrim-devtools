@@ -95,6 +95,20 @@ def healing_spells(spells):
     return found
 
 
+def healing_potions(inventory):
+    """Count of health-restoring potions in a Player.inventory reply (potion filter), judged by display name."""
+    total = 0
+    for item in inventory.get("items", []):
+        name = (item.get("name") or "").lower()
+        if "heal" in name or "health" in name:
+            total += item.get("count", 1)
+    return total
+
+
+NO_HEAL_WARNING = ("no healing potion in the inventory and no healing spell: below {drink} percent health there is "
+                   "nothing to recover with; add potions (console additem) or avoid this fight")
+
+
 def register(mcp, native, manager):
     ranged.register(mcp, native, manager)
 
@@ -186,8 +200,10 @@ def register(mcp, native, manager):
         It also judges the fight (enemy levels and health against yours, and trades lost so far) and returns outcome
         "outmatched" with `assessment` before it loses, at the start or mid-fight; stand_ground=true fights on
         regardless. A target it cannot walk to (higher with no navmesh path) is shot with a bow when one is carried
-        (see combat_shoot), otherwise it returns outcome "unreachable"; style ranged always shoots. Returns what happened per round summarised, plus your lowest health. Use the primitives instead
-        when you want to choose each move yourself."""
+        (see combat_shoot), otherwise it returns outcome "unreachable"; style ranged always shoots. With no healing
+        potion and no healing spell it warns at the start (`warnings`, also a `warning` event for events_drain) instead
+        of finding out when health runs low. Returns what happened per round summarised, plus your lowest health. Use
+        the primitives instead when you want to choose each move yourself."""
         started = time.monotonic()
         log = []
         lowest = 100
@@ -204,6 +220,16 @@ def register(mcp, native, manager):
         have_potion = True
         ranged_memory = {}
         unreachable_advice = None
+        warnings = []
+        potion_count = None
+        try:
+            potion_count = healing_potions(await native("Player.inventory", filter="potion", limit=200))
+        except Exception:  # an older plugin build: found out when the first drink fails
+            pass
+        if potion_count == 0 and not healers:
+            warnings.append(NO_HEAL_WARNING.format(drink=drink_below))
+            # buffered as an event right away, so events_drain shows it even if the fight tool is cut short
+            manager.note_warning("noHealingPotion", warnings[-1])
         for number in range(1, rounds + 1):
             if time.monotonic() - started > timeout_s:
                 log.append("timeout")
@@ -301,6 +327,10 @@ def register(mcp, native, manager):
                   "potionsDrunk": potions, "healCasts": heals, "lowestHealthPct": lowest,
                   "elapsedS": round(time.monotonic() - started, 1),
                   "player": final["player"], "hostilesLeft": final["hostileTotal"], "hostiles": final["hostiles"]}
+        if potion_count is not None:
+            result["healingPotions"] = potion_count
+        if warnings:
+            result["warnings"] = warnings
         if assessment:
             result["assessment"] = assessment
         if ranged_memory.get("shots"):
