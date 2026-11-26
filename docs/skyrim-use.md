@@ -65,7 +65,7 @@ strafes, jumps, replans around the spot (blocking a looped door), and then stops
 about 15 s: `walk` returns `{"stuck": true, "error": "stuck", reason, pos, facingDeg, blockers,
 screenshotHint}` and `nav_wait` returns `"error": "stuck"` with the same report under `stuck`; take a
 `screenshot` to see the blocker. Tune it per call with the `stuck` argument (`false` disables;
-`{"distance": 40, "windowS": 3, "maxFailures": 3, "totalS": 20, "progressWindowS": 15}`).
+`{"distance": 40, "windowS": 3, "maxFailures": 3, "totalS": 20, "progressWindowS": 10}`).
 `moveStuck` / `moveUnstuck` events land in the timeline JSONL. `walk` also has a client-side backstop:
 if the player covers under 40 units in 20 s the walk is stopped and reported `reason: hardCap`.
 Details: docs/protocol.md, "Stuck detector".

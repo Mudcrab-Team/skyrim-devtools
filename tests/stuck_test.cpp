@@ -90,7 +90,7 @@ int main()
         double now = 0.0;
         auto zig = [](double t) { return std::pair{ std::fmod(t, 2.0) < 1.0 ? 0.0 : 150.0, 0.0 }; };
         const auto v = Run(d, now, 40.0, zig, 900.0);
-        Check(v.reason == Reason::noProgress && v.step == Step::replan && now >= 15.0 && now <= 17.0, "no progress to the goal");
+        Check(v.reason == Reason::noProgress && v.step == Step::replan && now >= 10.0 && now <= 12.0, "no progress to the goal");
         const auto again = Run(d, now, 40.0, zig, 900.0);
         Check(again.step == Step::abort && again.reason == Reason::noProgress, "second no-progress aborts");
     }

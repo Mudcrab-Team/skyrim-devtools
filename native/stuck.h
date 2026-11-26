@@ -24,7 +24,7 @@ namespace devtools::nav::stuck
         double windowS = 3.0;
         int maxFailures = 3;          // recoveries tried before giving up
         double totalS = 20.0;         // hard cap on one stuck episode
-        double progressWindowS = 15.0;  // goal distance must improve by progressGain within this
+        double progressWindowS = 10.0;  // goal distance must improve by progressGain within this; two windows end a trip, so 20 s
         double progressGain = 100.0;
         double oscWindowS = 10.0;     // goal-less movement: net displacement vs path walked
         double oscRatio = 0.2;
@@ -123,11 +123,13 @@ namespace devtools::nav::stuck
         }
 
         // Keep going from a new place without ending the episode (a recovery just moved the player).
+        // Progress towards the goal is not restarted: a recovery that gets the player nowhere closer must not
+        // buy another full window before the next verdict.
         void Rebase(double now)
         {
+            (void)now;
             samples_.clear();
             walked_ = 0.0;
-            bestAt_ = now;
         }
 
         // A recovery the caller chooses itself, for steps with no meaning to it (replan on a fixed heading).

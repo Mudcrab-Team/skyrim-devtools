@@ -103,6 +103,14 @@ namespace
         double questRefreshed = 0.0;
         bool activate = false;      // activate the goal reference on arrival
         bool activated = false;
+        RE::FormID lever = 0;       // a lever, chain or switch being walked to because a way ahead is shut
+        std::set<RE::FormID> leversTried;
+        double leverSettleUntil = -1e9;  // gates and bridges animate for a few seconds after a pull
+        int leversPulled = 0;
+        RE::TESObjectCELL* awaitCell = nullptr;  // activating a load door: the cell the player must leave
+        double awaitSince = 0.0;
+        double awaitChanged = -1.0;  // when the cell was seen to change; the door log needs a moment to note the arrival
+        int doorTries = 0;
         double loadingTotal = 0.0;  // seconds spent in loading screens; they do not count against timeoutS
         double loadingSince = -1.0;
         std::uint64_t openSignature = 0;  // open/locked/disabled state of what stands nearby
@@ -245,6 +253,10 @@ namespace
         return nullptr;
     }
 
+    constexpr double leverReach = 150.0;
+    constexpr double leverFarthest = 500.0;
+    constexpr double leverSettleS = 4.0;
+    constexpr std::size_t maxLevers = 4;
     constexpr double doorStageDistance = 130.0;
     constexpr double doorActivateReach = 160.0;
 
@@ -283,6 +295,13 @@ namespace
         if (p.viaIndex < p.via.size()) {
             radius = p.global ? 400.0 : 250.0;
             return p.via[p.viaIndex];
+        }
+        if (p.lever) {
+            if (const auto lever = LookupRef(p.lever)) {
+                radius = leverReach;
+                return lever->GetPosition();
+            }
+            p.lever = 0;
         }
         if (const auto door = ApproachDoor(p)) {
             if (p.stageFor != door->GetFormID()) {
@@ -527,6 +546,9 @@ namespace
         out["loadingS"] = Round(p.loadingTotal);
         if (p.activate) {
             out["activated"] = p.activated;
+        }
+        if (p.leversPulled) {
+            out["leversPulled"] = p.leversPulled;
         }
         if (p.staleResets) {
             out["openStateResets"] = p.staleResets;
@@ -866,6 +888,34 @@ namespace
         return true;
     }
 
+    // The cell changed after a load door was activated. The detector only runs while a trip is walking, so
+    // a door that is being re-entered is reported here, once the arrival is in the door log.
+    void FinishThroughDoor(Process& p, RE::PlayerCharacter& player)
+    {
+        const auto now = Now();
+        if (p.awaitChanged < 0.0) {
+            p.awaitChanged = now;
+        }
+        if (now - p.awaitChanged < 0.6) {
+            p.state = "door";
+            return;
+        }
+        const auto& cfg = p.det.Settings();
+        if (const auto door = stuck::Doors().Repeated(now, p.awaitSince - 1.0, cfg.doorRepeat, cfg.doorWindowS)) {
+            stuck::Verdict verdict;
+            verdict.reason = stuck::Reason::doorLoop;
+            verdict.step = stuck::Step::replan;
+            verdict.failures = 1;
+            verdict.door = door;
+            const auto goalPos = GoalPosition(p);
+            auto report = stuck::Report(verdict, player, &goalPos);
+            stuck::EmitStuck("nav", verdict, report);
+        }
+        p.awaitCell = nullptr;
+        p.awaitChanged = -1.0;
+        Finish(p, "arrived", "");
+    }
+
     // Ends a trip at its goal; with activate set, first faces the goal reference and activates it.
     void Arrive(Process& p, RE::PlayerCharacter& player)
     {
@@ -881,20 +931,95 @@ namespace
                 return;
             }
         }
+        if (p.activate && p.awaitCell) {
+            // A load door was activated: the trip ends once the destination cell is loaded, not when the
+            // activation is sent, so the next leg starts in the cell it expects.
+            if (player.GetParentCell() != p.awaitCell) {
+                FinishThroughDoor(p, player);
+                return;
+            }
+            const auto now = Now();
+            if (now - p.awaitSince > 6.0) {
+                if (p.doorTries >= 3) {
+                    Finish(p, "failed", "Activating the load door did not change cells (locked, blocked or out of reach)");
+                    return;
+                }
+                if (const auto ref = LookupRef(p.goal.ref)) {
+                    ++p.doorTries;
+                    p.awaitSince = now;
+                    FaceHeading(player, HeadingTo(player.GetPosition(), ref->GetPosition()));
+                    ref->ActivateRef(&player, 0, nullptr, 1, false);
+                }
+            }
+            p.state = "door";
+            return;
+        }
         if (p.activate && !p.activated) {
             if (const auto ref = LookupRef(p.goal.ref)) {
                 p.activated = true;
                 FaceHeading(player, HeadingTo(player.GetPosition(), ref->GetPosition()));
                 ref->ActivateRef(&player, 0, nullptr, 1, false);
+                if (IsLoadDoor(ref)) {
+                    p.awaitCell = player.GetParentCell();
+                    p.awaitSince = Now();
+                    p.doorTries = 1;
+                    p.state = "door";
+                    return;
+                }
             }
         }
         Finish(p, "arrived", "");
+    }
+
+    // Shut ways: when the loaded navmeshes end at a gate or an unbuilt drawbridge, whatever operates it
+    // (a lever, a chain, an activator linked to it) is the way forward, so pull it and plan again.
+    void PullLever(Process& p, RE::PlayerCharacter& player, double now)
+    {
+        const auto id = p.lever;
+        p.lever = 0;
+        p.leversTried.insert(id);
+        const auto ref = LookupRef(id);
+        if (!ref) {
+            return;
+        }
+        FaceHeading(player, HeadingTo(player.GetPosition(), ref->GetPosition()));
+        ref->ActivateRef(&player, 0, nullptr, 1, false);
+        ++p.leversPulled;
+        p.leverSettleUntil = now + leverSettleS;
+        p.traps.clear();
+        p.deadEnds = 0;
+        p.plan = {};
+        p.replanWanted = true;
+        Emit("navReplan", { { "id", p.id }, { "why", "leverPulled" }, { "ref", Hex(id) }, { "pos", Point(player.GetPosition()) } });
+    }
+
+    bool StartLever(Process& p, const RE::NiPoint3& stop)
+    {
+        if (p.leversTried.size() >= maxLevers) {
+            return false;
+        }
+        for (const auto id : inspect::Pullables(stop, 1500.0)) {
+            if (p.leversTried.contains(id) || !LookupRef(id)) {
+                continue;
+            }
+            p.lever = id;
+            p.deadEnds = 0;
+            p.plan = {};
+            p.replanWanted = true;
+            return true;
+        }
+        return false;
     }
 
     void TickInput(Process& p, RE::PlayerCharacter& player, Tick& tick)
     {
         const auto now = tick.now;
         const auto pos = player.GetPosition();
+        if (p.awaitCell && player.GetParentCell() != p.awaitCell) {
+            // The load door led somewhere: the goal reference stayed behind, so do not measure against it.
+            FinishThroughDoor(p, player);
+            return;
+        }
         if (now - p.openChecked > 1.0) {
             p.openChecked = now;
             const auto signature = OpenSignature(player);
@@ -927,6 +1052,17 @@ namespace
             }
         }
 
+        if (now < p.leverSettleUntil) {
+            p.state = "door";
+            return;
+        }
+        if (p.lever && p.viaIndex >= p.via.size()) {
+            if (const auto lever = LookupRef(p.lever); lever && Dist2D(pos, lever->GetPosition()) < leverReach + 20.0 &&
+                                                       std::abs(pos.z - lever->GetPosition().z) < 300.0) {
+                PullLever(p, player, now);
+                return;
+            }
+        }
         if (p.hasStage && !p.staged && p.viaIndex >= p.via.size() && Dist2D(pos, target) < radius) {
             // At the staging point: face the door, which is then within reach.
             p.staged = true;
@@ -999,6 +1135,19 @@ namespace
             }
             if (p.deadEnds > 5) {
                 const auto stop = p.plan.points.empty() ? pos : p.plan.points.back();
+                if (p.lever) {
+                    // The lever itself is off the navmesh: pull it from the nearest reachable spot if that is close enough.
+                    const auto lever = LookupRef(p.lever);
+                    if (lever && Dist3D(lever->GetPosition(), stop) < leverFarthest) {
+                        PullLever(p, player, now);
+                        return;
+                    }
+                    p.leversTried.insert(p.lever);
+                    p.lever = 0;
+                }
+                if (StartLever(p, stop)) {
+                    return;
+                }
                 p.blockers = inspect::Blockers(stop, target);
                 Finish(p, "failed", "Dead end: the loaded navmeshes have no way closer to the goal; " + inspect::BlockerSummary(p.blockers));
                 return;
@@ -1615,6 +1764,10 @@ namespace
         Emit("navStuck", std::move(data));
         if (verdict.step == stuck::Step::abort) {
             if (p.global && p.unsticks < 10 && verdict.reason == stuck::Reason::stuck && Unstick(p, player, now)) {
+                return;
+            }
+            if (p.mode == "input" && !p.lever && verdict.reason != stuck::Reason::doorLoop && StartLever(p, pos)) {
+                p.det.Reset(now);
                 return;
             }
             p.blockers = report["blockers"];
