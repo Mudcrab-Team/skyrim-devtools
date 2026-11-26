@@ -55,7 +55,8 @@ def decode(raw):
         for start, duration, word, a, b in EVENT.iter_unpack(blob):
             events.append(((start - origin) * 1000.0 / freq, duration * 1000.0 / freq, word & NAME_MASK, word >> NAME_BITS, a, b))
         events.sort(key=lambda e: (e[0], -e[1]))
-        threads.append({"tid": thread.get("tid"), "name": thread.get("name") or "", "events": events,
+        threads.append({"tid": thread.get("tid"), "name": thread.get("name") or "",
+                        "nameSource": thread.get("nameSource") or "", "events": events,
                         "dropped": thread.get("dropped", 0), "shortWaits": thread.get("shortWaits", 0)})
     return {"names": names, "threads": threads, "settings": trace.get("settings", {}), "hooks": trace.get("hooks", []),
             "api": trace.get("api", {}), "osHooks": trace.get("osHooks", {}), "freq": freq}

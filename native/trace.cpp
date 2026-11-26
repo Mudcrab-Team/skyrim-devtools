@@ -11,6 +11,7 @@
 #include "logs.h"
 #include "methods.h"
 #include "perf.h"
+#include "thread_names.h"
 
 #include <Windows.h>
 #include <MinHook.h>
@@ -66,6 +67,11 @@ namespace devtools::trace
         struct ThreadBuffer
         {
             DWORD tid = 0;
+            // Taken on the thread itself when it first records, so a thread that exits before the trace
+            // is read keeps its label.
+            std::uintptr_t start = 0;
+            std::uintptr_t root = 0;
+            devtools::threads::Name name;
             std::uint64_t generation = 0;
             std::atomic<std::uint64_t> count = 0;
             std::atomic<std::uint64_t> dropped = 0;
@@ -115,6 +121,9 @@ namespace devtools::trace
             if (!local) {
                 auto* buffer = new ThreadBuffer;
                 buffer->tid = GetCurrentThreadId();
+                buffer->start = devtools::threads::StartAddress(GetCurrentThread());
+                buffer->root = devtools::threads::RootGameFrame();
+                buffer->name = devtools::threads::NameOf(buffer->tid, GetCurrentThread());
                 std::lock_guard lock(buffersMutex);
                 buffers.push_back(buffer);
                 local = buffer;
@@ -142,26 +151,6 @@ namespace devtools::trace
                 out += i + 1 < size ? alphabet[(v >> 6) & 63] : '=';
                 out += '=';
             }
-            return out;
-        }
-
-        std::string ThreadName(DWORD tid)
-        {
-            std::string out;
-            HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
-            if (!thread) {
-                return out;
-            }
-            PWSTR wide = nullptr;
-            if (SUCCEEDED(GetThreadDescription(thread, &wide)) && wide) {
-                const int size = WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
-                if (size > 1) {
-                    out.resize(size - 1);
-                    WideCharToMultiByte(CP_UTF8, 0, wide, -1, out.data(), size, nullptr, nullptr);
-                }
-                LocalFree(wide);
-            }
-            CloseHandle(thread);
             return out;
         }
 
@@ -471,9 +460,10 @@ namespace devtools::trace
                 std::memcpy(bytes.data() + i * sizeof(Event), chunk->events, n * sizeof(Event));
             }
             events += count;
-            threads.push_back({ { "tid", buffer->tid }, { "name", ThreadName(buffer->tid) }, { "count", count },
-                { "dropped", buffer->dropped.load() }, { "shortWaits", buffer->shortWaits.load() },
-                { "events", Base64(bytes.data(), bytes.size()) } });
+            Json thread{ { "tid", buffer->tid }, { "count", count }, { "dropped", buffer->dropped.load() },
+                { "shortWaits", buffer->shortWaits.load() }, { "events", Base64(bytes.data(), bytes.size()) } };
+            devtools::threads::Describe(thread, buffer->tid, nullptr, buffer->start, buffer->root, buffer->name);
+            threads.push_back(std::move(thread));
         }
         const char* api = settings.apiMode == 0 ? "off" : settings.apiMode == 2 ? "full" : "batched";
         return Json{ { "version", 1 }, { "freq", frequency },

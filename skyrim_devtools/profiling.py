@@ -299,6 +299,73 @@ class Profile:
         self.frame_function = [self._function(f) for f in raw.get("frames", [])]
         self.stacks = raw.get("stacks", [])
         self._stack_cache = {}
+        self.label_threads()
+
+    # Labels the client derived itself; a thread carrying one is relabelled when the symbols change.
+    DERIVED_THREAD_NAMES = ("main", "start-symbol", "root-symbol", "start-address", "root-address")
+
+    def _game_modules(self):
+        return {m["name"].lower() for m in self.modules if m.get("game")} or {"skyrimse.exe"}
+
+    def _code_label(self, where):
+        """(label, resolved) for a code address reported as {module, rva}: `Function (SkyrimSE+0x1234)` when
+        the game's symbols name it, else `module+0x1234`."""
+        if not where or where.get("module") is None or where.get("rva") is None:
+            return None, False
+        module, rva = where["module"], where["rva"]
+        place = f"{module.rsplit('.', 1)[0]}+0x{rva:x}"
+        if module.lower() in self._game_modules() and not self.foreign:
+            label, source, _ = self.symbols.resolve(rva)
+            if source not in ("none", "pdata"):
+                return f"{label} ({place})", True
+        return place, False
+
+    def _sampled_root(self, thread):
+        """{module, rva} of the outermost game frame of the thread's most sampled stack."""
+        weights = Counter()
+        for _, stack, count, _ in thread.get("runs", []):
+            weights[stack] += count
+        frames = self.raw.get("frames", [])
+        for stack, _ in weights.most_common(1):
+            root = None
+            while stack is not None and 0 <= stack < len(self.stacks):
+                prefix, frame = self.stacks[stack]
+                info = frames[frame] if 0 <= frame < len(frames) else {}
+                module = self.modules[info["m"]] if 0 <= info.get("m", -1) < len(self.modules) else {}
+                if module.get("game"):
+                    root = {"module": module["name"], "rva": info.get("rva")}
+                stack = prefix
+            return root
+        return None
+
+    def label_threads(self):
+        """Give every unnamed thread (sampled or traced) a label: `main` for the main thread, else the function
+        its start address or outermost game frame lies in. `nameSource` says where a name came from:
+        description or exception (the game named it), start-symbol/root-symbol, start-address/root-address."""
+        sampled = {t.get("tid"): t for t in self.raw.get("threads", [])}
+        main = {tid for tid, t in sampled.items() if t.get("main")}
+        traced = ((self.raw.get("trace") or {}).get("threads")) or []
+        for thread in list(sampled.values()) + list(traced):
+            source = thread.get("nameSource")
+            if thread.get("name") and source not in self.DERIVED_THREAD_NAMES:
+                continue
+            if thread.get("tid") in main:
+                thread["name"], thread["nameSource"] = "main", "main"
+                continue
+            other = sampled.get(thread.get("tid"), {})
+            root = thread.get("root") or other.get("root") or self._sampled_root(other or thread)
+            candidates = [("start", thread.get("start") or other.get("start")), ("root", root)]
+            # A named function first; else a game address, since CRT and OS start trampolines are shared
+            # by many threads and tell them apart less well.
+            ranked = []
+            for order, (kind, where) in enumerate(candidates):
+                label, resolved = self._code_label(where)
+                if label:
+                    in_game = label.lower().startswith(tuple(f"{g.rsplit('.', 1)[0]}+" for g in self._game_modules()))
+                    ranked.append((not resolved, not (resolved or in_game), order, label,
+                                   f"{kind}-{'symbol' if resolved else 'address'}"))
+            if ranked:
+                _, _, _, thread["name"], thread["nameSource"] = min(ranked)
 
     def _function(self, frame, count_source=True):
         if "m" not in frame:

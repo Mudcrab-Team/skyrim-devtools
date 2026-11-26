@@ -117,9 +117,13 @@ async def capture_case(manager, symbols, config, seconds, out):
     _, stats = profile_trace.build_perfetto(profile)
     decoded = profile_trace.decode(raw) or {"threads": [], "names": []}
     categories = {}
-    named_threads = 0
+    named_threads = labelled_threads = 0
+    name_sources = {}
     for thread in decoded["threads"]:
-        named_threads += bool(thread["name"])
+        source = thread.get("nameSource") or ("" if not thread["name"] else "unknown")
+        name_sources[source] = name_sources.get(source, 0) + 1
+        labelled_threads += bool(thread["name"])
+        named_threads += bool(thread["name"]) and source not in ("start-address", "root-address")
         for _, _, name_id, _, _, _ in thread["events"]:
             category = decoded["names"][name_id][1]
             categories[category] = categories.get(category, 0) + 1
@@ -147,7 +151,9 @@ async def capture_case(manager, symbols, config, seconds, out):
     if not ((summary.get("drawsPerFrame") or {}).get("p50") or 0) > 0:
         failed.append("no draw calls per frame")
     if len(decoded["threads"]) < 4 or named_threads < 2:
-        failed.append(f"{len(decoded['threads'])} traced threads, {named_threads} named")
+        failed.append(f"{len(decoded['threads'])} traced threads, {named_threads} named ({name_sources})")
+    if labelled_threads < len(decoded["threads"]):
+        failed.append(f"{len(decoded['threads']) - labelled_threads} traced threads without any label")
     for category, label in (("render", "engine render ranges"), ("pass", "D3D11 passes"), ("wait", "OS waits"),
                             ("io", "file reads"), ("cell", "cell attach/detach ranges")):
         if not categories.get(category):
@@ -163,6 +169,8 @@ async def capture_case(manager, symbols, config, seconds, out):
     return {"pass": not failed, "failed": failed, "pftrace": paths["perfetto"], "files": paths,
             "bytes": Path(paths["perfetto"]).stat().st_size, "perfetto": stats, "traceProcessor": tp,
             "categories": categories, "threads": len(decoded["threads"]), "namedThreads": named_threads,
+            "labelledThreads": labelled_threads, "nameSources": name_sources,
+            "threadNames": sorted({t["name"] for t in decoded["threads"] if t["name"]})[:30],
             "hooksInstalled": installed, "hookErrors": [h for h in hooks if h.get("error")], "unresolvedLocal": unresolved,
             "summary": {k: summary.get(k) for k in ("events", "droppedEvents", "frames", "phases", "drawsPerFrame",
                                                     "apiPasses", "waits", "reads", "api", "settings")},

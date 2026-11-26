@@ -224,6 +224,35 @@ class ProfileTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_label_threads(self):
+        raw = raw_profile(RUNS)
+        raw["threads"] += [
+            {"tid": 2, "name": "JobWorker", "nameSource": "description", "start": {"module": "SkyrimSE.exe", "rva": 0x1010},
+             "runs": []},
+            {"tid": 3, "name": "", "start": {"module": "SkyrimSE.exe", "rva": 0x1010}, "runs": []},
+            {"tid": 4, "name": "", "start": {"module": "ucrtbase.dll", "rva": 0x2a0}, "runs": [[0.0, 2, 5, 0]]},
+            {"tid": 5, "name": "", "start": {"module": "KERNEL32.DLL", "rva": 0x17340}, "runs": []},
+            {"tid": 6, "name": "", "start": {"module": "SkyrimSE.exe", "rva": 0x8010}, "runs": []},
+        ]
+        raw["trace"] = {"threads": [{"tid": 7, "name": "", "start": {"module": "ucrtbase.dll", "rva": 0x2a0},
+                                     "root": {"module": "SkyrimSE.exe", "rva": 0x2010}},
+                                    {"tid": 3, "name": ""}]}
+        symbols = profiling.GameSymbols(self.root)
+        profile = profiling.Profile(raw, symbols)
+        names = {t["tid"]: (t["name"], t.get("nameSource")) for t in raw["threads"] + raw["trace"]["threads"][:1]}
+        self.assertEqual(names[1], ("main", "main"))
+        self.assertEqual(names[2], ("JobWorker", "description"))
+        self.assertEqual(names[3], ("Alpha::Run (SkyrimSE+0x1010)", "start-symbol"))
+        self.assertEqual(names[4], ("Alpha::Run (SkyrimSE+0x1010)", "root-symbol"))
+        self.assertEqual(names[5], ("KERNEL32+0x17340", "start-address"))
+        self.assertEqual(names[6], ("SkyrimSE+0x8010", "start-address"))
+        self.assertEqual(names[7], ("Beta::Tick (guess) (SkyrimSE+0x2010)", "root-symbol"))
+        # a traced thread that was also sampled borrows the sampled thread's start address
+        self.assertEqual(raw["trace"]["threads"][1]["name"], "Alpha::Run (SkyrimSE+0x1010)")
+        profiling.Profile(raw, symbols)
+        self.assertEqual({t["tid"]: (t["name"], t.get("nameSource")) for t in raw["threads"]
+                          + raw["trace"]["threads"][:1]}, names)
+
     def test_report_self_total_and_waits(self):
         report = self.profile.report("main")
         self.assertEqual(report["onCpuSamples"], 7)
