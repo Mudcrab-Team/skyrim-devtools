@@ -3,6 +3,7 @@
 
   tools/pc-build --config mac.json                   incremental build
   tools/pc-build --config mac.json --deploy          build, then copy the DLL while holding agent.lock
+                                                     (--with-example also deploys the example extension plugin)
   tools/pc-build --config mac.json commonlib         (re)build the shared CommonLibSSE-NG once
   tools/pc-build --config mac.json lock|unlock       hold agent.lock around a live run
   tools/pc-build --config mac.json lock --refresh    heartbeat: agent.lock goes stale 25 min after its last refresh
@@ -32,7 +33,8 @@ import time
 
 REPO = Path(__file__).resolve().parent.parent
 REMOTE_ROOT = r".local\skyrim-devtools"
-SYNC_DIRS = ["native"]
+# native/ is the build tree's root; ext/ (the public extension header) and examples/ keep their names inside it
+SYNC_DIRS = ["native", "ext", "examples"]
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,40}")
 
 
@@ -66,6 +68,10 @@ class Host:
                                 capture_output=True, text=True)
         if result.returncode:
             fail(f"scp failed: {result.stderr.strip()[:400]}")
+
+
+def remote_path(relative):
+    return relative.removeprefix("native/")
 
 
 def scan():
@@ -104,11 +110,11 @@ def sync(host, name, full):
         with tempfile.TemporaryDirectory() as tmp:
             archive = Path(tmp) / "src.tar"
             manifest = Path(tmp) / "removed.txt"
-            manifest.write_text("\n".join(r.removeprefix("native/") for r in removed))
+            manifest.write_text("\n".join(remote_path(r) for r in removed))
             with tarfile.open(archive, "w") as tar:
                 for relative in changed:
                     if relative != "native/build_id.h":
-                        tar.add(REPO / relative, arcname=relative.removeprefix("native/"))
+                        tar.add(REPO / relative, arcname=remote_path(relative))
                 if "native/build_id.h" in changed:
                     header = Path(tmp) / "build_id.h"
                     header.write_text(stamp)
@@ -232,6 +238,8 @@ def main():
     parser.add_argument("--config", type=Path, default=os.environ.get("SKYRIM_DEVTOOLS_CONFIG"))
     parser.add_argument("--name", default=REPO.name, help="build directory and agent name (default: worktree name)")
     parser.add_argument("--deploy", action="store_true", help="copy the DLL into the game while holding agent.lock")
+    parser.add_argument("--with-example", action="store_true",
+                        help="with --deploy: also copy the example extension plugin (examples/hello-ext) into the game")
     parser.add_argument("--keep-lock", action="store_true", help="with --deploy: keep agent.lock for the live run")
     parser.add_argument("--lock-wait", type=int, default=0, metavar="SECONDS", help="wait this long for agent.lock")
     parser.add_argument("--refresh", action="store_true",
@@ -276,6 +284,8 @@ def main():
             flags += f" -Deploy -Agent {options.name} -LockWait {options.lock_wait}"
             if options.keep_lock:
                 flags += " -KeepLock"
+            if options.with_example:
+                flags += " -WithExample"
         if options.reconfigure:
             flags += " -Reconfigure"
         if options.no_prebuilt:

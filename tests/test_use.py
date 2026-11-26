@@ -19,7 +19,10 @@ METHODS = ["Console.execute", "Events.list", "Events.snapshot", "Events.subscrib
 
 
 class FakeSocket:
+    default_extra = []  # methods another plugin registered, as Session.getInfo lists them
+
     def __init__(self):
+        self.extra_methods = [dict(m) for m in FakeSocket.default_extra]
         self.inbox = asyncio.Queue()
         self.calls = []
         self.menus = {"Main Menu"}
@@ -60,7 +63,7 @@ class FakeSocket:
             reply["result"] = self.results[method]
         elif method == "Session.getInfo":
             reply["result"] = {"protocol": 2, "dataLoaded": True, "loadEpoch": self.epoch, "headless": True,
-                               "capabilities": ["input"], "methods": [{"name": m, "thread": "any", "timeoutMs": 1} for m in METHODS]}
+                               "capabilities": ["input"], "methods": [{"name": m, "thread": "any", "timeoutMs": 1} for m in METHODS] + self.extra_methods}
         elif method == "Events.list":
             reply["result"] = [{"type": "menuOpenClose"}, {"type": "console"}, {"type": "loadGame"}]
         elif method == "Events.snapshot":

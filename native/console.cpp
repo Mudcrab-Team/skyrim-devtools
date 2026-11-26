@@ -7,6 +7,7 @@
 #include "events.h"
 #include "game.h"
 #include "methods.h"
+#include "transition.h"
 
 #include <MinHook.h>
 
@@ -128,7 +129,7 @@ DEVTOOLS_MODULE(Console)
     hooked = InstallHook();
     SetCapability("console", hooked);
 
-    Register("Console.execute", [](const Json& params) {
+    RegisterDeferred("Console.execute", [](const Json& params, ReplyPtr reply) {
         AllowOnly(params, { "command", "target", "loadEpoch" });
         if (params.contains("loadEpoch")) {
             RequirePlayable(params);
@@ -136,8 +137,17 @@ DEVTOOLS_MODULE(Console)
         RE::NiPointer<RE::TESObjectREFR> hold;
         const auto target = Target(params, hold);
         const auto command = Require<std::string>(params, "command");
-        return Json{ { "command", command }, { "lines", console::Run(command, target) } };
-    }, { .thread = Thread::Main, .timeout = 15s });
+        if (!transition::Wanted(command)) {
+            reply->Ok({ { "command", command }, { "lines", console::Run(command, target) } });
+            return;
+        }
+        // The target reference is looked up again after the bounce: the selection does not survive a cell change.
+        const auto targetMode = Optional<std::string>(params, "target", "selected");
+        transition::Bounce(reply, [reply, command, targetMode] {
+            RE::TESObjectREFR* after = targetMode == "player" ? RE::PlayerCharacter::GetSingleton() : nullptr;
+            reply->Ok({ { "command", command }, { "bounced", true }, { "lines", console::Run(command, after) } });
+        });
+    }, { .thread = Thread::Main, .timeout = 90s });
     Register("Console.history", [](const Json& params) {
         AllowOnly(params, { "since" });
         const auto since = Optional<std::uint64_t>(params, "since", 0);

@@ -149,7 +149,8 @@ and RPC transcript. The profile holds the game and loader logs.
   states MIT in its README. It uses a named pipe and a separate .NET MCP bridge for many game actions.
 
 - [devbench](https://github.com/alandtse/devbench) (GPL-3.0) injects input at the same input
-  poll. Its approach was studied. No code was copied.
+  poll, and lets other plugins register tools and events through a small C ABI. Its approach and public
+  documentation were studied. No code was copied; the extension API here is an independent design.
 
 These projects were reviewed as source references. The runner uses the pinned libraries above
 directly and includes original host, protocol, and game adapter code.

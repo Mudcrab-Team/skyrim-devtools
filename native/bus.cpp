@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -22,12 +23,26 @@ namespace devtools
         {
             DeferredHandler handler;
             MethodSpec spec;
+            MethodInfo info;
         };
 
-        std::unordered_map<std::string, Method>& Methods()
+        // Other plugins add and remove methods while connections are being served, so lookups copy a
+        // shared_ptr under the lock and a call in flight keeps its method alive after it is removed.
+        using MethodPtr = std::shared_ptr<const Method>;
+
+        std::shared_mutex methodsMutex;
+
+        std::unordered_map<std::string, MethodPtr>& Methods()
         {
-            static std::unordered_map<std::string, Method> methods;
+            static std::unordered_map<std::string, MethodPtr> methods;
             return methods;
+        }
+
+        MethodPtr FindMethod(const std::string& name)
+        {
+            std::shared_lock lock(methodsMutex);
+            const auto found = Methods().find(name);
+            return found == Methods().end() ? nullptr : found->second;
         }
 
         std::vector<std::pair<const char*, void (*)()>>& Modules()
@@ -120,7 +135,7 @@ namespace devtools
             }
         }
 
-        void Run(const Method& method, const Json& params, const ReplyPtr& reply, const std::string& name, Thread thread,
+        void Run(const MethodPtr& method, const Json& params, const ReplyPtr& reply, const std::string& name, Thread thread,
             double enqueuedAt)
         {
             // A call that timed out before the game reached it is not run: its client has moved on.
@@ -144,7 +159,7 @@ namespace devtools
                 }
             } timing{ name, thread, enqueuedAt, started };
             try {
-                method.handler(params, reply);
+                method->handler(params, reply);
             } catch (const RpcError& error) {
                 reply->Fail(error.code, error.message, error.data);
             } catch (const Json::exception& error) {
@@ -174,17 +189,48 @@ namespace devtools
             spec);
     }
 
-    void RegisterDeferred(std::string name, DeferredHandler handler, MethodSpec spec)
+    void RegisterDeferred(std::string name, DeferredHandler handler, MethodSpec spec, MethodInfo info)
     {
-        Methods()[std::move(name)] = Method{ std::move(handler), spec };
+        auto method = std::make_shared<const Method>(Method{ std::move(handler), spec, std::move(info) });
+        std::unique_lock lock(methodsMutex);
+        Methods()[std::move(name)] = std::move(method);
+    }
+
+    bool Unregister(const std::string& name, const std::string& owner)
+    {
+        std::unique_lock lock(methodsMutex);
+        const auto found = Methods().find(name);
+        if (found == Methods().end() || found->second->info.owner != owner) {
+            return false;
+        }
+        Methods().erase(found);
+        return true;
+    }
+
+    std::optional<std::string> OwnerOf(const std::string& name)
+    {
+        const auto method = FindMethod(name);
+        if (!method) {
+            return std::nullopt;
+        }
+        return method->info.owner;
     }
 
     Json ListMethods()
     {
         auto list = Json::array();
+        std::shared_lock lock(methodsMutex);
         for (const auto& [name, method] : Methods()) {
-            list.push_back({ { "name", name }, { "thread", ThreadName(method.spec.thread) },
-                { "timeoutMs", method.spec.timeout.count() } });
+            Json entry{ { "name", name }, { "thread", ThreadName(method->spec.thread) },
+                { "timeoutMs", method->spec.timeout.count() } };
+            if (!method->info.owner.empty()) {
+                entry["owner"] = method->info.owner;
+                entry["description"] = method->info.description;
+                if (!method->info.schema.is_null()) {
+                    entry["schema"] = method->info.schema;
+                }
+            }
+            list.push_back(std::move(entry));
         }
         std::sort(list.begin(), list.end(), [](const Json& a, const Json& b) { return a["name"] < b["name"]; });
         return list;
@@ -255,8 +301,8 @@ namespace devtools
                 outbox->Push(ErrorEnvelope(id, code::invalidParams, "Expected named parameters").dump());
                 return;
             }
-            const auto found = Methods().find(name);
-            if (found == Methods().end()) {
+            const auto method = FindMethod(name);
+            if (!method) {
                 outbox->Push(ErrorEnvelope(id, code::unknownMethod, "Unknown method " + name).dump());
                 return;
             }
@@ -265,7 +311,6 @@ namespace devtools
                 outbox->Push(ErrorEnvelope(id, code::busy, "Too many calls in flight").dump());
                 return;
             }
-            const auto& method = found->second;
             auto reply = std::make_shared<Reply>([outbox, id](Json body) {
                 body["jsonrpc"] = "2.0";
                 body["id"] = id;
@@ -273,20 +318,20 @@ namespace devtools
                 ++completed;
                 outbox->Push(body.dump(-1, ' ', false, Json::error_handler_t::replace));
             });
-            if (method.spec.timeout.count() > 0) {
-                Deadlines().Add(std::chrono::steady_clock::now() + method.spec.timeout, reply,
-                    { { "method", name }, { "thread", ThreadName(method.spec.thread) },
-                        { "timeoutMs", method.spec.timeout.count() } });
+            if (method->spec.timeout.count() > 0) {
+                Deadlines().Add(std::chrono::steady_clock::now() + method->spec.timeout, reply,
+                    { { "method", name }, { "thread", ThreadName(method->spec.thread) },
+                        { "timeoutMs", method->spec.timeout.count() } });
             }
             const auto tasks = SKSE::GetTaskInterface();
-            const auto thread = method.spec.thread;
+            const auto thread = method->spec.thread;
             const double enqueuedAt = perf::Now();
             switch (thread) {
             case Thread::Main:
-                tasks->AddTask([&method, params, reply, name, thread, enqueuedAt] { Run(method, params, reply, name, thread, enqueuedAt); });
+                tasks->AddTask([method, params, reply, name, thread, enqueuedAt] { Run(method, params, reply, name, thread, enqueuedAt); });
                 break;
             case Thread::UI:
-                tasks->AddUITask([&method, params, reply, name, thread, enqueuedAt] { Run(method, params, reply, name, thread, enqueuedAt); });
+                tasks->AddUITask([method, params, reply, name, thread, enqueuedAt] { Run(method, params, reply, name, thread, enqueuedAt); });
                 break;
             default:
                 Run(method, params, reply, name, thread, enqueuedAt);

@@ -3,6 +3,9 @@ SkyrimDevtools licensing
 MIT covers the Python client, Windows launcher, native transport, build scripts
 and tests. See licenses/MIT.txt.
 
+The extension header ext/skyrim_devtools_ext.h and the example plugin source in examples/ are MIT, so a plugin that
+only includes the header takes on no GPL obligation from this project.
+
 The Windows plugin adapter, native/plugin.cpp, carries GPL-3.0-or-later. See
 licenses/CommonLibSSE-GPL-3.0.txt and the pinned CommonLibSSE-NG notices and
 linking exceptions in README.md.

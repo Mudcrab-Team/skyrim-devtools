@@ -5,6 +5,7 @@ param(
     [string]$Name = 'default',
     [string]$Agent = '',
     [switch]$Deploy,
+    [switch]$WithExample,
     [switch]$Wipe,
     [switch]$Reconfigure,
     [switch]$NoPrebuilt,
@@ -204,6 +205,10 @@ if ($Deploy) {
     try {
         $dest = Join-Path $root 'game\Data\SKSE\Plugins'
         Step 'deploy' { Copy-Item $dll (Join-Path $dest 'SkyrimDevTools.dll') -Force }
+        $example = Join-Path $build 'SkyrimDevToolsExample.dll'
+        if ($WithExample -and (Test-Path $example)) {
+            Step 'deploy example' { Copy-Item $example (Join-Path $dest 'SkyrimDevToolsExample.dll') -Force }
+        }
     } finally {
         if (-not $KeepLock -and -not $heldBefore) { Remove-Item $lockPath -Force -ErrorAction SilentlyContinue; Write-Output 'lock released' }
     }

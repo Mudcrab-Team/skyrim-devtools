@@ -5,6 +5,7 @@
 #include "game.h"
 #include "input.h"
 #include "methods.h"
+#include "options.h"
 
 #include <algorithm>
 #include <mutex>
@@ -36,6 +37,9 @@ namespace
             }
             const std::string menu = event->menuName.c_str();
             events::Emit("menuOpenClose", { { "menu", menu }, { "opening", event->opening } });
+            if (event->opening) {
+                options::OnMenuOpened(menu);
+            }
             std::vector<ReplyPtr> ready;
             {
                 std::lock_guard lock(waitersMutex);

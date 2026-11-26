@@ -11,9 +11,11 @@ import time
 
 from mcp.server.fastmcp import FastMCP, Image
 
-from . import capture, combat, modtest, perception, saves
+from . import capture, combat, ext, modtest, perception, saves
 from .alerts import AlertBoard
-from .manager import GameError, GameManager
+from .manager import GameError, GameManager, describe_rpc_error
+from .options import split_options
+from ..client import RpcError
 from .timeline import Recorder
 
 INSTRUCTIONS = """\
@@ -141,6 +143,9 @@ def build_server(manager, recorder=None, board=None):
     mcp = FastMCP("skyrim-use", instructions=INSTRUCTIONS, lifespan=lifespan)
     recorder.instrument(mcp, board)
 
+    extension_tools = ext.ExtTools(mcp, manager)
+    manager.methods_listeners.append(extension_tools.sync)
+
     async def native(method, **params):
         """Call a method that may be missing from the running plugin build."""
         params = {key: value for key, value in params.items() if value is not None}
@@ -170,6 +175,7 @@ def build_server(manager, recorder=None, board=None):
         perf_check next: a slideshow game wastes the whole session."""
         board.forget_native()
         status = await manager.start(headless=headless, save=save)
+        extension_tools.sync()
         await sync_alerts()
         return dumps(status)
 
@@ -180,6 +186,7 @@ def build_server(manager, recorder=None, board=None):
         ended (graceful, killed-after-Ns, closing-crashed) and `crash` carries the crash log's top frames."""
         result = await manager.stop(grace=max(1, min(120, grace_seconds)))
         board.forget_native()
+        extension_tools.sync()
         return dumps(result)
 
     @mcp.tool()
@@ -191,6 +198,7 @@ def build_server(manager, recorder=None, board=None):
         status = await manager.status()
         if not manager.alive:
             board.forget_native()
+        extension_tools.sync()
         status["daemon"] = daemon_state()
         return dumps(status)
 
@@ -389,8 +397,49 @@ def build_server(manager, recorder=None, board=None):
     @mcp.tool()
     async def rpc_call(method: str, params: dict | None = None, timeout_s: float | None = None) -> str:
         """Call any native JSON-RPC method by name with a params object (see rpc_methods and docs/protocol.md).
-        Returns the JSON result. Errors carry the RPC code (-32004 not ready, -32005 stale epoch, -32008 timeout)."""
-        return dumps(await manager.call(method, timeout=timeout_s, **(params or {})))
+        Returns the JSON result. Errors carry the RPC code (-32004 not ready, -32005 stale epoch, -32008 timeout).
+        Methods registered by other plugins carry a schema in rpc_methods; keys outside it produce a `warnings` entry."""
+        params, warnings = ext.check_args((manager.methods.get(method) or {}).get("schema"), params,
+                                          bool(manager.option_state.get("strictArgs")), label=f"method {method}")
+        return ext.attach_warnings(dumps(await manager.call(method, timeout=timeout_s, **params)), warnings)
+
+    # ---- options ------------------------------------------------------------------------------
+
+    @mcp.tool()
+    async def game_options(changes: dict | None = None) -> str:
+        """Read or change the session options. changes keys: alwaysActive (bool: the game keeps running while its window
+        is in the background), autoDismissMenus (list of menu names hidden as soon as they open, e.g. ["TutorialMenu"];
+        message boxes and core menus are never dismissed), disableVanityCamera (bool, default true: no idle orbit
+        camera), cleanTransition (bool: coc/cow first visit a small cell so the game shows a real loading screen),
+        cleanTransitionCell (interior editor id for that bounce), stallThresholdMs (main-thread stall event threshold),
+        strictArgs (bool: unknown tool arguments are an error instead of a warning). Options persist across game
+        restarts of this server and can also be set under `options` in the host config."""
+        if changes:
+            try:
+                split_options(changes)
+            except ValueError as error:
+                raise GameError(str(error)) from error
+            for key in ("alwaysActive", "cleanTransition", "disableVanityCamera", "strictArgs"):
+                if key in changes and not isinstance(changes[key], bool):
+                    raise GameError(f"option {key} is true or false")
+            before = dict(manager.option_state)
+            manager.option_state.update(changes)
+            applied = None
+            if manager.alive:
+                try:
+                    applied = await manager.apply_options(changed=changes.keys())
+                except RpcError as error:
+                    manager.option_state.clear()
+                    manager.option_state.update(before)
+                    raise GameError(describe_rpc_error(error)) from error
+        else:
+            applied = None
+        result = {"options": manager.option_state}
+        if manager.alive and manager.has_method("Options.get"):
+            result["native"] = applied if applied is not None else await manager.call("Options.get")
+        elif not manager.alive:
+            result["note"] = "no game is running; the options are applied when one starts"
+        return dumps(result)
 
     # ---- curated wrappers for newer native methods --------------------------------------------
 
@@ -842,6 +891,7 @@ def build_server(manager, recorder=None, board=None):
         moves the player along it instead). Returns at once; the replayFinished event marks the end."""
         return dumps(await native("Record.replayCamera", name=name, speed=speed, method=method))
 
+    ext.install_arg_checking(mcp, lambda: bool(manager.option_state.get("strictArgs")), extension_tools.remember)
     return mcp
 
 
