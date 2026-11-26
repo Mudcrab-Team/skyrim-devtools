@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // COMMUNITY(alandtse/CommonLibSSE-NG@7c27a75da3eb0db080c1f1f63f6df1b7cd733c2a, GPL-3.0-or-later)
 // Session lifecycle, save loading and the generic state snapshot.
+#include "build_info.h"
 #include "bus.h"
 #include "events.h"
 #include "game.h"
@@ -183,7 +184,7 @@ DEVTOOLS_MODULE(Session)
     Register("Session.getInfo", [](const Json& params) {
         AllowOnly(params, {});
         const auto& config = GetConfig();
-        return Json{ { "protocol", protocol }, { "build", config.build }, { "imageSha256", config.imageSha256 },
+        return Json{ { "protocol", protocol }, { "build", config.build }, { "pluginBuild", std::string(BuildId()) }, { "imageSha256", config.imageSha256 },
             { "sessionId", config.sessionId }, { "dataLoaded", state::dataLoaded.load() },
             { "loadEpoch", state::epoch.load() }, { "headless", config.headless },
             { "capabilities", Capabilities() }, { "methods", ListMethods() }, { "bus", bus::Stats() } };

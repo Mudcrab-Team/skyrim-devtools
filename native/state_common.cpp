@@ -215,7 +215,9 @@ namespace devtools::view
             if (const auto race = actor->GetRace()) {
                 out["race"] = Name(race->GetName());
             }
-        } else if (const auto category = out["type"].get<std::string>(); category == "door" || category == "container") {
+        } else if (const auto category = out["type"].get<std::string>(); category == "door") {
+            AddDoorDetails(ref, out);
+        } else if (category == "container") {
             if (ref->IsLocked()) {
                 out["locked"] = true;
             }

@@ -211,6 +211,28 @@ class UseTests(unittest.TestCase):
             await h.text("game_stop")
         run(scenario())
 
+    def test_stale_plugin_is_reported(self):
+        async def scenario():
+            h = Harness()
+            started = json.loads(await h.text("game_start"))
+            plugin = started["plugin"]
+            self.assertTrue(plugin["stale"])
+            self.assertIsNone(plugin["buildId"])
+            self.assertIn("Quest.get", plugin["missingMethods"])
+            self.assertIn("older than", started["warning"])
+            self.assertIn("older than", json.loads(await h.text("game_status"))["warning"])
+            await h.text("game_stop")
+        run(scenario())
+
+    def test_current_plugin_reports_build_id(self):
+        from skyrim_devtools.use.manager import curated_methods, plugin_report
+
+        names = curated_methods()
+        self.assertIn("Ref.activate", names)
+        self.assertIn("Dialogue.waitIdle", names)
+        report = plugin_report({"pluginBuild": "abc:123"}, {name: {} for name in names})
+        self.assertEqual(report, {"buildId": "abc:123", "missingMethods": [], "stale": False})
+
     def test_screenshot_returns_image(self):
         async def scenario():
             h = Harness()

@@ -7,7 +7,7 @@ calls, and exposes menus, console, input, state queries and screenshots as tools
 ## Install and register
 
 ~~~sh
-pip install -e .            # installs the `skyrim-use` command (needs Python 3.13)
+pip install -e '.[video]'   # installs skyrim-use, skyrim-devtools-smoke and skyrim-devtools-video (Python 3.13)
 claude mcp add skyrim-use -- skyrim-use --config /path/to/devtools.json
 ~~~
 
@@ -40,8 +40,10 @@ server speaks plain stdio. When the client exits the server stops the game, so a
 | Observe | `snapshot`, `list_menus {open_only}`, `events_list`, `events_subscribe`, `events_drain {types?, limit}`, `wait_for` |
 | Act | `open_menu`, `close_menu`, `console {command, target}`, `press_key`, `press_control`, `mouse`, `release_all_input`, `look {yaw_deg, pitch_deg}` |
 | Saves and world | `list_saves`, `load_save`, `reload`, `center_on_cell` |
-| State (newer plugin builds) | `player_state`, `player_inventory`, `world_nearby`, `world_crosshair`, `quest_get`, `quest_active`, `message_box`, `message_box_select`, `dialogue_state`, `dialogue_select`, `dialogue_wait`, `dialogue_advance`, `dialogue_close`, `ui_list_items`, `ui_select_item`, `ui_dump`, `ui_get`, `ui_set`, `ui_invoke`, `ui_list`, `dialogue_start`, `screenshot` (image), `perf_frame_stats`, `papyrus_log` |
+| State (newer plugin builds) | `player_state`, `player_inventory`, `world_nearby`, `world_crosshair`, `quest_get`, `quest_find`, `quest_active`, `activate`, `message_box`, `message_box_select`, `dialogue_state`, `dialogue_select`, `dialogue_wait`, `dialogue_advance`, `dialogue_close`, `ui_list_items`, `ui_select_item`, `ui_dump`, `ui_get`, `ui_set`, `ui_invoke`, `ui_list`, `dialogue_start`, `screenshot` (image), `perf_frame_stats`, `papyrus_log` |
 | Generic | `rpc_methods`, `rpc_call {method, params}` |
+
+`game_start` and `game_status` report `plugin` {buildId, missingMethods, stale} and, when the plugin DLL on the host is older than this client, a top-level `warning`; redeploy with `tools/pc-build --deploy` rather than debugging tools that silently do nothing.
 
 The state tools wrap native methods that older plugin builds lack. They answer "method X is not available in
 this plugin build" instead of failing obscurely, and `rpc_call` reaches any method before a wrapper exists.
@@ -80,7 +82,7 @@ For a non-technical audience: game footage beside an "agent view" panel (tool ca
 3. `capture_stop` stops the recording and copies the MP4 next to the timeline (about 40 MB per 30 s at 8 Mbit/s;
    the copy dominates the call over a slow link). The footage start (UTC epoch ms, within about 0.2 s) is in
    the timeline and in `<stamp>.capture.json`.
-4. Compose on the Mac (`pip install -e '.[video]'`, ffmpeg on PATH):
+4. Compose on the Mac (installed by the command above; needs ffmpeg on PATH):
 
 ~~~sh
 skyrim-devtools-video compose --footage x.mp4 --timeline x.jsonl -o out.mp4 \

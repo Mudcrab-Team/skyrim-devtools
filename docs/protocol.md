@@ -13,7 +13,7 @@ finishes later, its result is dropped. Server notifications have no `id`:
 ~~~
 
 `Session.getInfo` returns the protocol number, build, image hash, session id, `dataLoaded`,
-`loadEpoch`, `headless`, `capabilities` (`console`, `events`, `headless`, `input`, `loadSave`,
+`loadEpoch`, `headless`, `pluginBuild` (git sha, `-dirty` when native/ had local changes, and a hash of native/; `unknown` for a hand build; absent in DLLs that predate it), `capabilities` (`console`, `events`, `headless`, `input`, `loadSave`,
 `menus`, `perf`, `screen`), every registered method with its thread and timeout, and bus counters.
 
 ## Methods
@@ -58,10 +58,12 @@ finishes later, its result is dropped. Server notifications have no `id`:
 | Player.state | main | avs? | Position, rotation (deg), cell, worldspace, health/magicka/stamina, level, gold, carry weight, stance flags, active effects. `avs` adds named actor values. |
 | Player.inventory | main | filter?, limit? | `{total, items:[{formID, name, type, count, value, weight, equipped}]}`. Filter: weapon, armor, ammo, potion, ingredient, book, misc, key, scroll, soulgem, note, or a 4-letter record type. |
 | Player.equipped / Player.spells | main | kind?, limit? (spells) | Hands, worn armor with slots; known spells, powers and shouts |
-| World.nearby | main | radius?, types?, limit? | References sorted by distance: actor, container, door, item, activator, furniture, flora. Actors carry level, healthPct, hostile, dead, inCombat, race. |
+| World.nearby | main | radius?, types?, limit? | References sorted by distance: actor, container, door, item, activator, furniture, flora. Actors carry level, healthPct, hostile, dead, inCombat, race. Doors carry `locked`, `lockLevel` and, for teleport doors, `destination` {cell, cellEditorID, interior, location, worldspace, doorRefID, pos}. |
 | World.crosshair | main | | `{ref}` under the crosshair with the activation `prompt`, or null |
 | Form.get / Ref.get | main | formID or editorID / refID | Basic form or reference info. Editor IDs resolve only for record types the engine keeps them for. |
-| Quest.get / Quest.active | main | editorID or formID, allObjectives? / limit? | Stage, flags, objectives with state; quests with a displayed objective |
+| Quest.get / Quest.active | main | editorID or formID, allObjectives? / limit? | Stage, flags, objectives with state; quests with a displayed objective. `status` is running, completed, failed, stopped or not-started and `finished` is true for completed or failed. The raw `completed` flag is set only by a script's CompleteQuest and `running` (the library's IsRunning) stays true after a quest is stopped; a quest normally ends by a shut-down stage, which clears `enabled` without setting `completed`. So `status` is derived: failed (failed flag), completed (completed flag, or stopped after running with every objective completed), running (enabled), stopped (ran, stopped, not finished) or not-started; `finished` is true for completed or failed and `finishedBy` names the evidence (`completedFlag`, `objectivesCompleted`, `failedFlag`). `status` and `finished` are the fields to assert on; `finishedBy` names the evidence (`completedFlag`, `shutDownStage`, `failedFlag`). |
+| Quest.find | main | text, limit? | Quests whose display name or editor ID contains text |
+| Ref.activate | main | refID, maxDistance?, force? | Activates a reference like the activate key without aiming. Refuses beyond maxDistance (default 300, to the nearer of origin and bounds centre) with `activated:false`; walls are not checked (`lineOfSightChecked:false`); force skips the reach check |
 | Global.get / Game.time | main | editorID or formID / | Global value; hour, day, month, year, daysPassed, timescale |
 | Game.setTimescale | main | value | Sets the TimeScale global, returns the time |
 | Player.teleport | main | x,y,z or refID, yawDeg? | Position set, or MoveTo a reference (queued by the engine, so the reply carries the target) |
