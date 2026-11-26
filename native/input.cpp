@@ -7,6 +7,7 @@
 #include "game.h"
 #include "input.h"
 #include "methods.h"
+#include "perf.h"
 
 #include <MinHook.h>
 
@@ -187,11 +188,14 @@ namespace
         return std::chrono::milliseconds(hold);
     }
 
+    std::atomic<double> lastRequestAt = 0.0;
+
     void Submit(Request request)
     {
         if (!hooked) {
             throw RpcError(code::inputUnavailable, "The input polling hook is not installed");
         }
+        lastRequestAt.store(devtools::perf::Now(), std::memory_order_relaxed);
         std::lock_guard lock(inboxMutex);
         if (inbox.size() >= 256) {
             throw RpcError(code::busy, "Too many input requests are queued");
@@ -486,6 +490,7 @@ namespace devtools::input
     }
 
     bool Hooked() { return hooked; }
+    double LastRequestAt() { return lastRequestAt.load(std::memory_order_relaxed); }
 
     std::vector<std::string> DrivenControls()
     {

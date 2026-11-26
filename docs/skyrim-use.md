@@ -44,10 +44,11 @@ server speaks plain stdio. When the client exits the server stops the game, so a
 | State (newer plugin builds) | `player_state`, `player_inventory`, `world_nearby`, `world_crosshair`, `quest_get`, `quest_find`, `quest_active`, `quest_targets {quest}`, `activate`, `message_box`, `message_box_select`, `dialogue_state`, `dialogue_select`, `dialogue_wait`, `dialogue_advance`, `dialogue_close`, `ui_list_items`, `ui_select_item`, `ui_dump`, `ui_get`, `ui_set`, `ui_invoke`, `ui_list`, `dialogue_start`, `screenshot` (image), `perf_frame_stats`, `perf_hitches`, `perf_check`, `papyrus_log` |
 | Perceive | `world_inspect {ref_id, nodes, graph, scripts}`, `world_models {contains, radius, limit}`, `screen_capture {ref_id or x,y,z or region, zoom, pad, include_ui}` (image), `game_setting {name, value?}` |
 | Move and camera | `walk {direction, duration_ms or distance, run?, sprint?}`, `turn_to {heading_deg or x,y or ref_id}`, `jump`, `sneak {on}`, `camera_state`, `camera_set {mode, yaw_deg, pitch_deg, zoom, fov}`, `camera_look_at {ref_id or x,y,z}` |
-| Combat | `combat_state {radius}`, `combat_target`, `combat_face`, `combat_draw`, `combat_equip {name, hand}`, `combat_unequip`, `combat_attack {kind=light\|power, hand}`, `combat_block`, `combat_cast`, `combat_drink {kind}`, `combat_fight {style, rounds, drink_below}` (a bounded loop over the primitives), `player_equipped`, `player_spells` |
+| Combat | `combat_state {radius}`, `combat_target`, `combat_face`, `combat_draw`, `combat_equip {name, hand}`, `combat_unequip`, `combat_attack {kind=light\|power, hand}`, `combat_block`, `combat_cast`, `combat_drink {kind}`, `combat_shoot {target, shots, draw_s, part, reposition, weapon}`, `combat_fight {style, rounds, drink_below}` (a bounded loop over the primitives), `player_equipped`, `player_spells` |
 | Navigate | `nav_nearby {radius, kind}`, `nav_places {contains}`, `nav_goto {goal, mode=input\|ai, timeout_s, on_combat, on_dialogue, on_message_box, on_menu, invulnerable, via, route, activate}`, `nav_plan {ref_id \| x, y, z, route}`, `nav_status`, `nav_wait {timeout_s}`, `nav_cancel` |
 | Setup and speed | `scenario_setup {quest?, stage?, complete_stages_before?, stage_path?, position?, items?, kit?, level?, skills?, perks?, spells?, time?, weather?, clear_bounty?, file?}`, `game_speed {walk?, timescale?, reset?}`, `fast_travel {to, force?}`, `wait {hours}`; `nav_goto {fast: true}` |
 | Record | `record_start {hz, fields, name}`, `record_stop`, `record_fetch {name, dest_dir?, plot}`, `trajectory_plot {file, color_by, route}`, `record_replay_camera {name, speed}` |
+| Alerts | `agent_alerts {history, limit, dismiss, dismiss_seconds, configure}` (every other reply also carries the active alerts, see Alerts) |
 | Generic | `rpc_methods`, `rpc_call {method, params}` |
 
 `game_start` and `game_status` report `plugin` {buildId, missingMethods, stale} and, when the plugin DLL on the host is older than this client, a top-level `warning`; redeploy with `tools/pc-build --deploy` rather than debugging tools that silently do nothing.
@@ -107,6 +108,32 @@ All four are ordinary tools, so the session timeline records each call with its 
 `wait {hours: 3}` with `waitedHours`, `fast_travel {to: Whiterun}`, `nav_goto {fast: true}`); the video composer labels them
 in the panel and runs them at the fast-forward rate like other waiting.
 
+## Ranged combat
+
+`combat_shoot {target?, shots=3, draw_s?, part=torso|head, reposition=false, max_repositions=2, weapon=bow|spell}`
+equips the best bow and arrows (or reports `{"error":"missing","missing":["bow"|"arrows"|"bolts"]}`) and shoots. Why
+the naive loop fails and what the tool does about it:
+
+- Short draws give weak, short arrows. Every draw is held for `draw_s` seconds, by default `max(1.5, 1.1 / bow speed + 0.5)`,
+  a little longer than a full draw; each shot reports the `heldS` it actually held.
+- Aim at the target, not at what is in front of it. The aim point is the target's torso (or head), corrected for arrow
+  drop and for movement (the target's velocity is measured over 0.12 s and led by flight time). Arrow speed and gravity come
+  from the ammunition's projectile form, then from the first arrow's observed flight (`Ranged.arrows`); the angle between
+  the commanded and the actual launch is learnt the same way. A miss reads the arrow's path at the target's range and
+  trims the next aim (`missVertical` / `missLateral` in the shot detail).
+- A blocked line is detected before drawing. An engine ray from the eye to the target's torso that meets geometry (a
+  bridge deck, a wall) returns `noLineOfSight` with the blocker (`hitDistance`, `hitLayer`) and `suggestedPosition`
+  `{x,y,z,rangeToTarget}`: points on rings up to 600 units around the player, kept when their own ray is clear and the navmesh
+  reaches them, ranked by walking distance and by how far the range lies outside 600-1500. `reposition=true` walks there
+  with `Nav.goto` and shoots; the line is re-checked before every shot.
+- Hits are verified by the target's health change; `shots`, `hits`, `hitRate`, `damage`, `targetDead`, `repositions` and a
+  per-shot `detail` come back. `weapon: "spell"` does the same for a projectile spell in the right hand (a fire bolt, not a
+  concentration spell): same ray, ballistic aim with the spell projectile's speed and gravity, a short press instead of a draw.
+
+`combat_fight` switches by itself: when the nearest target cannot be walked to (`Nav.plan` finds no complete path, as for an archer
+on a bridge above) it shoots if a bow with arrows is carried, otherwise it ends with outcome `unreachable` and an `advice` line.
+The check repeats every 4 rounds. `style="ranged"` shoots instead of walking up.
+
 ## Perception
 
 A player reads a puzzle with their eyes; an agent with a 1600-pixel screenshot of a dark room cannot. The
@@ -143,6 +170,48 @@ fast path (and the one that works with muted audio). A trainer, merchant or gift
 the dialogue; `dialogue_wait` then answers `submenu` and the conversation stays frozen until that menu is closed
 so act in it first and leave it with the exit key (`press_control Cancel`) or `dialogue_close`; hiding a training menu with `close_menu` was followed by a frozen game within two minutes in two of two runs, so `open_menu` now refuses trainer, barter, gift, container, lockpicking, crafting, dialogue and book menus (pass `force` to override) and `close_menu` leaves them with the Cancel control. Muted (headless) audio does not stall a conversation, but every line still lasts as long as its voice, so use `skip`. The plugin turns dialogue subtitles on so NPC lines can be read.
 
+## Mod testing
+
+`dialogue_topics`, `dialogue_explore`, `coverage_start` and `coverage_report` check what a mod's dialogue, quests
+and scenes do in a play session; see [mod-testing.md](mod-testing.md).
+
+## Alerts
+
+Alerts tell you when you are wasting time. Every tool reply carries the active ones as a short `alerts` field
+(`[{kind, severity, since, hint}]`; a JSON reply gets the key, a plain-text reply an `alerts: [...]` line, an
+image reply an extra text part). The field is absent when nothing is active. `agent_alerts` returns them in full
+(`sinceMs`, `ageS`, `detail`), with `history=true` the last raised and cleared entries, the plugin's per-tick
+`cost`, and the current thresholds. `agent_alerts {dismiss: kind}` hides one you have dealt with for
+`dismiss_seconds` (default 300). Each raise and clear is also a `{"t":"alert"}` line in the session timeline, and
+the showcase composer shows the active kinds in the status panel.
+
+| Kind | Raised when (default) | What to try |
+|---|---|---|
+| `questStalled` | the tracked quest's stage and objectives are unchanged for `questStalledMin` (8 min) | re-read `quest_targets`, try another approach |
+| `actionLoop` | the same tool with the same arguments gave the same result `actionLoopCount` (3) times within `actionLoopWindowS` (120 s); waiting and status tools are exempt | change the approach |
+| `combatStalemate` | in combat `combatStalemateS` (20 s) with neither the player's nor any hostile's health changing | reposition, ranged attack, leave |
+| `deathLoop` | `deathCount` (2) deaths within `deathWindowMin` (10 min), or that many within `deathNearDist` (1500 units) of one spot | kit up, level, avoid, or the invulnerable fallback |
+| `fellOrOutOfBounds` | falling `fallTimeS` (3 s), `fallDrop` (2000 units) below the last ground, or swimming `swimStallS` (30 s) without getting `swimProgressDist` (600) away | `player.moveto`, `coc`, or reload |
+| `blindCamera` | the camera pitch is beyond `pitchLimitDeg` (70) for `pitchBlindS` (15 s), or a `screenshot` is mostly black (`blindMeanLuma` 12) or one colour (`blindDominantShare` 0.92) | look level, check for a menu or fade |
+| `menuLeftOpen` | a non-HUD menu is open `menuOpenS` (30 s) with no input request | close it |
+| `paused` | the game is paused with no menu open, or (windowed runs) not the foreground window, for `notFocusedS` (5 s) | close the menu or refocus |
+| `lowFps` | fps under `lowFpsBelow` (30) for `lowFpsS` (10 s), or one frame over `hitchMs` (1000 ms; held 30 s) | pause actions, `perf_hitches` |
+| `overEncumbered` | carried weight above the carry limit | drop or store items |
+| `crime` | a bounty gained, stolen goods value rising, or a hostile guard (held 60 s) | pay, jail or avoid |
+| `targetDead`, `targetUnreachable` | a tracked quest's target actor is dead (the detail says if it is essential), or is disabled or in no cell; checked every `targetCheckS` (10 s) | re-check the quest, reload, or another route |
+| `lowHealthNoHeal` | health under `lowHealthPct` (30) with no restoring potion and no healing spell | retreat, rest, console heal |
+| `moveStuck` | the movement stuck detector's `moveStuck` event, until `moveUnstuck` | another route, open the door |
+
+Change thresholds with `agent_alerts {configure: {"thresholds": {"questStalledMin": 3}, "disable": ["crime"]}}`;
+the plugin owns the native keys (`Alerts.configure`), the MCP server the `actionLoop*` and `blind*` ones. Alerts
+are not shown before a save is loaded, and a save load resets every timer.
+
+Cost: a poller thread asks the game thread for one sample about every `pollMs` (500 ms), and all detectors run on
+the poller thread. The game-thread part is a handful of reads (the quest and target checks every 5 s and 10 s,
+the potion scan only while health is low). `agent_alerts` reports it as `cost`: `mainMeanUs` and `mainMaxUs` are the
+game-thread time per sample, `pollerMeanUs` the detector time; the sample also appears in `Perf.hitches`
+`slowCalls` as `Alerts.tick` if it ever exceeds 5 ms.
+
 ## Performance
 
 Call `perf_check` first in every playtest, once the world is loaded and before any other tool. It waits 10 s,
@@ -164,6 +233,32 @@ once a second into a CSV), and restart the game if nothing explains it.
 * A visible game runs borderless-windowed at the profile's resolution (`bFull Screen=0`): exclusive fullscreen
   drew the picture in a corner of the monitor and made the desktop capture black. `Window.info` reports the
   window, client, monitor, swap chain size and DPI awareness, to check the game fills the screen.
+
+## Long sessions
+
+Restart the game about every 30 minutes (`game_stop`, then `game_start`, then load the save again) until the cause of
+the thread growth is fixed: the game's thread count rises by roughly two per second during play and the main thread
+hung at a few thousand threads in the long playtests. `game_stop` leaves the host ready for the next `game_start`
+(it ends the scheduled task and removes the stale lease marker), and `game_start` clears the same leftovers itself
+when no game is running (`staleCleared` in its reply says what it removed).
+
+`game_status` carries a `health` object read from the operating system, so it also answers when the game is hung:
+
+* `threads`, `handles`: the leading indicator; a healthy start is about 100 to 250 threads. Watch the trend, not one value.
+* `privateMB`, `workingSetMB`: memory of the game process.
+* `cpuCores`: CPU used over the last half second, in cores (1.0 is one fully busy core); a hung game with a blocked
+  main thread still burns several.
+* `responding`: false when the game window stopped answering messages; `uptimeS`: age of the process.
+* `healthWarnings` (and `warning`): `threadCount` at 1500 threads or more, `threadGrowth` when the count rose by 60 or
+  more per minute over at least a minute, `notResponding`, and an informational `longSession` after 30 minutes. The
+  limits are config keys `healthThreadWarn`, `healthThreadGrowthPerMin`, `healthGrowthWindowS`, `healthGrowthMinSpanS`
+  and `healthRestartAfterMin`. The MCP link samples health once a minute in the background so the growth rate is
+  known even when nobody calls `game_status`. Each warning has a stable `code` so the alerts layer can raise it as an
+  alert (the single integration point is `GameManager.health_watch.warnings`).
+
+`combat_fight` warns at its start (`warnings`, plus a `warning` event for `events_drain`) when the inventory holds no
+healing potion and the player knows no healing spell. `windows/perf-watch.ps1 -Out FILE -Detach` starts the host
+sampler detached from the SSH session (once a second, with the game's thread count in `gameThreads`); `-Stop` ends it.
 
 ## Showcase video
 
