@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory)]
     [ValidateSet('install-task', 'start', 'run', 'status', 'stop', 'evidence', 'crashes', 'active', 'idle',
                  'install-capture-task', 'capture-start', 'capture-run', 'capture-stop', 'capture-status',
-                 'health', 'reset')]
+                 'health', 'reset', 'restore-profile')]
     [string] $Action,
     [ValidatePattern('^[a-f0-9]{32}$')]
     [string] $Session,
@@ -115,6 +115,116 @@ public static class SkyrimDevToolsDesktop
     if (!$Headless -and ![SkyrimDevToolsDesktop]::IsUnlocked()) {
         Refuse-Launch 'desktop-locked' 'The interactive test desktop is locked or inaccessible'
     }
+}
+
+# The game resolves My Games\Skyrim Special Edition from the Windows Documents folder and has no switch to move it
+# (sLocalSavePath only moves saves; INIs and the SKSE and Papyrus logs stay). The isolated profile is therefore
+# reached through a junction that exists only while a run owns the game, so a modlist installed next to the test
+# setup never writes into it. The real folder is renamed, never emptied, and a real folder that is not a junction
+# is never touched beyond that one rename.
+function Get-DocsPaths {
+    $link = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'My Games\Skyrim Special Edition'
+    @{ link = $link; backup = "$link.DevTools-Real" }
+}
+
+function Get-DocsLinkState($Path) {
+    $entry = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (!$entry) { return 'missing' }
+    if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        $target = @($entry.Target)
+        if ($entry.LinkType -eq 'Junction' -and $target.Count -eq 1 -and [IO.Path]::GetFullPath($target[0]) -eq $profile) {
+            return 'junction-profile'
+        }
+        return 'junction-other'
+    }
+    if ($entry.PSIsContainer) { return 'real' }
+    return 'file'
+}
+
+# Decides what entering the isolated profile has to do; anything ambiguous is an error, never a guess.
+function Get-EnterPlan([string] $State, [bool] $BackupExists) {
+    switch ($State) {
+        'missing' { return 'link' }
+        'junction-profile' { return 'reuse' }
+        'real' {
+            if ($BackupExists) { throw 'Both the Documents Skyrim folder and its DevTools-Real backup are real folders; resolve by hand' }
+            return 'backup-and-link'
+        }
+        default { throw "The Documents Skyrim folder is in an unexpected state ($State); resolve by hand" }
+    }
+}
+
+function Test-RealBackup($Path) {
+    $entry = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    [bool]($entry -and $entry.PSIsContainer -and !($entry.Attributes -band [IO.FileAttributes]::ReparsePoint))
+}
+
+# Plugins.txt and the content catalog under LOCALAPPDATA are shared with other installs and cannot be redirected,
+# so the files present before a run are kept aside and put back afterwards.
+function Get-LocalDataPaths {
+    @{ live = Join-Path $env:LOCALAPPDATA 'Skyrim Special Edition'; kept = Join-Path $root 'localappdata-kept' }
+}
+
+function Restore-LocalData {
+    $paths = Get-LocalDataPaths
+    if (!(Test-Path -LiteralPath $paths.kept)) { return }
+    foreach ($file in Get-ChildItem -LiteralPath $paths.kept -File -Force) {
+        $target = Join-Path $paths.live $file.Name
+        $same = (Test-Path -LiteralPath $target) -and
+            (Get-FileHash -LiteralPath $target).Hash -eq (Get-FileHash -LiteralPath $file.FullName).Hash
+        if (!$same) { Copy-Item -LiteralPath $file.FullName -Destination $target -Force }
+        Remove-Item -LiteralPath $file.FullName -Force
+    }
+    Remove-Item -LiteralPath $paths.kept -Force
+}
+
+function Keep-LocalData {
+    $paths = Get-LocalDataPaths
+    # Leftovers from an interrupted run hold the real content, so they are restored before anything is kept.
+    Restore-LocalData
+    if (!(Test-Path -LiteralPath $paths.live)) { return }
+    New-Item -ItemType Directory -Path $paths.kept | Out-Null
+    foreach ($file in Get-ChildItem -LiteralPath $paths.live -File -Force) {
+        Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $paths.kept $file.Name)
+    }
+}
+
+function Enter-IsolatedProfile {
+    $docs = Get-DocsPaths
+    $plan = Get-EnterPlan (Get-DocsLinkState $docs.link) (Test-Path -LiteralPath $docs.backup)
+    if ($plan -eq 'reuse') { Keep-LocalData; return }
+    if ($plan -eq 'backup-and-link') { [IO.Directory]::Move($docs.link, $docs.backup) }
+    try {
+        New-Item -ItemType Junction -Path $docs.link -Target $profile | Out-Null
+    } catch {
+        if ($plan -eq 'backup-and-link' -and !(Test-Path -LiteralPath $docs.link)) { [IO.Directory]::Move($docs.backup, $docs.link) }
+        throw
+    }
+    Keep-LocalData
+}
+
+# Removes the junction (only the link, through rmdir) and renames the backup back. Idempotent, and a no-op while a
+# game process exists because the junction is then in use.
+function Exit-IsolatedProfile {
+    if (Get-Process SkyrimSE, skse64_loader -ErrorAction SilentlyContinue) { return 'game-running' }
+    $docs = Get-DocsPaths
+    $state = Get-DocsLinkState $docs.link
+    $backup = Test-Path -LiteralPath $docs.backup
+    if ($state -eq 'real' -and $backup) { throw 'Both the Documents Skyrim folder and its DevTools-Real backup are real folders; resolve by hand' }
+    if ($state -eq 'junction-other' -or $state -eq 'file') { throw "The Documents Skyrim folder is in an unexpected state ($state); resolve by hand" }
+    if ($state -eq 'junction-profile') {
+        & cmd.exe /c rmdir "`"$($docs.link)`"" | Out-Null
+        if (Test-Path -LiteralPath $docs.link) { throw 'The isolated profile junction could not be removed' }
+        $state = 'missing'
+    }
+    $restored = $false
+    if ($state -eq 'missing' -and $backup) {
+        if (!(Test-RealBackup $docs.backup)) { throw 'The DevTools-Real backup is not a plain folder' }
+        [IO.Directory]::Move($docs.backup, $docs.link)
+        $restored = $true
+    }
+    Restore-LocalData
+    if ($restored) { 'restored' } else { 'clean' }
 }
 
 function Assert-LocalProfile {
@@ -373,6 +483,7 @@ function Preflight($Config, $Headless) {
     if (Get-Process SkyrimSE, skse64_loader -ErrorAction SilentlyContinue) {
         throw 'A game or loader process is already running'
     }
+    Enter-IsolatedProfile
     Assert-LocalProfile
     Write-ProfileSettings $Headless $Config
     Assert-LocalProfile
@@ -505,6 +616,7 @@ function Run-Game {
         if ($_.Exception.Data['LaunchCheck']) { $reason = $_.Exception.Data['LaunchCheck'] }
         $_.Exception.Message | Set-Content -LiteralPath (Join-Path $run 'host-error.txt') -Encoding UTF8
     } finally {
+      try {
         if ($loaderProcess -and !$loaderProcess.HasExited) {
             $loaderProcess.Kill()
             $loaderProcess.WaitForExit()
@@ -535,7 +647,13 @@ function Run-Game {
             }
         }
         Write-Json $final $state
+      } finally {
+        # Last, so the junction goes away on every path (stop, crash, kill, failed preflight) before the lease is freed.
+        try { $null = Exit-IsolatedProfile } catch {
+            $_.Exception.Message | Add-Content -LiteralPath (Join-Path $run 'host-error.txt') -Encoding UTF8
+        }
         Remove-Item -LiteralPath $lease
+      }
     }
 }
 
@@ -570,6 +688,8 @@ function Reset-StaleHost([switch] $KillGame, [int] $MinAgeSeconds = 0) {
         Remove-Item -LiteralPath $lease -ErrorAction SilentlyContinue
         $cleared += 'lease-removed'
     }
+    # A junction left by a run whose host died would keep other installs writing into the test profile.
+    if ((Exit-IsolatedProfile) -eq 'restored') { $cleared += 'profile-restored' }
     return @{ gameRunning = $false; cleared = $cleared }
 }
 
@@ -788,6 +908,9 @@ switch ($Action) {
         (Reset-StaleHost -KillGame:$Force) | ConvertTo-Json -Compress
     }
     'run' { Run-Game }
+    'restore-profile' {
+        @{ result = (Exit-IsolatedProfile) } | ConvertTo-Json -Compress
+    }
     'install-capture-task' {
         $arguments = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy RemoteSigned -File "{0}" capture-run' -f $PSCommandPath
         $task = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
