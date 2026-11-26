@@ -16,6 +16,12 @@ may own the heap or loader lock. Stacks are interned into a prefix tree and stor
 thread costs a few bytes per second. A thread that used no CPU since the last tick is not suspended again:
 its last stack is reused and the sample is marked *waiting* (off-CPU).
 
+Suspending a thread costs about 15-40 µs, more when it has to be woken from a wait, so each thread has a
+suspension budget (`--suspend-budget`, 2.5% of wall time by default, `0` for none). Over a sliding 100 ms
+window, a tick that would exceed it keeps the previous stack and is marked *throttled*; the report says what
+share of main-thread ticks that was. With `threads=all` (the default) the main thread is sampled at `--hz` and
+every other game thread at `--other-hz` (250 by default), each sample weighted so the shares stay comparable.
+
 Running inside the plugin, rather than as an ETW session or an external sampler like samply, needs no
 administrator rights or extra installs on the test PC and knows the game's frames: the Present hook marks
 frame boundaries, so a profile has frame and hitch markers and the hitch watch can keep the stacks of any
@@ -30,9 +36,10 @@ of symbol tables and the same raw profile can be re-symbolised later as names im
 
 ```
 skyrim-devtools-profile record --config host.json --seconds 30 [--phase idle|walk|coc:<cell>[,<back>]]
-                               [--threads main|frame|all|<ids or names>] [--hz 1000] [--save NAME]
-                               [--cell Riverwood] [--out DIR] [--keep]
+                               [--threads all|main|frame|<ids or names>] [--hz 1000] [--other-hz 250]
+                               [--suspend-budget 2.5] [--save NAME] [--cell Riverwood] [--out DIR] [--keep]
 skyrim-devtools-profile report DIR [--rewrite] [--json]
+skyrim-devtools-profile export DIR --firefox OUT.json[.gz] [--open]
 skyrim-devtools-profile diff A B [--threads main|all] [--json]
 skyrim-devtools-profile top --config host.json [--save NAME] [--cell C] [--phase P] [--window 3] [--count N] [--json]
 skyrim-devtools-profile timeline DIR [--recorder TIMELINE.jsonl] [--out FILE]
@@ -45,16 +52,32 @@ applies a load (`walk` turns and walks, `coc:` loads a cell and returns, repeate
 | File | What |
 |------|------|
 | `report.txt`, `report.json` | Top functions by self and total time, hottest stacks, module split, waits, hitches, overhead, symbol coverage, credits |
-| `profile.json.gz` | Firefox Profiler format: drop it on profiler.firefox.com or run `samply load` |
-| `cpu-flame.svg`, `cpu.folded` | On-CPU flame graph and Brendan Gregg folded stacks |
+| `profile.json.gz` | Firefox Profiler format, see below |
+| `cpu-flame.svg`, `cpu.folded` | On-CPU flame graph (interactive: click to zoom, Esc or "Reset zoom" to go back, "Search" or Ctrl+F to highlight a regex, hover for samples, % and ms) and Brendan Gregg folded stacks |
 | `wait-flame.svg`, `wait.folded` | The same for waiting (off-CPU) samples |
 | `timeline.html` | Self-contained timeline viewer (see below) |
 | `raw.json.gz` | The raw profile; `report --rewrite` regenerates everything from it |
 
+### Firefox Profiler
+
+`profile.json.gz` is written on every `record` and `report --rewrite`; `export DIR --firefox OUT.json.gz`
+writes it anywhere (plain JSON without `.gz`). Open https://profiler.firefox.com, choose **Load a profile
+from file** and pick it, or drop it on the page. `--open` instead serves the file on `127.0.0.1` under a
+random path and opens the profiler on it, the way `samply load` does; the page reads the file from this
+machine and nothing leaves it. Chrome asks once to allow the page to reach the local network; allow it, or
+use the file route. Press Ctrl+C to stop serving.
+
+Never press the profiler's **Upload** (or *Share*) button: it publishes the profile, with the game's
+addresses and names, to a public Mozilla server. Keep profiles local.
+
+The export has a track per sampled thread with its call tree, flame graph and stack chart; module names
+on every frame; waiting samples as idle (toggle "Include idle samples"); and markers for each frame and
+each hitch. The file layout is described in [profile-data.md](profile-data.md).
+
 `diff` compares two profiles (for example the same scene with and without a mod) and lists the largest
 changes in self and total share and in the module split.
 
-MCP tools in `skyrim-use`: `profile_start {threads, hz, duration_s}`, `profile_stop` (returns the report and
+MCP tools in `skyrim-use`: `profile_start {threads, hz, duration_s}` (threads `all` by default), `profile_stop` (returns the report and
 writes the files on the MCP host), `profile_status`, `profile_watch`, `profile_hitches`, `profile_top` (one
 live snapshot) and `profile_mark` (a named span on the running profile). Raw RPC methods are listed in
 [protocol.md](protocol.md).
@@ -116,9 +139,14 @@ lists its markers and, per thread, the top self functions and hottest stacks.
   graphics driver and D3D runtime; `kernel` ntdll/win32u (system-call stubs); `system` other Windows DLLs.
 * **Names**: a game function shows its name when a symbol table knows it, a guessed name with `(guess)`,
   `id:N+0xOFF` when only the Address Library ID is known, and `sub_<rva>` (function start from `.pdata`)
-  otherwise. A name is a label, not proof of what a function does.
-* **Overhead**: `mainSuspendedPct` is the share of wall time the main thread spent suspended by the sampler
-  and `samplerCpuPct` the sampler thread's own CPU. With vsync on, fps hides small overhead, so look at these
+  otherwise. A name is a label, not proof of what a function does. Other modules without debug symbols
+  (graphics drivers, for example) show `module+0xOFFSET` of the function start, or `module!Export` when the
+  address is at or within 0x100 bytes of an export; their export tables are too sparse to name anything
+  further away. Consecutive frames of such a module collapse into one `[module]` frame, so the time spent
+  in a driver shows as one entry.
+* **Overhead**: `mainSuspendedPct` is the share of wall time the main thread spent suspended by the sampler,
+  `mainThrottledPct` the share of its ticks that kept the previous stack because the budget was spent,
+  `otherMaxSuspendedPct` the worst other thread, and `samplerCpuPct` the sampler thread's own CPU. With vsync on, fps hides small overhead, so look at these
   and at the frame-time percentiles in `context`.
 
 ## Symbols
@@ -146,4 +174,6 @@ PC's scratch tree, not in commits, issues or PRs.
 * User-mode stacks only; time inside the kernel is attributed to the system-call stub (`NtWaitFor...`).
 * A frame without unwind data (JIT code, some packed DLLs) ends the stack at that frame.
 * Sampling has the usual error: at 1 kHz a function needs about 50 samples (50 ms of CPU) for a stable share.
-* `threads=all` suspends every game thread each tick; use it for short captures. `main` is the cheap default.
+* `threads=all` suspends other game threads at `--other-hz`; with many busy threads lower it, or use
+  `threads=main` for the cheapest capture.
+* A throttled tick repeats the previous stack, so at high budget pressure short functions are undercounted.

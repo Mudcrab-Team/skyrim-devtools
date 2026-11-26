@@ -24,6 +24,12 @@ import zlib
 
 CRASHLOGGER_CREDIT = "CRASHLOGGER_PDB(59818@2026.10.24)"
 FLAG_WAITING = 1
+FLAG_THROTTLED = 4
+# DbgHelp symbol types that come from real debug information; anything else (export tables, none) only
+# yields the nearest exported name, which can sit megabytes away from the sampled code.
+REAL_SYMBOL_TYPES = {"pdb", "dia", "codeview", "coff", "sym"}
+# An export guess is kept only this close to the sampled address (syscall stubs, short wrappers).
+EXPORT_NEAR = 0x100
 WAIT_RE = re.compile(
     r"^(Nt|Zw)(WaitFor|DelayExecution|RemoveIoCompletion|SignalAndWait|UserMsgWaitFor|AlertThreadByThreadId|"
     r"WaitForAlertByThreadId|ReplyWaitReceivePort|AlpcSendWaitReceivePort|UserGetMessage|GdiDdDDIWaitFor|"
@@ -161,6 +167,7 @@ class Profile:
         self.sources = Counter()
         self.functions = []      # (label, module name, kind)
         self.function_index = {}
+        self.opaque = {}         # function index -> module name, for frames in modules without symbols
         self.frame_function = [self._function(f) for f in raw.get("frames", [])]
         self.stacks = raw.get("stacks", [])
         self._stack_cache = {}
@@ -174,19 +181,58 @@ class Profile:
             kind = self.kinds[frame["m"]]
             if kind == "game":
                 label, source, _ = self.symbols.resolve(frame["rva"], frame.get("start"), frame.get("id"), frame.get("idOff"))
-            elif frame.get("sym"):
-                label, source = frame["sym"], "dbghelp"
-            elif frame.get("start") is not None:
-                label, source = f"sub_{frame['start']:x}", "pdata"
             else:
-                label, source = f"+0x{frame['rva']:x}", "none"
+                label, source = self._module_label(frame, module)
             key = (label, module["name"], kind)
         if count_source:
             self.sources[source] += 1
         if key not in self.function_index:
             self.function_index[key] = len(self.functions)
             self.functions.append(key)
+            if source == "module-offset":
+                self.opaque[self.function_index[key]] = key[1]
         return self.function_index[key]
+
+    @staticmethod
+    def _module_label(frame, module):
+        """Name for a frame outside the game: the DbgHelp symbol when the module has debug information (or
+        the payload predates symOff), otherwise module+offset of the function start (or of the address), or module!export+offset when
+        the nearest export is the function itself or a few bytes before the address."""
+        name = module["name"]
+        sym, offset = frame.get("sym"), frame.get("symOff")
+        start = frame.get("start")
+        if sym and (module.get("symbols") in REAL_SYMBOL_TYPES or offset is None):
+            return sym, "dbghelp"
+        if sym and offset is not None:
+            export_at = frame["rva"] - offset
+            if (start is not None and export_at == start) or offset < EXPORT_NEAR:
+                # System DLL exports are the documented API names the wait detection and readers expect.
+                return (sym if module_kind(module) in ("kernel", "system") else f"{name}!{sym}"), "export-near"
+        if start is not None:
+            return f"{name}+0x{start:x}", "module-offset"
+        return f"{name}+0x{frame['rva']:x}", "module-offset"
+
+    def collapse(self, functions):
+        """Leaf-first function indices with each run of two or more frames from one unsymbolised module
+        folded into a single "[module]" node, so driver internals read as one box."""
+        out = []
+        i = 0
+        while i < len(functions):
+            module = self.opaque.get(functions[i])
+            j = i + 1
+            while module is not None and j < len(functions) and self.opaque.get(functions[j]) == module:
+                j += 1
+            if j - i >= 2:
+                kind = self.functions[functions[i]][2]
+                key = (f"[{module}]", module, kind)
+                if key not in self.function_index:
+                    self.function_index[key] = len(self.functions)
+                    self.functions.append(key)
+                out.append(self.function_index[key])
+            else:
+                out.append(functions[i])
+            i = j
+        return out
 
     def stack_functions(self, stack):
         """Function indices of a stack, leaf first."""
@@ -198,7 +244,7 @@ class Profile:
                 prefix, frame = self.stacks[index]
                 out.append(self.frame_function[frame])
                 index = prefix
-            cached = self._stack_cache[stack] = tuple(out)
+            cached = self._stack_cache[stack] = tuple(self.collapse(out))
         return cached
 
     def is_wait(self, stack, flags):
@@ -304,7 +350,7 @@ class Profile:
         frames = [self._function(f) for f in self.raw.get("hitchFrames", [])]
         out = []
         for hitch in self.raw.get("hitches", []):
-            stacks = [[frames[i] for i in s] for s in hitch.get("stacks", [])]
+            stacks = [self.collapse([frames[i] for i in s]) for s in hitch.get("stacks", [])]
             self_on, self_wait, by_stack = Counter(), Counter(), Counter()
             waiting = 0
             for _, stack, flags in hitch.get("samples", []):
@@ -371,6 +417,16 @@ class Profile:
             out["mainSuspendedMs"] = main.get("suspendedMs")
             out["mainSuspendedPct"] = round(100.0 * main.get("suspendedMs", 0.0) / duration_ms, 2)
             out["mainWalked"] = main.get("walked")
+            ticks = max(self.raw.get("ticks") or 0, 1)
+            out["mainThrottledPct"] = round(100.0 * main.get("throttled", 0) / ticks, 2)
+        if self.raw.get("suspendBudgetPct") is not None:
+            out["suspendBudgetPct"] = self.raw["suspendBudgetPct"]
+        others = [t for t in self.raw.get("threads", []) if not t.get("main")]
+        if others:
+            worst = max(others, key=lambda t: t.get("suspendedMs", 0.0))
+            out["otherThreads"] = len(others)
+            out["otherHz"] = round(self.raw.get("hz", 1000.0) / max(self.raw.get("otherEvery") or 1, 1), 1)
+            out["otherMaxSuspendedPct"] = round(100.0 * worst.get("suspendedMs", 0.0) / duration_ms, 2)
         return out
 
     # ---- exports ----------------------------------------------------------------------------
@@ -387,81 +443,11 @@ class Profile:
             counts[";".join(names)] += weight
         return "".join(f"{key} {value}\n" for key, value in sorted(counts.items()))
 
-    def gecko(self):
-        """Firefox Profiler (Gecko format) profile; open it at profiler.firefox.com or with `samply load`."""
-        kind_names = ["Other", "game", "plugin", "skse", "gpu-driver", "kernel", "system", "other-dll", "unknown"]
-        colors = ["grey", "blue", "green", "purple", "orange", "red", "yellow", "lightblue", "grey"]
-        categories = [{"name": n, "color": c, "subcategories": ["Other"]} for n, c in zip(kind_names, colors)]
-        idle_category = len(categories)
-        categories.append({"name": "Idle", "color": "transparent", "subcategories": ["Other"]})
-        period = 1000.0 / self.raw.get("hz", 1000.0)
-        threads = []
-        for thread in self.raw.get("threads", []):
-            strings, string_index = [], {}
+    def firefox(self):
+        """Firefox Profiler profile (processed format, as samply writes it); see profile_firefox."""
+        from .profile_firefox import Export
 
-            def intern(text):
-                if text not in string_index:
-                    string_index[text] = len(strings)
-                    strings.append(text)
-                return string_index[text]
-
-            frame_rows, frame_index = [], {}
-            stack_rows, stack_index = [], {}
-
-            def frame_of(function, idle):
-                key = (function, idle)
-                if key not in frame_index:
-                    label, module, kind = self.functions[function]
-                    category = idle_category if idle else kind_names.index(kind) if kind in kind_names else 0
-                    frame_index[key] = len(frame_rows)
-                    frame_rows.append([intern(f"{label} (in {module})"), False, 0, None, None, None, category, 0])
-                return frame_index[key]
-
-            def stack_of(stack, idle):
-                prefix = None
-                for function in reversed(self.stack_functions(stack)):
-                    key = (prefix, frame_of(function, idle))
-                    if key not in stack_index:
-                        stack_index[key] = len(stack_rows)
-                        stack_rows.append([prefix, key[1]])
-                    prefix = stack_index[key]
-                return prefix
-
-            samples = []
-            cache = {}
-            for at, stack, count, flags in thread.get("runs", []):
-                idle = self.is_wait(stack, flags)
-                key = (stack, idle)
-                if key not in cache:
-                    cache[key] = stack_of(stack, idle)
-                for i in range(count):
-                    samples.append([cache[key], round(at + i * period, 3), 0])
-            markers = []
-            if thread.get("frameThread") or thread.get("main"):
-                hitch_ms = self.raw.get("hitchThresholdMs", 100.0)
-                for start, end, frame in self.raw.get("frameMarks", []):
-                    name = "Hitch" if end - start > hitch_ms else "Frame"
-                    markers.append([intern(name), start, end, 1, 0, {"type": name, "frame": frame, "ms": round(end - start, 2)}])
-            name = thread.get("name") or ("Main thread" if thread.get("main") else f"Thread {thread['tid']}")
-            threads.append({
-                "name": "GeckoMain" if thread.get("main") else name, "processType": "default", "processName": "SkyrimSE.exe",
-                "tid": thread["tid"], "pid": "1", "registerTime": 0, "unregisterTime": None,
-                "samples": {"schema": {"stack": 0, "time": 1, "eventDelay": 2}, "data": samples},
-                "markers": {"schema": {"name": 0, "startTime": 1, "endTime": 2, "phase": 3, "category": 4, "data": 5}, "data": markers},
-                "stackTable": {"schema": {"prefix": 0, "frame": 1}, "data": stack_rows},
-                "frameTable": {"schema": {"location": 0, "relevantForJS": 1, "innerWindowID": 2, "implementation": 3,
-                                          "line": 4, "column": 5, "category": 6, "subcategory": 7}, "data": frame_rows},
-                "stringTable": strings,
-            })
-        threads.sort(key=lambda t: t["name"] != "GeckoMain")
-        meta = {
-            "version": 27, "interval": period, "stackwalk": 1, "debug": 0, "startTime": self.raw.get("startEpochMs", 0),
-            "shutdownTime": None, "processType": 0, "platform": "Windows", "oscpu": "Windows", "misc": "", "abi": "x86_64-msvc",
-            "toolkit": "windows", "product": "SkyrimSE (skyrim-devtools profiler)", "appBuildID": "", "sourceURL": "",
-            "physicalCPUs": 0, "logicalCPUs": 0, "categories": categories, "markerSchema": [],
-            "extensions": {"length": 0, "baseURL": [], "id": [], "name": []},
-        }
-        return {"meta": meta, "libs": [], "threads": threads, "processes": [], "pausedRanges": []}
+        return Export(self)
 
 
 # ---- flame graph --------------------------------------------------------------------------------
@@ -470,8 +456,73 @@ KIND_HUES = {"game": (215, 60), "plugin": (130, 55), "skse": (280, 45), "gpu-dri
              "system": (50, 70), "other-dll": (190, 50)}
 
 
-def flamegraph_svg(folded, title="Flame graph", kinds=None, width=1600, row=17):
-    """A self-contained flame graph SVG from folded stacks (root at the bottom), with hover titles."""
+FLAME_SCRIPT = r"""
+(function () {
+  var svg = document.documentElement, W = +svg.getAttribute('width'), boxes = [].slice.call(document.querySelectorAll('g.f'));
+  var details = document.getElementById('details'), matched = document.getElementById('matched');
+  var unzoom = document.getElementById('unzoom'), total = +svg.getAttribute('data-total'), msPer = +svg.getAttribute('data-ms');
+  var zoomed = null, term = null;
+  function info(g) {
+    var n = +g.getAttribute('data-n'), pct = 100 * n / total;
+    return g.getAttribute('data-name') + ' (' + n + ' samples, ' + pct.toFixed(2) + '%' + (msPer ? ', ' + (n * msPer).toFixed(1) + ' ms' : '') + ')';
+  }
+  function fit(g, x, w) {
+    var r = g.querySelector('rect'), t = g.querySelector('text');
+    r.setAttribute('x', x.toFixed(2)); r.setAttribute('width', Math.max(w, 0).toFixed(2));
+    var chars = Math.floor((w - 6) / 7), name = g.getAttribute('data-name');
+    t.setAttribute('x', (x + 3).toFixed(2));
+    t.textContent = chars < 3 ? '' : (name.length <= chars ? name : name.slice(0, chars - 2) + '..');
+  }
+  function layout() {
+    var x0 = 0, w0 = 1, d0 = -1;
+    if (zoomed) { x0 = +zoomed.getAttribute('data-x'); w0 = +zoomed.getAttribute('data-w'); d0 = +zoomed.getAttribute('data-d'); }
+    boxes.forEach(function (g) {
+      var x = +g.getAttribute('data-x'), w = +g.getAttribute('data-w'), d = +g.getAttribute('data-d');
+      var inside = x >= x0 - 1e-9 && x + w <= x0 + w0 + 1e-9;
+      if (zoomed && d < d0 && x <= x0 + 1e-9 && x + w >= x0 + w0 - 1e-9) { g.style.display = ''; g.classList.add('parent'); fit(g, 0, W); return; }
+      g.classList.remove('parent');
+      if (!inside || (zoomed && d < d0)) { g.style.display = 'none'; return; }
+      var nx = (x - x0) / w0 * W, nw = w / w0 * W;
+      g.style.display = nw < 0.3 ? 'none' : ''; fit(g, nx, nw);
+    });
+    unzoom.style.opacity = zoomed ? 1 : 0.3;
+  }
+  function search(text) {
+    term = text || null; var hit = 0, re = null;
+    try { re = term ? new RegExp(term, 'i') : null; } catch (e) { re = null; }
+    var spans = [];
+    boxes.forEach(function (g) {
+      var on = re && re.test(g.getAttribute('data-name'));
+      g.querySelector('rect').style.fill = on ? 'rgb(230,0,230)' : '';
+      if (on) spans.push([+g.getAttribute('data-x'), +g.getAttribute('data-x') + +g.getAttribute('data-w')]);
+    });
+    spans.sort(function (a, b) { return a[0] - b[0]; });
+    var end = -1;
+    spans.forEach(function (s) { if (s[0] >= end) { hit += s[1] - s[0]; end = s[1]; } else if (s[1] > end) { hit += s[1] - end; end = s[1]; } });
+    matched.textContent = term ? 'Matched: ' + (100 * hit).toFixed(1) + '%' : '';
+  }
+  boxes.forEach(function (g) {
+    g.addEventListener('click', function () { zoomed = g.getAttribute('data-d') === '0' ? null : g; layout(); });
+    g.addEventListener('mouseover', function () { details.textContent = info(g); });
+    g.addEventListener('mouseout', function () { details.textContent = ' '; });
+  });
+  unzoom.addEventListener('click', function () { zoomed = null; layout(); });
+  document.getElementById('search').addEventListener('click', function () {
+    var t = prompt('Search (regular expression)', term || ''); if (t !== null) search(t);
+  });
+  document.addEventListener('keydown', function (e) {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'f') { e.preventDefault(); var t = prompt('Search (regular expression)', term || ''); if (t !== null) search(t); }
+    else if (e.key === 'Escape') { search(''); zoomed = null; layout(); }
+  });
+  layout();
+})();
+"""
+
+
+def flamegraph_svg(folded, title="Flame graph", kinds=None, width=1600, row=17, ms_per_sample=None):
+    """A self-contained interactive flame graph SVG from folded stacks (root at the bottom): click a box to
+    zoom into it, "Reset zoom" or Esc to go back, "Search" or Ctrl+F to highlight a regular expression;
+    hovering shows samples, share and milliseconds."""
     root = {"n": 0, "c": {}}
     for line in folded.splitlines():
         stack, _, count = line.rpartition(" ")
@@ -484,40 +535,50 @@ def flamegraph_svg(folded, title="Flame graph", kinds=None, width=1600, row=17):
             node = node["c"].setdefault(name, {"n": 0, "c": {}})
             node["n"] += weight
     total = max(root["n"], 1)
-    rects = []
+    boxes = []
     depth_max = 0
 
+    # Boxes too narrow to see at full width are still kept down to a fraction of a pixel at 50x zoom.
     def walk(node, name, x, depth):
         nonlocal depth_max
-        w = width * node["n"] / total
-        if w < 0.3:
+        if node["n"] / total * width * 50 < 0.3:
             return
         depth_max = max(depth_max, depth)
-        rects.append((name, x, depth, w, node["n"]))
+        boxes.append((name, x, depth, node["n"]))
         cx = x
         for child_name, child in sorted(node["c"].items()):
             walk(child, child_name, cx, depth + 1)
-            cx += width * child["n"] / total
+            cx += child["n"] / total
 
     walk(root, "all", 0.0, 0)
-    height = (depth_max + 1) * row + 40
-    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" font-family="Verdana" font-size="11">',
+    top = 40
+    height = (depth_max + 1) * row + top + 26
+    ms = f"{ms_per_sample:g}" if ms_per_sample else "0"
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" font-family="Verdana" '
+           f'font-size="11" data-total="{total}" data-ms="{ms}">',
+           '<style>g.f:hover rect{stroke:#000;stroke-width:0.5;cursor:pointer} g.f text{pointer-events:none} '
+           'g.parent rect{opacity:0.5} .btn{cursor:pointer;fill:#333} .btn:hover{text-decoration:underline}</style>',
            '<rect width="100%" height="100%" fill="#f8f8f8"/>',
-           f'<text x="{width / 2}" y="18" text-anchor="middle" font-size="15">{html.escape(title)}</text>']
-    for name, x, depth, w, n in rects:
-        y = height - (depth + 1) * row - 4
+           f'<text x="{width / 2}" y="18" text-anchor="middle" font-size="15">{html.escape(title)}</text>',
+           '<text id="unzoom" class="btn" x="10" y="18" style="opacity:0.3">Reset zoom</text>',
+           f'<text id="search" class="btn" x="{width - 10}" y="18" text-anchor="end">Search</text>',
+           f'<text id="matched" x="{width - 10}" y="{height - 8}" text-anchor="end"> </text>',
+           f'<text id="details" x="10" y="{height - 8}"> </text>']
+    for name, x, depth, n in boxes:
+        y = height - 26 - (depth + 1) * row
         kind = (kinds or {}).get(name)
         hue, sat = KIND_HUES.get(kind, (zlib.crc32(name.encode()) % 60, 70))
         light = 55 + zlib.crc32(name.encode()) % 20
         pct = 100.0 * n / total
-        label = html.escape(f"{name} ({n} samples, {pct:.2f}%)")
-        out.append(f'<g><title>{label}</title><rect x="{x:.2f}" y="{y}" width="{w:.2f}" height="{row - 1}" '
-                   f'fill="hsl({hue},{sat}%,{light}%)" rx="2"/>')
-        chars = int(w / 7)
-        if chars >= 3:
-            text = name if len(name) <= chars else name[:chars - 2] + ".."
-            out.append(f'<text x="{x + 3:.2f}" y="{y + row - 5}">{html.escape(text)}</text>')
-        out.append("</g>")
+        w = width * n / total
+        tip = f"{name} ({n} samples, {pct:.2f}%" + (f", {n * ms_per_sample:.1f} ms" if ms_per_sample else "") + ")"
+        chars = int((w - 6) / 7)
+        text = "" if chars < 3 else name if len(name) <= chars else name[:chars - 2] + ".."
+        out.append(f'<g class="f" data-name="{html.escape(name)}" data-x="{x:.8f}" data-w="{n / total:.8f}" data-d="{depth}" '
+                   f'data-n="{n}"><title>{html.escape(tip)}</title><rect x="{x * width:.2f}" y="{y}" width="{w:.2f}" '
+                   f'height="{row - 1}" fill="hsl({hue},{sat}%,{light}%)" rx="2"/>'
+                   f'<text x="{x * width + 3:.2f}" y="{y + row - 5}">{html.escape(text)}</text></g>')
+    out.append(f"<script><![CDATA[{FLAME_SCRIPT}]]></script>")
     out.append("</svg>")
     return "\n".join(out)
 
@@ -602,9 +663,9 @@ def save_outputs(profile, out_dir, title="Skyrim SE"):
     (out_dir / "report.json").write_text(json.dumps(summary, indent=1), encoding="utf-8")
     (out_dir / "report.txt").write_text(render_text(summary), encoding="utf-8")
     paths["report"] = out_dir / "report.txt"
-    with gzip.open(out_dir / "profile.json.gz", "wt", encoding="utf-8") as handle:
-        json.dump(profile.gecko(), handle)
-    paths["firefox"] = out_dir / "profile.json.gz"
+    from .profile_firefox import write
+
+    paths["firefox"] = write(profile_firefox_data(profile), out_dir / "profile.json.gz")
     kinds = {}
     for label, _, kind in profile.functions:
         kinds.setdefault(label, kind)
@@ -612,7 +673,8 @@ def save_outputs(profile, out_dir, title="Skyrim SE"):
     for name, waiting in (("cpu", False), ("wait", True)):
         folded = profile.folded(which, waiting=waiting)
         (out_dir / f"{name}.folded").write_text(folded, encoding="utf-8")
-        svg = flamegraph_svg(folded, f"{title}: {'on-CPU' if not waiting else 'waiting (off-CPU)'} stacks, {which} threads", kinds)
+        svg = flamegraph_svg(folded, f"{title}: {'on-CPU' if not waiting else 'waiting (off-CPU)'} stacks, {which} threads", kinds,
+                             ms_per_sample=1000.0 / profile.raw.get("hz", 1000.0))
         (out_dir / f"{name}-flame.svg").write_text(svg, encoding="utf-8")
         paths[f"{name}Flame"] = out_dir / f"{name}-flame.svg"
     from .profile_views import timeline_html
@@ -636,6 +698,12 @@ def render_text(summary, top=10):
     overhead = summary["overhead"]
     lines.append(f"overhead: main thread suspended {overhead.get('mainSuspendedPct')}% ({overhead.get('mainSuspendedMs')} ms), "
                  f"sampler CPU {overhead.get('samplerCpuPct')}%")
+    if overhead.get("mainThrottledPct"):
+        lines.append(f"  suspension budget {overhead.get('suspendBudgetPct')}%: {overhead['mainThrottledPct']}% of main-thread "
+                     "ticks held the previous stack instead of suspending")
+    if overhead.get("otherThreads"):
+        lines.append(f"  {overhead['otherThreads']} other threads at {overhead.get('otherHz')} Hz, "
+                     f"worst suspended {overhead.get('otherMaxSuspendedPct')}%")
     coverage = summary["coverage"]
     lines.append(f"game samples named: {coverage['namedPct']}% {coverage['split']}")
     if summary.get("context"):
@@ -757,7 +825,8 @@ async def record(args):
             await manager.call("Console.execute", command=f"coc {args.cell}", timeout=60)
         await asyncio.sleep(args.settle)
         frame = (await manager.call("Perf.frameStats")).get("frame", 0)
-        await manager.call("Profile.start", threads=args.threads, hz=args.hz, durationS=args.seconds + 30)
+        await manager.call("Profile.start", threads=args.threads, hz=args.hz, durationS=args.seconds + 30,
+                           otherHz=args.other_hz, suspendBudgetPct=args.suspend_budget)
         load = asyncio.create_task(drive(manager, args.phase))
         await asyncio.sleep(args.seconds)
         load.cancel()
@@ -808,6 +877,34 @@ async def top(args):
             await manager.stop()
 
 
+def export_command(args, symbols):
+    from . import profile_firefox
+
+    source = Path(args.profile)
+    out = Path(args.firefox) if args.firefox else (source if source.is_dir() else source.parent) / "profile.json.gz"
+    data = profile_firefox_data(Profile(load_raw(source), symbols))
+    problems = profile_firefox.check(data)
+    if problems:
+        raise SystemExit("Firefox export failed its checks: " + "; ".join(problems))
+    profile_firefox.write(data, out)
+    print(f"wrote {out}")
+    if args.open:
+        server, url = profile_firefox.serve(out, open_browser=not args.no_browser)
+        print(f"serving on 127.0.0.1 for {url}\n(the browser reads it from this machine; do not press Upload). Ctrl+C stops.")
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            server.shutdown()
+            server.server_close()
+    return 0
+
+
+def profile_firefox_data(profile):
+    """The Firefox profile with everything this build records; save_outputs and export share it."""
+    return profile.firefox().build()
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="skyrim-devtools-profile", description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -815,7 +912,10 @@ def main(argv=None):
     rec.add_argument("--config", required=True, type=Path)
     rec.add_argument("--seconds", type=float, default=30.0)
     rec.add_argument("--hz", type=float, default=1000.0)
-    rec.add_argument("--threads", default="main", help="main, frame, all, or comma-separated ids / name fragments")
+    rec.add_argument("--threads", default="all", help="main, frame, all, or comma-separated ids / name fragments")
+    rec.add_argument("--other-hz", type=float, default=250.0, help="sampling rate for threads other than the main one")
+    rec.add_argument("--suspend-budget", type=float, default=2.5,
+                     help="percent of a thread's time the sampler may keep it suspended (0: no limit)")
     rec.add_argument("--phase", default="idle", help="idle, walk or coc:<cell>[,<back>] (into the cell and back, repeatedly)")
     rec.add_argument("--save", default=None, help="save to load first")
     rec.add_argument("--cell", default=None, help="coc to this cell before profiling (for example Riverwood)")
@@ -831,6 +931,15 @@ def main(argv=None):
     rep.add_argument("--config", type=Path, default=None)
     rep.add_argument("--rewrite", action="store_true", help="regenerate every output next to the raw file")
     rep.add_argument("--json", action="store_true")
+    exp = sub.add_parser("export", help="write the Firefox Profiler file of a saved profile; --open serves it to "
+                                        "profiler.firefox.com from this machine")
+    exp.add_argument("profile", help="output directory or raw.json.gz")
+    exp.add_argument("--firefox", default=None, help="output .json or .json.gz (default <dir>/profile.json.gz)")
+    exp.add_argument("--open", action="store_true", help="serve on 127.0.0.1 and open profiler.firefox.com on it "
+                                                         "(nothing is uploaded; never press the site's Upload button)")
+    exp.add_argument("--no-browser", action="store_true", help=argparse.SUPPRESS)
+    exp.add_argument("--symbols", default=None)
+    exp.add_argument("--config", type=Path, default=None)
     dif = sub.add_parser("diff", help="compare two profiles (for example with and without a mod)")
     dif.add_argument("a")
     dif.add_argument("b")
@@ -888,6 +997,8 @@ def main(argv=None):
             summary = profile.summary()
         print(json.dumps(summary, indent=1) if args.json else render_text(summary))
         return 0
+    if args.command == "export":
+        return export_command(args, symbols)
     result = diff(Profile(load_raw(args.a), symbols), Profile(load_raw(args.b), symbols), args.threads)
     print(json.dumps(result, indent=1) if args.json else render_diff(result))
     return 0
