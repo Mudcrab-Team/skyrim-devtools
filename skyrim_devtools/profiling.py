@@ -677,6 +677,10 @@ def save_outputs(profile, out_dir, title="Skyrim SE"):
                              ms_per_sample=1000.0 / profile.raw.get("hz", 1000.0))
         (out_dir / f"{name}-flame.svg").write_text(svg, encoding="utf-8")
         paths[f"{name}Flame"] = out_dir / f"{name}-flame.svg"
+    from .profile_views import timeline_html
+
+    (out_dir / "timeline.html").write_text(timeline_html(profile, f"{title} timeline"), encoding="utf-8")
+    paths["timeline"] = out_dir / "timeline.html"
     return {k: str(v) for k, v in paths.items()}, summary
 
 
@@ -839,6 +843,40 @@ async def record(args):
             await manager.stop()
 
 
+async def top(args):
+    from .profile_views import render_top, top_snapshot
+    from .use.manager import GameManager
+
+    config = json.loads(Path(args.config).read_text())
+    manager = GameManager(config)
+    symbols = GameSymbols(research_root(args.symbols, config))
+    interactive = sys.stdout.isatty() and not args.json
+    load = None
+    try:
+        await manager.start(headless=args.headless, save=args.save)
+        if args.cell:
+            await manager.call("Console.execute", command=f"coc {args.cell}", timeout=60)
+        if args.phase != "idle":
+            load = asyncio.create_task(drive(manager, args.phase))
+        shown = 0
+        while not args.count or shown < args.count:
+            started = time.monotonic()
+            snap = await top_snapshot(manager.call, symbols, seconds=args.window, top=args.top)
+            if args.json:
+                print(json.dumps(snap), flush=True)
+            else:
+                print(("\x1b[H\x1b[2J" if interactive else "") + render_top(snap) + ("" if interactive else "\n"), flush=True)
+            shown += 1
+            await asyncio.sleep(max(0.0, args.interval - (time.monotonic() - started)))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if load:
+            load.cancel()
+        if not args.keep:
+            await manager.stop()
+
+
 def export_command(args, symbols):
     from . import profile_firefox
 
@@ -909,12 +947,47 @@ def main(argv=None):
     dif.add_argument("--symbols", default=None)
     dif.add_argument("--config", type=Path, default=None)
     dif.add_argument("--json", action="store_true")
+    tp = sub.add_parser("top", help="start the game and show a live dashboard (fps, hot functions, threads, memory, GPU)")
+    tp.add_argument("--config", required=True, type=Path)
+    tp.add_argument("--interval", type=float, default=1.0, help="seconds between refreshes")
+    tp.add_argument("--window", type=float, default=3.0, help="seconds of main-thread samples per view")
+    tp.add_argument("--top", type=int, default=15)
+    tp.add_argument("--count", type=int, default=0, help="stop after this many refreshes (0: until Ctrl-C)")
+    tp.add_argument("--json", action="store_true", help="one JSON snapshot per line instead of the dashboard")
+    tp.add_argument("--phase", default="idle", help="idle, walk or coc:<cell>[,<back>]")
+    tp.add_argument("--save", default=None)
+    tp.add_argument("--cell", default=None)
+    tp.add_argument("--headless", action="store_true")
+    tp.add_argument("--keep", action="store_true")
+    tp.add_argument("--symbols", default=None)
+    tl = sub.add_parser("timeline", help="write the HTML timeline of a saved profile")
+    tl.add_argument("profile", help="output directory or raw.json.gz")
+    tl.add_argument("--out", default=None, help="HTML file (default timeline.html next to the raw file)")
+    tl.add_argument("--recorder", default=None, help="skyrim-use timeline .jsonl whose tool calls and narration to overlay")
+    tl.add_argument("--symbols", default=None)
+    tl.add_argument("--config", type=Path, default=None)
     args = parser.parse_args(argv)
     if args.command == "record":
         asyncio.run(record(args))
         return 0
+    if args.command == "top":
+        try:
+            asyncio.run(top(args))
+        except KeyboardInterrupt:
+            pass
+        return 0
     config = json.loads(args.config.read_text()) if args.config else None
     symbols = GameSymbols(research_root(args.symbols, config))
+    if args.command == "timeline":
+        from .profile_views import recorder_marks, timeline_html
+
+        raw = load_raw(args.profile)
+        if args.recorder and raw.get("startEpochMs"):
+            raw.setdefault("marks", []).extend(recorder_marks(args.recorder, raw["startEpochMs"], raw.get("durationS", 0) * 1000.0))
+        target = Path(args.out) if args.out else (Path(args.profile) if Path(args.profile).is_dir() else Path(args.profile).parent) / "timeline.html"
+        target.write_text(timeline_html(Profile(raw, symbols)), encoding="utf-8")
+        print(target)
+        return 0
     if args.command == "report":
         profile = Profile(load_raw(args.profile), symbols)
         if args.rewrite:

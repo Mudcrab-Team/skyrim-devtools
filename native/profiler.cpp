@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstring>
 #include <deque>
@@ -119,6 +120,22 @@ namespace
         }
         std::ranges::sort(out, {}, &Module::base);
         return out;
+    }
+
+    bool ModuleSetChanged(const std::vector<Module>& list)
+    {
+        std::vector<HMODULE> handles(1024);
+        DWORD needed = 0;
+        if (!EnumProcessModulesEx(GetCurrentProcess(), handles.data(), static_cast<DWORD>(handles.size() * sizeof(HMODULE)), &needed, LIST_MODULES_64BIT)) {
+            return false;
+        }
+        handles.resize(std::min<std::size_t>(handles.size(), needed / sizeof(HMODULE)));
+        // Only a module the list lacks matters; a stale entry for an unloaded one is harmless.
+        return std::ranges::any_of(handles, [&](HMODULE handle) {
+            const auto base = reinterpret_cast<std::uintptr_t>(handle);
+            const auto it = std::ranges::lower_bound(list, base, {}, &Module::base);
+            return it == list.end() || it->base != base;
+        });
     }
 
     const Module* FindModule(const std::vector<Module>& list, std::uintptr_t address)
@@ -479,6 +496,45 @@ namespace
     std::deque<Hitch> hitchLog;
     std::uint64_t hitchesSeen = 0;
 
+    // Profile.top keeps the main-thread ring filling for a few seconds after each call, so a live view
+    // samples only while someone is looking and the watch need not stay on.
+    std::atomic<double> topLeaseUntil = 0.0;
+
+    bool Watching(double now)
+    {
+        return watching.load(std::memory_order_relaxed) || now < topLeaseUntil.load(std::memory_order_relaxed);
+    }
+
+    // Aggregates of the main-thread ring over the last `seconds`, computed by the sampler thread (which owns
+    // the ring) on request.
+    struct TopData
+    {
+        double seconds = 0.0;
+        double hz = 0.0;
+        std::uint32_t samples = 0;
+        std::uint32_t waiting = 0;
+        std::vector<std::pair<std::uint64_t, std::uint32_t>> self;
+        std::vector<std::pair<std::uint64_t, std::uint32_t>> total;
+        std::vector<std::pair<std::uint64_t, std::uint32_t>> waits;
+    };
+    std::mutex topMutex;
+    std::condition_variable topReady;
+    std::uint64_t topWanted = 0;
+    std::uint64_t topDone = 0;
+    double topSeconds = 5.0;
+    TopData topData;
+
+    struct MarkRecord
+    {
+        std::string kind;
+        std::string name;
+        double start;
+        double end;
+    };
+    constexpr std::size_t maxMarks = 200000;
+    std::mutex marksMutex;
+    std::vector<MarkRecord> sessionMarks;
+
     Json WaitChain(DWORD tid)
     {
         const HWCT session = OpenThreadWaitChainSession(0, nullptr);
@@ -728,6 +784,76 @@ namespace
         }
     }
 
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> Largest(const std::unordered_map<std::uint64_t, std::uint32_t>& counts, std::size_t keep)
+    {
+        std::vector<std::pair<std::uint64_t, std::uint32_t>> out(counts.begin(), counts.end());
+        const auto cut = std::min(keep, out.size());
+        std::partial_sort(out.begin(), out.begin() + static_cast<std::ptrdiff_t>(cut), out.end(),
+            [](const auto& a, const auto& b) { return a.second > b.second; });
+        out.resize(cut);
+        return out;
+    }
+
+    void ServeTop(const HitchState& state, double now)
+    {
+        double seconds = 0.0;
+        {
+            std::lock_guard lock(topMutex);
+            if (topWanted == topDone) {
+                return;
+            }
+            seconds = topSeconds;
+        }
+        TopData data;
+        data.seconds = seconds;
+        data.hz = watchHz.load();
+        std::unordered_map<std::int32_t, std::pair<std::uint32_t, std::uint32_t>> stacks;  // on-CPU, waiting
+        for (std::size_t i = 0; i < state.count; ++i) {
+            const auto& entry = state.ring[(state.head + state.ring.size() - state.count + i) % state.ring.size()];
+            if (entry.at < now - seconds || entry.stack < 0) {
+                continue;
+            }
+            ++data.samples;
+            auto& counts = stacks[entry.stack];
+            if (entry.flags & flagWaiting) {
+                ++data.waiting;
+                ++counts.second;
+            } else {
+                ++counts.first;
+            }
+        }
+        std::unordered_map<std::uint64_t, std::uint32_t> self, total, waits;
+        std::unordered_set<std::uint64_t> seen;
+        for (const auto& [stack, counts] : stacks) {
+            const auto pcs = state.interner.Expand(stack);
+            if (pcs.empty()) {
+                continue;
+            }
+            if (counts.second) {
+                waits[pcs.front()] += counts.second;
+            }
+            if (!counts.first) {
+                continue;
+            }
+            self[pcs.front()] += counts.first;
+            seen.clear();
+            for (const auto pc : pcs) {
+                if (seen.insert(pc).second) {
+                    total[pc] += counts.first;
+                }
+            }
+        }
+        data.self = Largest(self, 80);
+        data.total = Largest(total, 80);
+        data.waits = Largest(waits, 20);
+        {
+            std::lock_guard lock(topMutex);
+            topData = std::move(data);
+            topDone = topWanted;
+        }
+        topReady.notify_all();
+    }
+
     double SamplerCpu()
     {
         FILETIME created, exited, kernel, user;
@@ -793,11 +919,15 @@ namespace
                     targetsAt = session->started;
                     session->samplerCpuSeconds = SamplerCpu();
                     next = session->started;
+                    {
+                        std::lock_guard marks(marksMutex);
+                        sessionMarks.clear();
+                    }
                     std::lock_guard frames(frameMutex);
                     sessionFrames.clear();
                 }
             }
-            const bool watch = watching.load();
+            const bool watch = Watching(perf::Now());
             if (!session && !watch) {
                 WaitForSingleObject(wake, 250);
                 next = perf::Now();
@@ -863,6 +993,7 @@ namespace
                     hitches.waitChain = WaitChain(mainThreadId);
                 }
                 CollectHitches(hitches, now);
+                ServeTop(hitches, now);
             }
             if (session) {
                 ++session->ticks;
@@ -946,22 +1077,33 @@ namespace
     }
     // ---- resolution --------------------------------------------------------------------------
 
+    // DbgHelp is single-threaded; the per-call resolvers and the persistent one behind Profile.top share it.
+    std::mutex dbgHelpMutex;
+
     struct Resolver
     {
+        explicit Resolver(std::uintptr_t handle = 0x5d7e1e11) : symbols(reinterpret_cast<HANDLE>(handle)) {}
+        Resolver(const Resolver&) = delete;
+        Resolver& operator=(const Resolver&) = delete;
+
         std::vector<Module> list = SnapshotModules();
         std::uintptr_t gameBase = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
         std::vector<std::uint32_t> used;  // module indices in output order
         std::unordered_map<std::uint32_t, std::uint32_t> moduleOut;
-        HANDLE symbols = reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(0x5d7e1e11));
+        HANDLE symbols;
         bool symInit = false;
         std::unordered_set<std::uint32_t> symLoaded;
+        std::unordered_map<std::uint64_t, Json> frames;
 
         ~Resolver()
         {
             if (symInit) {
+                std::lock_guard lock(dbgHelpMutex);
                 SymCleanup(symbols);
             }
         }
+
+        bool Covers(std::uint64_t pc) const { return FindModule(list, pc) != nullptr; }
 
         static const std::vector<REL::IDDB::mapping_t>& Ids()
         {
@@ -996,6 +1138,19 @@ namespace
 
         Json Frame(std::uint64_t pc)
         {
+            if (const auto cached = frames.find(pc); cached != frames.end()) {
+                return cached->second;
+            }
+            auto out = Resolve(pc);
+            if (frames.size() > 65536) {
+                frames.clear();
+            }
+            frames.emplace(pc, out);
+            return out;
+        }
+
+        Json Resolve(std::uint64_t pc)
+        {
             const auto* module = FindModule(list, pc);
             if (!module) {
                 return Json{ { "addr", pc } };
@@ -1022,6 +1177,7 @@ namespace
                 }
                 return out;
             }
+            std::lock_guard lock(dbgHelpMutex);
             if (!symInit) {
                 SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_NO_PROMPTS);
                 symInit = SymInitialize(symbols, SymbolPath().c_str(), FALSE) != FALSE;
@@ -1054,6 +1210,7 @@ namespace
                     { "path", Narrow(m.path) }, { "base", m.base }, { "size", m.end - m.base },
                     { "game", m.base == gameBase } };
                 if (symInit) {
+                    std::lock_guard lock(dbgHelpMutex);
                     IMAGEHLP_MODULEW64 info{};
                     info.SizeOfStruct = sizeof(info);
                     if (SymGetModuleInfoW64(symbols, m.base, &info)) {
@@ -1141,6 +1298,13 @@ namespace
                 marks.push_back({ std::round((f.start - s.started) * 1e5) / 100.0, std::round((f.end - s.started) * 1e5) / 100.0, f.frame });
             }
         }
+        auto markList = Json::array();
+        {
+            std::lock_guard lock(marksMutex);
+            for (const auto& m : sessionMarks) {
+                markList.push_back({ std::round((m.start - s.started) * 1e5) / 100.0, std::round((m.end - s.started) * 1e5) / 100.0, m.kind, m.name });
+            }
+        }
         Json hitchJson = SerializeHitches(resolver, s.started, maxHitches, 0);
         // keep only hitches that fall inside the profile
         auto kept = Json::array();
@@ -1159,7 +1323,7 @@ namespace
             { "mainThread", mainThreadId }, { "frameThread", frameThreadId.load() },
             { "pluginBuild", std::string(BuildId()) },
             { "frames", std::move(frames) }, { "stacks", std::move(stacks) }, { "threads", std::move(threads) },
-            { "frameMarks", std::move(marks) }, { "hitchThresholdMs", hitchThresholdMs.load() },
+            { "frameMarks", std::move(marks) }, { "marks", std::move(markList) }, { "hitchThresholdMs", hitchThresholdMs.load() },
             { "hitches", std::move(kept) }, { "hitchFrames", std::move(hitchJson["frames"]) } };
         out["modules"] = resolver.Modules();
         return out.dump(-1, ' ', false, Json::error_handler_t::replace);
@@ -1249,10 +1413,87 @@ namespace
 
 namespace devtools::profiler
 {
+    bool Profiling()
+    {
+        return profiling.load(std::memory_order_relaxed);
+    }
+
+    void Mark(std::string_view kind, std::string_view name, double start, double end)
+    {
+        if (!profiling.load(std::memory_order_relaxed)) {
+            return;
+        }
+        std::lock_guard lock(marksMutex);
+        if (sessionMarks.size() < maxMarks) {
+            sessionMarks.push_back({ std::string(kind), std::string(name), start, end });
+        }
+    }
+
+    Json TopSamples(double seconds)
+    {
+        seconds = std::clamp(seconds, 0.5, 30.0);
+        const double now = perf::Now();
+        const double previousLease = topLeaseUntil.exchange(now + 10.0);
+        {
+            std::lock_guard lock(controlMutex);
+            EnsureSampler();
+        }
+        TopData data;
+        bool fresh = false;
+        {
+            std::unique_lock lock(topMutex);
+            topSeconds = seconds;
+            const auto ticket = ++topWanted;
+            fresh = topReady.wait_for(lock, std::chrono::milliseconds(1500), [&] { return topDone >= ticket; });
+            if (fresh) {
+                data = topData;
+            }
+        }
+        Json out{ { "seconds", seconds }, { "hz", watchHz.load() }, { "warm", previousLease > now || watching.load() },
+            { "ready", fresh } };
+        if (!fresh) {
+            return out;
+        }
+        // One resolver lives across calls so DbgHelp loads each module once; it is rebuilt when a frame lands
+        // in a module that loaded after its snapshot.
+        static std::mutex resolverMutex;
+        static std::unique_ptr<Resolver> resolver;
+        std::lock_guard lock(resolverMutex);
+        const auto covers = [&](const auto& list) {
+            return std::ranges::all_of(list, [&](const auto& item) { return resolver->Covers(item.first); });
+        };
+        // A rebuild reloads DbgHelp symbols for every module, which costs hundreds of milliseconds. Code outside
+        // any module (hook trampolines, generated stubs) never becomes covered, so rebuild only when the loaded
+        // module set really changed.
+        const double resolveStart = perf::Now();
+        if (!resolver || ((!covers(data.self) || !covers(data.total) || !covers(data.waits)) && ModuleSetChanged(resolver->list))) {
+            resolver.reset();
+            resolver = std::make_unique<Resolver>(0x5d7e1e12);
+            out["resolverRebuilt"] = true;
+        }
+        const auto encode = [&](const auto& list) {
+            auto rows = Json::array();
+            for (const auto& [pc, count] : list) {
+                auto frame = resolver->Frame(pc);
+                frame["n"] = count;
+                rows.push_back(std::move(frame));
+            }
+            return rows;
+        };
+        out["samples"] = data.samples;
+        out["waiting"] = data.waiting;
+        out["self"] = encode(data.self);
+        out["total"] = encode(data.total);
+        out["waits"] = encode(data.waits);
+        out["modules"] = resolver->Modules();
+        out["resolveMs"] = std::round((perf::Now() - resolveStart) * 10000.0) / 10.0;
+        return out;
+    }
+
     void OnFrame(double start, double end, std::uint64_t frame)
     {
         const bool session = profiling.load(std::memory_order_relaxed);
-        const bool watch = session || watching.load(std::memory_order_relaxed);
+        const bool watch = session || Watching(end);
         if (!watch) {
             return;
         }

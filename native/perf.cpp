@@ -233,6 +233,7 @@ namespace devtools::perf
 
     void NoteCall(const std::string& method, const char* thread, double startedAt, double queuedMs, double ranMs)
     {
+        profiler::Mark("rpc", method, startedAt, startedAt + ranMs / 1000.0);
         if (ranMs < 5.0 && queuedMs < 100.0) {
             return;
         }
