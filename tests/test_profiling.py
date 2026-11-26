@@ -195,6 +195,13 @@ class PerBuildTablesTests(unittest.TestCase):
         self.assertIn("CRASHLOGGER_PDB(59818@2030.01.02)", credits)
         self.assertNotIn(profiling.CRASHLOGGER_CREDIT, credits)
 
+    def test_tables_can_be_switched_off_to_compare_with_bridging(self):
+        raw = raw_profile(RUNS)
+        raw["build"] = self.build
+        raw["frames"] = [{"m": 0, "rva": 0x9010, "start": 0x9000}]
+        profile = profiling.Profile(raw, profiling.GameSymbols(self.root, build_tables=False))
+        self.assertTrue(profile.foreign)
+
     def test_pinned_build_keeps_committed_tables(self):
         profile = self.profile(profiling.SYMBOLS_BUILD)
         self.assertEqual(profile.functions[profile.frame_function[1]][0], "Alpha::Run")

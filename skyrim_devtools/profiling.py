@@ -129,10 +129,13 @@ class GameSymbols:
     boundary table. All of these describe SYMBOLS_BUILD; with that build's Address Library table
     (`addrlib`) a profile of another runtime is named through each frame's Address Library ID."""
 
-    def __init__(self, root=None, addrlib=None, build=None, tables=None):
+    def __init__(self, root=None, addrlib=None, build=None, tables=None, build_tables=True):
         self.root = Path(root) if root else None
         self.build = build or SYMBOLS_BUILD
         self.credit = CRASHLOGGER_CREDIT
+        # False keeps a profile of another build on Address Library bridging even when tables exist for it,
+        # to compare the two namings.
+        self.build_tables = build_tables
         # Tables of a non-pinned build live outside the committed tree, in the checkout's ignored .local.
         self.tables = Path(tables) if tables else None
         self.ids = read_address_library(addrlib) if addrlib else {}
@@ -193,7 +196,7 @@ class GameSymbols:
     def for_build(self, build):
         """The symbols to use for a profile of `build`: these when it is their build, a table set generated
         from that build's own PDB when one exists, otherwise these (named through Address Library IDs)."""
-        if build == self.build or not self.root or not BUILD_RE.fullmatch(build or ""):
+        if build == self.build or not self.build_tables or not self.root or not BUILD_RE.fullmatch(build or ""):
             return self
         tables = self.root / ".local" / "crashlogger_pdb" / build
         if not (tables / "names").is_dir():
@@ -961,7 +964,8 @@ async def record(args):
 
     config = json.loads(Path(args.config).read_text())
     manager = GameManager(config)
-    symbols = GameSymbols(research_root(args.symbols, config), address_library_path(args.addrlib, config))
+    symbols = GameSymbols(research_root(args.symbols, config), address_library_path(args.addrlib, config),
+                          build_tables=not args.no_build_tables)
     out = Path(args.out) if args.out else default_out()
     try:
         if args.attach:
@@ -1036,11 +1040,15 @@ def main(argv=None):
     rec.add_argument("--keep", action="store_true", help="leave the game running")
     rec.add_argument("--attach", action="store_true", help=argparse.SUPPRESS)
     rec.add_argument("--addrlib", default=None, help="versionlib-1-7-104-0.bin, to name profiles of other runtimes")
+    rec.add_argument("--no-build-tables", action="store_true",
+                    help="name other builds through --addrlib even when tables generated from their PDB exist")
     rec.add_argument("--symbols", default=None, help="skyrim-research checkout with the symbol tables")
     rec.add_argument("--out", default=None, help="output directory (default .local/profiles/<stamp>)")
     rep = sub.add_parser("report", help="re-symbolise a saved profile and print or rewrite its report")
     rep.add_argument("profile", help="output directory or raw.json.gz")
     rep.add_argument("--addrlib", default=None, help="versionlib-1-7-104-0.bin, to name profiles of other runtimes")
+    rep.add_argument("--no-build-tables", action="store_true",
+                    help="name other builds through --addrlib even when tables generated from their PDB exist")
     rep.add_argument("--symbols", default=None)
     rep.add_argument("--config", type=Path, default=None)
     rep.add_argument("--rewrite", action="store_true", help="regenerate every output next to the raw file")
@@ -1053,6 +1061,8 @@ def main(argv=None):
                                                          "(nothing is uploaded; never press the site's Upload button)")
     exp.add_argument("--no-browser", action="store_true", help=argparse.SUPPRESS)
     exp.add_argument("--addrlib", default=None, help="versionlib-1-7-104-0.bin, to name profiles of other runtimes")
+    exp.add_argument("--no-build-tables", action="store_true",
+                    help="name other builds through --addrlib even when tables generated from their PDB exist")
     exp.add_argument("--symbols", default=None)
     exp.add_argument("--config", type=Path, default=None)
     dif = sub.add_parser("diff", help="compare two profiles (for example with and without a mod)")
@@ -1060,6 +1070,8 @@ def main(argv=None):
     dif.add_argument("b")
     dif.add_argument("--threads", default="main", help="main or all")
     dif.add_argument("--addrlib", default=None, help="versionlib-1-7-104-0.bin, to name profiles of other runtimes")
+    dif.add_argument("--no-build-tables", action="store_true",
+                    help="name other builds through --addrlib even when tables generated from their PDB exist")
     dif.add_argument("--symbols", default=None)
     dif.add_argument("--config", type=Path, default=None)
     dif.add_argument("--json", action="store_true")
@@ -1068,7 +1080,8 @@ def main(argv=None):
         asyncio.run(record(args))
         return 0
     config = json.loads(args.config.read_text()) if args.config else None
-    symbols = GameSymbols(research_root(args.symbols, config), address_library_path(args.addrlib, config))
+    symbols = GameSymbols(research_root(args.symbols, config), address_library_path(args.addrlib, config),
+                          build_tables=not args.no_build_tables)
     if args.command == "report":
         profile = Profile(load_raw(args.profile), symbols)
         if args.rewrite:
