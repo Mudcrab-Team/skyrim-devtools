@@ -133,7 +133,7 @@ def main():
     parser.add_argument("--keep-lock", action="store_true", help="with --deploy: keep agent.lock for the live run")
     parser.add_argument("--lock-wait", type=int, default=0, metavar="SECONDS", help="wait this long for agent.lock")
     parser.add_argument("--refresh", action="store_true",
-                        help="with lock: touch agent.lock if this agent holds it (exit 4 if not); long holders call it every few minutes")
+                        help="with lock: touch agent.lock if this agent holds it (non-zero exit if not); long holders call it every few minutes")
     parser.add_argument("--full", action="store_true", help="resend every source file")
     parser.add_argument("--reconfigure", action="store_true", help="delete the build directory first")
     parser.add_argument("--no-prebuilt", action="store_true", help="compile CommonLib inside the build directory")
