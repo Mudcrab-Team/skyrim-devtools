@@ -37,7 +37,9 @@ def _rows(profile, items, samples, count_source=False):
 
 async def top_snapshot(call, symbols=None, seconds=3.0, top=15):
     """One dashboard snapshot. `call(method, **params)` is any RPC caller."""
+    began = time.monotonic()
     raw = await call("Profile.top", seconds=seconds)
+    rpc_ms = (time.monotonic() - began) * 1000.0
     try:
         stats = await call("Perf.frameStats", window=seconds)
     except Exception:  # noqa: BLE001 - the Present hook may be absent (headless) and the rest still reads
@@ -69,6 +71,8 @@ async def top_snapshot(call, symbols=None, seconds=3.0, top=15):
         "topTotal": sorted(({"function": f, "pct": p} for f, p in total_rows.items()), key=lambda r: -r["pct"])[:top],
         "waits": _rows(profile, raw.get("waits"), samples)[:5],
         "memory": raw.get("memory"), "threads": raw.get("threads"), "gpu": raw.get("gpu"),
+        "costMs": {**(raw.get("costMs") or {}), "resolve": raw.get("resolveMs"), "rpc": round(rpc_ms, 1),
+                   "resolverRebuilt": bool(raw.get("resolverRebuilt"))},
     }
     credits = profile.credits()
     if credits:
@@ -246,25 +250,31 @@ TEMPLATE = r"""<!doctype html>
 <style>
 :root {
   --bg: #fbfbfa; --panel: #ffffff; --ink: #1d1f22; --muted: #6b7078; --line: #e2e3e6;
-  --band-a: #eef0f3; --band-b: #e3e6eb; --band-slow: #f4c7c3; --band-hitch: #e0574b; --sel: #2f6fdf;
-  --wait: #c9ccd2;
+  --band-a: #eef0f3; --band-b: #e3e6eb; --band-slow: #f0b46a; --band-hitch: #e0574b; --sel: #2f6fdf;
+  --wait: #c9ccd2; --cross: #1d1f22;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #15171a; --panel: #1c1f23; --ink: #e6e7e9; --muted: #969ba3; --line: #2c3036;
-    --band-a: #23272c; --band-b: #2b3036; --band-slow: #6b3a36; --band-hitch: #d4554a; --sel: #6d9cf0;
-    --wait: #3a3f46;
+    --band-a: #23272c; --band-b: #2b3036; --band-slow: #9a6a2c; --band-hitch: #d4554a; --sel: #6d9cf0;
+    --wait: #3a3f46; --cross: #e6e7e9;
   }
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
-header { padding: 10px 16px; display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap; border-bottom: 1px solid var(--line); }
+header { padding: 8px 16px; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid var(--line); }
 header h1 { font-size: 15px; margin: 0; font-weight: 600; }
 header .meta { color: var(--muted); }
 header label { color: var(--muted); }
+header button { font: inherit; font-size: 12px; color: var(--ink); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 4px; padding: 1px 8px; cursor: pointer; min-width: 28px; }
+header button:disabled { color: var(--muted); cursor: default; }
+header, #view { user-select: none; -webkit-user-select: none; }
 #wrap { display: flex; height: calc(100vh - 44px); }
 #view { flex: 1; position: relative; overflow-y: auto; overflow-x: hidden; }
-canvas { display: block; cursor: crosshair; }
+#r { position: sticky; top: 0; z-index: 2; display: block; cursor: col-resize; }
+#c { display: block; cursor: crosshair; }
+#o { position: absolute; left: 0; pointer-events: none; z-index: 1; }
 #side { width: 380px; max-width: 45vw; border-left: 1px solid var(--line); background: var(--panel); overflow: auto; padding: 10px 14px; }
 #side h2 { font-size: 13px; margin: 12px 0 4px; }
 #side table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -273,6 +283,13 @@ canvas { display: block; cursor: crosshair; }
 #side .stack { font-size: 11px; color: var(--muted); margin: 2px 0 8px; word-break: break-word; }
 #tip { position: fixed; pointer-events: none; background: var(--panel); border: 1px solid var(--line); padding: 4px 8px;
   font-size: 12px; max-width: 520px; display: none; z-index: 5; box-shadow: 0 2px 8px rgba(0,0,0,.15); }
+#tip b { font-variant-numeric: tabular-nums; }
+#help { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: none; align-items: center; justify-content: center; z-index: 10; }
+#help.open { display: flex; }
+#help .card { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 14px 18px; max-width: min(520px, calc(100vw - 32px)); }
+#help h2 { font-size: 14px; margin: 0 0 8px; }
+#help td { padding: 2px 10px 2px 0; vertical-align: top; }
+#help kbd { font: 11px ui-monospace, monospace; border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; background: var(--bg); }
 .legend span { display: inline-block; width: 10px; height: 10px; margin: 0 3px 0 8px; vertical-align: -1px; border-radius: 2px; }
 .hint { color: var(--muted); font-size: 12px; }
 @media (max-width: 700px) { #wrap { flex-direction: column; height: auto; } #side { width: auto; max-width: none; border-left: 0; } }
@@ -284,13 +301,35 @@ canvas { display: block; cursor: crosshair; }
   <span class="meta" id="meta"></span>
   <span class="legend" id="legend"></span>
   <label><input type="checkbox" id="idle"> idle threads</label>
-  <span class="hint">wheel: zoom, drag: pan, click: frame stacks, double-click: reset</span>
+  <span>
+    <button id="zout" title="Zoom out (-)">&minus;</button>
+    <button id="back" title="Previous zoom (Backspace)">Back</button>
+    <button id="fit" title="Fit all (0)">Fit</button>
+    <button id="helpbtn" title="Keys (?)">?</button>
+  </span>
+  <span class="hint" id="span"></span>
 </header>
 <div id="wrap">
-  <div id="view"><canvas id="c"></canvas></div>
-  <div id="side"><p class="hint">Click a frame band or a thread row to see that frame's stacks.</p></div>
+  <div id="view"><canvas id="r"></canvas><canvas id="c"></canvas><canvas id="o"></canvas></div>
+  <div id="side"></div>
 </div>
 <div id="tip"></div>
+<div id="help"><div class="card">
+  <h2>Timeline keys</h2>
+  <table>
+    <tr><td><kbd>drag</kbd></td><td>select a time range on the timeline or ruler and zoom to it</td></tr>
+    <tr><td><kbd>Alt</kbd>/<kbd>Shift</kbd> drag, middle drag</td><td>pan</td></tr>
+    <tr><td><kbd>wheel</kbd></td><td>zoom around the pointer; <kbd>Shift</kbd>+wheel or horizontal scroll pans</td></tr>
+    <tr><td><kbd>click</kbd></td><td>frame stacks in the side panel (a thread row focuses that thread)</td></tr>
+    <tr><td><kbd>Backspace</kbd></td><td>back to the previous zoom</td></tr>
+    <tr><td><kbd>-</kbd> <kbd>+</kbd></td><td>zoom out / in</td></tr>
+    <tr><td><kbd>0</kbd> <kbd>f</kbd>, double-click</td><td>fit the whole profile</td></tr>
+    <tr><td><kbd>&larr;</kbd> <kbd>&rarr;</kbd></td><td>pan by a fifth of the view</td></tr>
+    <tr><td><kbd>Esc</kbd></td><td>clear the selection, cancel a drag, close this help</td></tr>
+    <tr><td><kbd>?</kbd></td><td>show or hide this help</td></tr>
+  </table>
+  <p class="hint" id="framekey"></p>
+</div></div>
 <script>
 const D = __DATA__;
 const KIND_COLORS = { game: [28, 80], plugin: [212, 65], skse: [270, 50], "gpu-driver": [130, 45], kernel: [0, 60],
@@ -300,8 +339,15 @@ const MARK_COLORS = { load: "#3a8fd8", hitch: "#d9443a", alert: "#e08b1a", narra
 const MARK_ORDER = ["load", "hitch", "alert", "narrate", "tool", "rpc", "menu", "marker"];
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const canvas = document.getElementById("c"), ctx = canvas.getContext("2d");
+const ruler = document.getElementById("r"), rctx = ruler.getContext("2d");
+const over = document.getElementById("o"), octx = over.getContext("2d");
 const view = document.getElementById("view"), side = document.getElementById("side"), tip = document.getElementById("tip");
-const LABEL_W = 150, AXIS_H = 20, FRAME_H = 16, LANE_H = 12, LEVEL_H = 5, MAX_LEVELS = 14;
+const help = document.getElementById("help");
+const LABEL_W = 150, AXIS_H = 20, FRAME_H = 18, LANE_H = 12, LEVEL_H = 5, MAX_LEVELS = 14;
+// below about 50 us a 1 kHz profile has nothing left to separate, and float labels start to repeat
+const MIN_SPAN = 0.05;
+const SIDE_HINT = '<p class="hint">Click a frame band or a thread row to see that frame\'s stacks. Press ? for keys.</p>';
+side.innerHTML = SIDE_HINT;
 
 document.getElementById("title").textContent = "Timeline: " + D.title;
 document.getElementById("meta").textContent = `${(D.durationMs / 1000).toFixed(1)} s at ${D.hz} Hz, ${D.threads.length} threads, ${D.frames.length} frames`;
@@ -333,6 +379,14 @@ for (const t of D.threads) {
 }
 function lower(arr, x) { let lo = 0, hi = arr.length; while (lo < hi) { const m = (lo + hi) >> 1; if (arr[m] < x) lo = m + 1; else hi = m; } return lo; }
 
+// a frame is slow relative to this run's own pace, so a 30 fps capture is not painted all orange
+const frameEnds = D.frames.map(f => f[1]);
+const frameLens = D.frames.map(f => f[1] - f[0]).sort((a, b) => a - b);
+const MEDIAN_FRAME = frameLens.length ? frameLens[frameLens.length >> 1] : 16.7;
+const SLOW_MS = MEDIAN_FRAME * 1.5;
+document.getElementById("framekey").textContent = D.frames.length
+  ? `Frame boxes: orange above ${SLOW_MS.toFixed(1)} ms (1.5x the median ${MEDIAN_FRAME.toFixed(1)} ms), red above the ${D.hitchMs} ms hitch threshold.` : "";
+
 // marks into lanes per kind (greedy, at most 3 lanes per kind)
 const lanes = [];
 for (const kind of MARK_ORDER) {
@@ -343,51 +397,107 @@ for (const kind of MARK_ORDER) {
   rows.forEach((r, i) => lanes.push({ kind, label: i ? "" : kind, marks: r }));
 }
 
-let t0 = 0, t1 = Math.max(D.durationMs, 1), selected = null, showIdle = false, layout = [];
+const FULL = Math.max(D.durationMs, 1);
+let t0 = 0, t1 = FULL, selected = null, showIdle = false, layout = [], P = {};
+let hover = null, range = null, drag = null, wheelAt = 0;
+const zoomHistory = [];
 function visibleThreads() { return D.threads.filter(t => showIdle || t.onCpu > 0 || t.main); }
 function W() { return view.clientWidth; }
 function x(t) { return LABEL_W + (t - t0) / (t1 - t0) * (W() - LABEL_W); }
 function tAt(px) { return t0 + (px - LABEL_W) / (W() - LABEL_W) * (t1 - t0); }
 
+// ---- time formatting: the ruler switches from whole seconds to ms to us offsets as the view narrows
+function decimals(step) { return Math.max(0, Math.ceil(-Math.log10(step) - 1e-9)); }
+function fmtDur(ms) { const a = Math.abs(ms);
+  if (a >= 1000) return (ms / 1000).toFixed(a >= 10000 ? 1 : 2) + " s";
+  if (a >= 1) return ms.toFixed(a >= 100 ? 0 : a >= 10 ? 1 : 2) + " ms";
+  return (ms * 1000).toFixed(a >= 0.01 ? 0 : 1) + " µs"; }
+function fmtAbs(ms, dec) { return (ms / 1000).toFixed(dec) + " s"; }
+function fmtOffset(ms, step) {
+  if (step < 1 && ms < 1) return "+" + (ms * 1000).toFixed(decimals(step * 1000)) + " µs";
+  return "+" + ms.toFixed(step < 1 ? 3 : 0) + " ms"; }
+function ticks() {
+  const target = (t1 - t0) * 90 / Math.max(W() - LABEL_W, 1), p = Math.pow(10, Math.floor(Math.log10(target)));
+  const step = Math.max(0.001, [1, 2, 5, 10].map(m => m * p).find(s => s >= target * (1 - 1e-9)));
+  const first = Math.ceil(t0 / step - 1e-9), at = [];
+  for (let i = first; i * step <= t1 && at.length < 400; i++) at.push(i * step);
+  let labels;
+  if (step >= 1000) labels = at.map(g => fmtAbs(g, 0));
+  else if (step >= 10) labels = at.map(g => fmtAbs(g, decimals(step / 1000)));
+  else labels = at.map((g, i) => i ? fmtOffset(g - at[0], step) : fmtAbs(g, decimals(step / 1000)));
+  return { step, at, labels };
+}
+function fmtCursor(time) {
+  const perPx = (t1 - t0) / Math.max(W() - LABEL_W, 1);
+  return fmtAbs(time, Math.min(7, Math.max(3, decimals(perPx / 1000))));
+}
+
+// ---- zoom state
+function setView(a, b, remember) {
+  let span = Math.min(Math.max(b - a, MIN_SPAN), FULL * 1.2);
+  const mid = (a + b) / 2; a = mid - span / 2;
+  if (remember && (Math.abs(a - t0) > 1e-9 || Math.abs(span - (t1 - t0)) > 1e-9)) {
+    zoomHistory.push([t0, t1]); if (zoomHistory.length > 200) zoomHistory.shift(); }
+  t0 = a; t1 = a + span; draw();
+}
+function zoomBy(k, at) { if (at === undefined) at = (t0 + t1) / 2; const f = (at - t0) / (t1 - t0), span = (t1 - t0) * k;
+  setView(at - f * span, at - f * span + span, true); }
+function panBy(dt) { t0 += dt; t1 += dt; draw(); }
+function fit() { setView(0, FULL, true); }
+function back() { const v = zoomHistory.pop(); if (v) { t0 = v[0]; t1 = v[1]; draw(); } }
+
+function palette() { P = { bg: css("--bg"), ink: css("--ink"), muted: css("--muted"), line: css("--line"), a: css("--band-a"),
+  b: css("--band-b"), slow: css("--band-slow"), hitch: css("--band-hitch"), sel: css("--sel"), wait: css("--wait"), cross: css("--cross") }; }
+
 function draw() {
+  palette();
   const threads = visibleThreads();
   layout = [];
-  let y = AXIS_H;
+  let y = 4;
   layout.push({ type: "frames", y, h: FRAME_H }); y += FRAME_H + 4;
   for (const lane of lanes) { layout.push({ type: "lane", lane, y, h: LANE_H }); y += LANE_H + 2; }
   y += 4;
   for (const t of threads) { const h = t.levels * LEVEL_H + 4; layout.push({ type: "thread", thread: t, y, h }); y += h + 3; }
-  const dpr = window.devicePixelRatio || 1, w = W(), h = Math.max(y + 10, view.clientHeight);
-  canvas.width = w * dpr; canvas.height = h * dpr; canvas.style.width = w + "px"; canvas.style.height = h + "px";
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.fillStyle = css("--bg"); ctx.fillRect(0, 0, w, h);
+  const dpr = window.devicePixelRatio || 1, w = W(), h = Math.max(y + 10, view.clientHeight - AXIS_H);
+  for (const [cv, ch] of [[canvas, h], [over, h], [ruler, AXIS_H]]) {
+    cv.width = w * dpr; cv.height = ch * dpr; cv.style.width = w + "px"; cv.style.height = ch + "px"; }
+  over.style.top = AXIS_H + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); octx.setTransform(dpr, 0, 0, dpr, 0, 0); rctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = P.bg; ctx.fillRect(0, 0, w, h);
   ctx.font = "11px system-ui, sans-serif"; ctx.textBaseline = "middle";
-  // axis
-  const span = t1 - t0, step = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 60000].find(s => span / s < (w - LABEL_W) / 90) || 60000;
-  ctx.fillStyle = css("--muted"); ctx.strokeStyle = css("--line");
-  for (let g = Math.ceil(t0 / step) * step; g <= t1; g += step) { const gx = x(g);
-    ctx.fillText(g >= 1000 ? (g / 1000).toFixed(step < 1000 ? 2 : 0) + " s" : g + " ms", gx + 2, 10);
-    ctx.beginPath(); ctx.moveTo(gx, AXIS_H - 4); ctx.lineTo(gx, h); ctx.stroke(); }
+  ctx.strokeStyle = P.line;
+  for (const g of ticks().at) { const gx = Math.round(x(g)) + 0.5; ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, h); ctx.stroke(); }
   for (const row of layout) {
-    ctx.fillStyle = css("--muted");
+    ctx.fillStyle = P.muted;
     if (row.type === "frames") { ctx.fillText("frames", 6, row.y + row.h / 2); drawFrames(row); }
     else if (row.type === "lane") { ctx.fillText(row.lane.label, 6, row.y + row.h / 2); drawLane(row); }
-    else { const t = row.thread; ctx.fillStyle = css("--ink");
+    else { const t = row.thread; ctx.fillStyle = P.ink;
       ctx.fillText((t.main ? "main thread" : (t.name || "thread") + (t.frameThread ? " (presents)" : "")).slice(0, 22), 6, row.y + 7);
-      ctx.fillStyle = css("--muted"); ctx.fillText(`${t.tid}  ${(t.onCpu * D.periodMs / 1000).toFixed(2)} s cpu`, 6, row.y + 19);
+      ctx.fillStyle = P.muted; ctx.fillText(`${t.tid}  ${(t.onCpu * D.periodMs / 1000).toFixed(2)} s cpu`, 6, row.y + 19);
       drawThread(row); }
   }
-  if (selected) { ctx.fillStyle = css("--sel"); ctx.globalAlpha = 0.15;
-    ctx.fillRect(x(selected.start), AXIS_H, Math.max(1, x(selected.end) - x(selected.start)), h); ctx.globalAlpha = 1; }
+  if (selected) { ctx.fillStyle = P.sel; ctx.globalAlpha = 0.15;
+    ctx.fillRect(x(selected.start), 0, Math.max(1, x(selected.end) - x(selected.start)), h); ctx.globalAlpha = 1; }
+  document.getElementById("span").textContent = `view ${fmtDur(t1 - t0)}`;
+  document.getElementById("back").disabled = !zoomHistory.length;
+  drawOverlay();
 }
 function drawFrames(row) {
-  const a = lower(D.frames.map(f => f[1]), t0);
-  for (let i = a; i < D.frames.length && D.frames[i][0] <= t1; i++) {
-    const [s, e, n] = D.frames[i], ms = e - s;
-    ctx.fillStyle = ms > D.hitchMs ? css("--band-hitch") : ms > 33.4 ? css("--band-slow") : (n % 2 ? css("--band-a") : css("--band-b"));
-    const xs = Math.max(LABEL_W, x(s)), xe = x(e); if (xe < LABEL_W) continue;
-    ctx.fillRect(xs, row.y, Math.max(1, xe - xs - (xe - xs > 3 ? 1 : 0)), row.h);
+  const w = W();
+  ctx.save(); ctx.font = "10px system-ui, sans-serif";
+  for (let i = lower(frameEnds, t0); i < D.frames.length && D.frames[i][0] <= t1; i++) {
+    const [s, e, n] = D.frames[i], ms = e - s, hitch = ms > D.hitchMs, slow = ms > SLOW_MS;
+    const xs = Math.max(LABEL_W, x(s)), xe = Math.min(w, x(e)); if (xe < LABEL_W) continue;
+    const bw = Math.max(1, xe - xs - (xe - xs > 3 ? 1 : 0));
+    ctx.fillStyle = hitch ? P.hitch : slow ? P.slow : (n % 2 ? P.a : P.b);
+    ctx.fillRect(xs, row.y, bw, row.h);
+    const label = bw > 74 ? `#${n}  ${ms.toFixed(1)} ms` : bw > 30 ? ms.toFixed(1) : "";
+    if (label) { ctx.save(); ctx.beginPath(); ctx.rect(xs, row.y, bw, row.h); ctx.clip();
+      ctx.fillStyle = hitch ? "#fff" : P.ink; ctx.fillText(label, xs + 3, row.y + row.h / 2); ctx.restore(); }
   }
+  if (selected && selected.frame !== null) { ctx.strokeStyle = P.sel; ctx.lineWidth = 2;
+    ctx.strokeRect(x(selected.start) + 1, row.y + 1, Math.max(2, x(selected.end) - x(selected.start) - 2), row.h - 2); }
+  ctx.restore();
 }
 function drawLane(row) {
   ctx.fillStyle = MARK_COLORS[row.lane.kind] || "#888";
@@ -398,7 +508,7 @@ function drawLane(row) {
 }
 function sampleAt(t, time) { const i = lower(t.t, time); return i < t.t.length && t.t[i] - time <= D.periodMs * 1.5 ? i : -1; }
 function drawThread(row) {
-  const t = row.thread, w = W(), wait = css("--wait");
+  const t = row.thread, w = W(), wait = P.wait;
   const cols = new Int32Array(w).fill(-1);
   for (let px = LABEL_W; px < w; px++) cols[px] = sampleAt(t, tAt(px));
   for (let level = 0; level < t.levels; level++) {
@@ -418,9 +528,78 @@ function drawThread(row) {
 const pathCache = new Map(); const rawPath = path;
 path = n => { let p = pathCache.get(n); if (!p) { p = rawPath(n); if (pathCache.size > 50000) pathCache.clear(); pathCache.set(n, p); } return p; };
 
+// ---- ruler, crosshair and range overlay: redrawn on every pointer move, so they never repaint the sample rows
+function drawRuler() {
+  const w = W(); rctx.fillStyle = P.bg; rctx.fillRect(0, 0, w, AXIS_H);
+  rctx.font = "11px system-ui, sans-serif"; rctx.textBaseline = "middle";
+  rctx.strokeStyle = P.line; rctx.beginPath(); rctx.moveTo(0, AXIS_H - 0.5); rctx.lineTo(w, AXIS_H - 0.5); rctx.stroke();
+  const { at, labels } = ticks();
+  rctx.fillStyle = P.muted;
+  at.forEach((g, i) => { const gx = Math.round(x(g)) + 0.5; if (gx < LABEL_W) return;
+    rctx.beginPath(); rctx.moveTo(gx, AXIS_H - 6); rctx.lineTo(gx, AXIS_H); rctx.stroke(); rctx.fillText(labels[i], gx + 3, 9); });
+  rctx.fillStyle = P.bg; rctx.fillRect(0, 0, LABEL_W, AXIS_H);
+  rctx.fillStyle = P.muted; rctx.fillText(at.length && (at[1] - at[0]) < 10 ? "time (offsets)" : "time", 6, 9);
+  if (range) { const a = Math.max(LABEL_W, x(Math.min(range.a, range.b))), b = x(Math.max(range.a, range.b));
+    rctx.fillStyle = P.sel; rctx.globalAlpha = 0.3; rctx.fillRect(a, 0, Math.max(1, b - a), AXIS_H); rctx.globalAlpha = 1; }
+  if (hover && hover.x > LABEL_W) { const label = fmtCursor(tAt(hover.x));
+    rctx.font = "bold 11px system-ui, sans-serif"; const tw = rctx.measureText(label).width + 8;
+    const bx = Math.min(hover.x - tw / 2, w - tw); rctx.fillStyle = P.cross; rctx.fillRect(Math.max(LABEL_W, bx), 1, tw, AXIS_H - 3);
+    rctx.fillStyle = P.bg; rctx.fillText(label, Math.max(LABEL_W, bx) + 4, 9); }
+}
+function pill(c, text, px, py, color) {
+  c.font = "10px system-ui, sans-serif"; const tw = Math.min(c.measureText(text).width, 260) + 6, w = W();
+  const bx = px + 6 + tw > w ? px - 6 - tw : px + 6;
+  c.fillStyle = P.bg; c.globalAlpha = 0.85; c.fillRect(bx, py - 6, tw, 12); c.globalAlpha = 1;
+  c.save(); c.beginPath(); c.rect(bx, py - 6, tw, 12); c.clip();
+  c.fillStyle = color || P.ink; c.textBaseline = "middle"; c.fillText(text, bx + 3, py); c.restore();
+}
+function drawOverlay() {
+  const w = W(), h = over.height / (window.devicePixelRatio || 1);
+  octx.clearRect(0, 0, w, h);
+  const top = view.scrollTop, bottom = top + view.clientHeight - AXIS_H;
+  if (range) {
+    const lo = Math.min(range.a, range.b), hi = Math.max(range.a, range.b);
+    const a = Math.max(LABEL_W, x(lo)), b = Math.min(w, x(hi));
+    octx.fillStyle = P.sel; octx.globalAlpha = 0.18; octx.fillRect(a, 0, Math.max(1, b - a), h); octx.globalAlpha = 1;
+    octx.strokeStyle = P.sel; octx.beginPath(); octx.moveTo(a + 0.5, 0); octx.lineTo(a + 0.5, h); octx.moveTo(b - 0.5, 0); octx.lineTo(b - 0.5, h); octx.stroke();
+    octx.font = "bold 12px system-ui, sans-serif"; const text = fmtDur(hi - lo), tw = octx.measureText(text).width + 12;
+    const cx = Math.min(Math.max((a + b) / 2 - tw / 2, LABEL_W), w - tw);
+    octx.fillStyle = P.sel; octx.fillRect(cx, top + 6, tw, 18);
+    octx.fillStyle = "#fff"; octx.textBaseline = "middle"; octx.fillText(text, cx + 6, top + 15);
+  }
+  if (hover && hover.x > LABEL_W && !(drag && drag.mode === "pan")) {
+    const px = Math.round(hover.x) + 0.5, time = tAt(hover.x);
+    octx.strokeStyle = P.cross; octx.globalAlpha = 0.6; octx.beginPath(); octx.moveTo(px, 0); octx.lineTo(px, h); octx.stroke(); octx.globalAlpha = 1;
+    for (const row of layout) { if (row.y + row.h < top || row.y > bottom) continue;
+      const v = rowValue(row, time); if (v) pill(octx, v.text, px, row.y + Math.min(row.h / 2, 8), v.color); }
+  }
+  drawRuler();
+}
+
+// ---- what sits under the pointer
 function frameAt(time) {
-  for (const f of D.frames) if (f[0] <= time && time <= f[1]) return { start: f[0], end: f[1], frame: f[2] };
+  const i = lower(frameEnds, time); const f = D.frames[i];
+  if (f && f[0] <= time) return { start: f[0], end: f[1], frame: f[2] };
   return { start: time - 8, end: time + 8, frame: null };
+}
+function markAt(lane, time) { const slack = 2 * (t1 - t0) / W(); return lane.marks.find(m => m[0] <= time + slack && time <= m[1] + slack); }
+// one short value per row for the crosshair; rows without a value at this time stay quiet
+function rowValue(row, time) {
+  if (row.type === "frames") { const f = frameAt(time); if (f.frame === null) return null; const ms = f.end - f.start;
+    return { text: `#${f.frame}  ${ms.toFixed(1)} ms`, color: ms > D.hitchMs ? P.hitch : null }; }
+  if (row.type === "lane") { const m = markAt(row.lane, time); return m ? { text: m[3] } : null; }
+  if (row.type === "thread") { const t = row.thread, s = sampleAt(t, time); if (s < 0) return null; const p = path(t.node[s]);
+    if (!p.length) return null; return { text: (t.wait[s] ? "waiting: " : "") + funcs[p[p.length - 1]][0], color: t.wait[s] ? P.muted : null }; }
+  return null;
+}
+// the longer text for the row the pointer is on
+function rowDetail(row, time, y) {
+  if (row.type === "frames") { const f = frameAt(time); return f.frame !== null ? `frame ${f.frame}: ${(f.end - f.start).toFixed(2)} ms` : ""; }
+  if (row.type === "lane") { const m = markAt(row.lane, time); return m ? `${m[2]}: ${m[3]} (${fmtDur(m[1] - m[0])})` : ""; }
+  if (row.type === "thread") { const t = row.thread, s = sampleAt(t, time); if (s < 0) return ""; const p = path(t.node[s]);
+    const level = Math.floor((y - row.y - 2) / LEVEL_H), f = p[Math.min(level, p.length - 1)];
+    return f === undefined ? "" : (t.wait[s] ? "[waiting] " : "") + `${funcs[f][0]}  (${funcs[f][1]}, depth ${Math.min(level, p.length - 1)} of ${p.length})`; }
+  return "";
 }
 function esc(s) { return String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]); }
 function showSelection(threadFocus) {
@@ -443,40 +622,89 @@ function showSelection(threadFocus) {
   if (D.credits && D.credits.length) html += `<p class="hint">${D.credits.map(esc).join("<br>")}</p>`;
   side.innerHTML = html;
 }
+function clearSelection() { selected = null; side.innerHTML = SIDE_HINT; draw(); }
 function rowAt(y) { return layout.find(r => y >= r.y && y < r.y + r.h + 2); }
 
-let drag = null;
-canvas.addEventListener("mousedown", e => { drag = { x: e.offsetX, t0, t1, moved: false }; });
+// ---- pointer: plain drag selects a range and zooms to it; Alt/Shift/middle drag pans
+function localX(e) { return e.clientX - canvas.getBoundingClientRect().left; }
+function localY(e) { return e.clientY - canvas.getBoundingClientRect().top; }
+function startDrag(e, onRuler) {
+  const px = localX(e); if (px <= LABEL_W && e.button === 0) return;
+  e.preventDefault();
+  const pan = e.button === 1 || e.altKey || e.shiftKey;
+  drag = { mode: pan ? "pan" : "range", x: px, y: localY(e), t0, t1, time: tAt(px), moved: false, onRuler, remembered: false };
+}
+canvas.addEventListener("mousedown", e => startDrag(e, false));
+ruler.addEventListener("mousedown", e => startDrag(e, true));
+window.addEventListener("mousemove", e => {
+  const px = localX(e), py = localY(e);
+  if (drag) {
+    if (Math.abs(px - drag.x) > 3) drag.moved = true;
+    hover = { x: px, y: py }; tip.style.display = "none";
+    if (drag.mode === "pan") { if (!drag.moved) return;
+      if (!drag.remembered) { zoomHistory.push([drag.t0, drag.t1]); drag.remembered = true; }
+      const dt = (px - drag.x) / (W() - LABEL_W) * (drag.t1 - drag.t0); t0 = drag.t0 - dt; t1 = drag.t1 - dt; draw(); }
+    else if (drag.moved) { range = { a: drag.time, b: tAt(Math.max(LABEL_W, Math.min(W(), px))) }; drawOverlay(); }
+    return;
+  }
+  const inside = e.target === canvas || e.target === ruler;
+  if (!inside) { if (hover) { hover = null; tip.style.display = "none"; drawOverlay(); } return; }
+  hover = { x: px, y: py }; drawOverlay();
+  const row = e.target === canvas ? rowAt(py) : null, time = tAt(px);
+  if (px <= LABEL_W) { tip.style.display = "none"; return; }
+  const detail = row ? rowDetail(row, time, py) : "";
+  let html = `<b>${esc(fmtCursor(time))}</b>`;
+  if (selected) html += ` <span class="hint">${esc((time >= selected.start ? "+" : "") + fmtDur(time - selected.start))} from selection</span>`;
+  if (detail) html += "<br>" + esc(detail);
+  tip.innerHTML = html; tip.style.display = "block";
+  tip.style.left = Math.min(e.clientX + 12, window.innerWidth - 530) + "px"; tip.style.top = e.clientY + 14 + "px";
+});
 window.addEventListener("mouseup", e => {
-  if (drag && !drag.moved && e.target === canvas && e.offsetX > LABEL_W) {
-    const row = rowAt(e.offsetY); selected = frameAt(tAt(e.offsetX));
-    showSelection(row && row.type === "thread" ? row.thread : null); draw();
+  if (!drag) return;
+  const d = drag; drag = null;
+  if (d.mode === "range") {
+    if (d.moved && range) { const lo = Math.min(range.a, range.b), hi = Math.max(range.a, range.b); range = null; setView(lo, hi, true); return; }
+    range = null;
+    if (!d.moved && !d.onRuler && e.target === canvas && d.x > LABEL_W) {
+      const row = rowAt(d.y); selected = frameAt(tAt(d.x));
+      showSelection(row && row.type === "thread" ? row.thread : null); draw(); return; }
+    drawOverlay();
   }
-  drag = null;
 });
-canvas.addEventListener("mousemove", e => {
-  if (drag) { const dx = e.offsetX - drag.x; if (Math.abs(dx) > 2) drag.moved = true;
-    const dt = dx / (W() - LABEL_W) * (drag.t1 - drag.t0); t0 = drag.t0 - dt; t1 = drag.t1 - dt; draw(); tip.style.display = "none"; return; }
-  const row = rowAt(e.offsetY), time = tAt(e.offsetX); let text = "";
-  if (row && e.offsetX > LABEL_W) {
-    if (row.type === "frames") { const f = frameAt(time); if (f.frame !== null) text = `frame ${f.frame}: ${(f.end - f.start).toFixed(1)} ms`; }
-    else if (row.type === "lane") { const m = row.lane.marks.find(m => m[0] <= time + 2 * (t1 - t0) / W() && time <= m[1] + 2 * (t1 - t0) / W());
-      if (m) text = `${m[2]}: ${m[3]} (${(m[1] - m[0]).toFixed(1)} ms)`; }
-    else { const t = row.thread, s = sampleAt(t, time); if (s >= 0) { const p = path(t.node[s]);
-      const level = Math.floor((e.offsetY - row.y - 2) / LEVEL_H);
-      const f = p[Math.min(level, p.length - 1)];
-      if (f !== undefined) text = (t.wait[s] ? "[waiting] " : "") + `${funcs[f][0]}  (${funcs[f][1]}, depth ${Math.min(level, p.length - 1)} of ${p.length})`; } }
-  }
-  if (text) { tip.textContent = text; tip.style.display = "block"; tip.style.left = Math.min(e.clientX + 12, window.innerWidth - 530) + "px"; tip.style.top = e.clientY + 14 + "px"; }
-  else tip.style.display = "none";
-});
-canvas.addEventListener("mouseleave", () => { tip.style.display = "none"; });
-canvas.addEventListener("wheel", e => {
-  e.preventDefault(); const at = tAt(e.offsetX), k = Math.exp(e.deltaY * 0.0015);
-  const span = Math.min(Math.max((t1 - t0) * k, 2), D.durationMs * 1.2); const f = (at - t0) / (t1 - t0);
-  t0 = at - f * span; t1 = t0 + span; draw();
+canvas.addEventListener("mouseleave", () => { if (!drag) { hover = null; tip.style.display = "none"; drawOverlay(); } });
+ruler.addEventListener("mouseleave", () => { if (!drag) { hover = null; tip.style.display = "none"; drawOverlay(); } });
+for (const target of [canvas, ruler]) target.addEventListener("wheel", e => {
+  e.preventDefault(); const px = localX(e);
+  if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+    const d = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY; panBy(d / (W() - LABEL_W) * (t1 - t0)); return; }
+  // one history entry per wheel gesture, not per notch
+  const now = performance.now(), fresh = now - wheelAt > 400; wheelAt = now;
+  const at = tAt(Math.max(px, LABEL_W)), k = Math.exp(e.deltaY * 0.0015), f = (at - t0) / (t1 - t0), span = (t1 - t0) * k;
+  setView(at - f * span, at - f * span + span, fresh);
 }, { passive: false });
-canvas.addEventListener("dblclick", () => { t0 = 0; t1 = Math.max(D.durationMs, 1); draw(); });
+view.addEventListener("scroll", () => drawOverlay());
+canvas.addEventListener("dblclick", fit);
+window.addEventListener("keydown", e => {
+  if (e.target instanceof HTMLInputElement || e.metaKey || e.ctrlKey) return;
+  const at = hover && hover.x > LABEL_W ? tAt(hover.x) : undefined;
+  if (e.key === "Escape") {
+    if (help.classList.contains("open")) help.classList.remove("open");
+    else if (drag) { drag = null; range = null; drawOverlay(); }
+    else clearSelection();
+  }
+  else if (e.key === "?") help.classList.toggle("open");
+  else if (e.key === "Backspace") { e.preventDefault(); back(); }
+  else if (e.key === "+" || e.key === "=") zoomBy(0.5, at);
+  else if (e.key === "-" || e.key === "_") zoomBy(2, at);
+  else if (e.key === "0" || e.key === "f") fit();
+  else if (e.key === "ArrowLeft") { e.preventDefault(); panBy(-(t1 - t0) / 5); }
+  else if (e.key === "ArrowRight") { e.preventDefault(); panBy((t1 - t0) / 5); }
+});
+help.addEventListener("click", e => { if (e.target === help) help.classList.remove("open"); });
+document.getElementById("zout").addEventListener("click", () => zoomBy(2));
+document.getElementById("back").addEventListener("click", back);
+document.getElementById("fit").addEventListener("click", fit);
+document.getElementById("helpbtn").addEventListener("click", () => help.classList.toggle("open"));
 document.getElementById("idle").addEventListener("change", e => { showIdle = e.target.checked; draw(); });
 window.addEventListener("resize", draw);
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", draw);
