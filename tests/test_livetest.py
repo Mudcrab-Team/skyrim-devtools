@@ -144,6 +144,12 @@ class LiveTest(unittest.TestCase):
         self.assertEqual(manager.stops, 1)
         self.assertEqual(livetest.split_command("a.py x", "/c"), ("a.py", ["x", "--config", "/c"]))
 
+    def test_standalone_scripts_do_not_start_the_shared_game_between_perf_readings(self):
+        requests = [self.req("s1", script="tests/live/standalone.py"), self.req("s2", script="tests/live/standalone.py")]
+        manager, batch = self.run_batch(requests, perf_interval=3600)
+        self.assertEqual(manager.starts, 1)
+        self.assertEqual(len(batch.perf), 1)
+
     def test_script_error_and_timeout_are_errors(self):
         manager, batch = self.run_batch([self.req("e", script="tests/live/boom.py")])
         self.assertEqual(batch.outcomes["e"][0]["status"], "error")
@@ -165,7 +171,7 @@ class LiveTest(unittest.TestCase):
         requests = [self.req("c", script="tests/live/die.py")]
         manager, batch = self.run_batch(requests)
         self.assertEqual(batch.outcomes["c"][0]["status"], "crash")
-        self.assertEqual(manager.starts, 3)
+        self.assertEqual(manager.starts, 2)
         self.assertEqual(len(batch.outcomes["c"]), 2)
 
     def test_manual_case_takes_screenshot(self):
