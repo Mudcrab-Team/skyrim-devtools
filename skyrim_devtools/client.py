@@ -282,6 +282,66 @@ class Session:
     async def camera_look_at(self, ref_id=None, x=None, y=None, z=None):
         return await self._call_set("Camera.lookAt", refID=ref_id, x=x, y=y, z=z)
 
+    async def camera_pose(self):
+        return await self.call("Camera.pose")
+
+    async def camera_mode(self, mode, freeze_time=None):
+        return await self._call_set("Camera.mode", mode=mode, freezeTime=freeze_time)
+
+    async def camera_free(self, on, pos=None, yaw_deg=None, pitch_deg=None, fov=None, freeze_time=None):
+        return await self._call_set("Camera.free", on=on, pos=pos, yawDeg=yaw_deg, pitchDeg=pitch_deg, fov=fov,
+                                    freezeTime=freeze_time)
+
+    async def camera_auto_vanity(self, allow=None):
+        return await self._call_set("Camera.autoVanity", allow=allow)
+
+    async def ui_find(self, menu, name=None, text=None, path=None, depth=None, limit=None):
+        return await self._call_set("UI.find", menu=menu, name=name, text=text, path=path, depth=depth, limit=limit)
+
+    async def papyrus_classes(self, filter=None, prefix=None, offset=None, limit=None, detail=None):
+        return await self._call_set("Papyrus.classes", filter=filter, prefix=prefix, offset=offset, limit=limit,
+                                    detail=detail)
+
+    async def papyrus_functions(self, class_name, filter=None, kind=None, offset=None, limit=None):
+        return await self._call_set("Papyrus.functions", **{"class": class_name}, filter=filter, kind=kind,
+                                    offset=offset, limit=limit)
+
+    async def papyrus_call(self, function, class_name=None, args=None, form=None, alias=None, timeout_ms=None):
+        """Call a global (class + function) or a member function of a form or quest alias; returns the value."""
+        wait = (timeout_ms or 10000) / 1000 + 10
+        return await self._call_set("Papyrus.call", timeout=wait, function=function, args=args or [], form=form,
+                                    alias=alias, timeoutMs=timeout_ms, **({"class": class_name} if class_name else {}))
+
+    async def forms_find(self, type=None, editor_id=None, name=None, plugin=None, offset=None, limit=None):
+        return await self._call_set("Forms.find", timeout=40, type=type, editorID=editor_id, name=name, plugin=plugin,
+                                    offset=offset, limit=limit)
+
+    async def forms_info(self, form_id=None, editor_id=None):
+        return await self._call_set("Forms.info", formID=form_id, editorID=editor_id)
+
+    async def idles_list(self, ref, filter=None, plugin=None, playable=None, offset=None, limit=None):
+        return await self._call_set("Idles.list", ref=ref, filter=filter, plugin=plugin, playable=playable,
+                                    offset=offset, limit=limit)
+
+    async def idles_play(self, ref, idle):
+        return await self.call("Idles.play", ref=ref, idle=idle)
+
+    async def idles_stop(self, ref):
+        return await self.call("Idles.stop", ref=ref)
+
+    async def map_waypoint(self):
+        return await self.call("Map.getWaypoint")
+
+    async def map_set_waypoint(self, x, y, z=None):
+        return await self._call_set("Map.setWaypoint", x=x, y=y, z=z)
+
+    async def map_clear_waypoint(self):
+        return await self.call("Map.clearWaypoint")
+
+    async def map_markers(self, contains=None, visible=None, can_travel=None, offset=None, limit=None):
+        return await self._call_set("Map.markers", contains=contains, visible=visible, canTravel=can_travel,
+                                    offset=offset, limit=limit)
+
     async def nav_goto(self, goal, mode="input", timeout_s=None, **options):
         """Start a navigation process; follow it with nav_status or wait_nav."""
         return await self._call_set("Nav.goto", goal=goal, mode=mode, timeoutS=timeout_s, **options)
