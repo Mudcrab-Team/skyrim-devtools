@@ -57,7 +57,8 @@ class Host:
         destination = config["sshDestination"]
         if not isinstance(destination, str) or not destination or destination.startswith("-"):
             fail("Set an SSH destination or alias in the local configuration")
-        opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15"]
+        opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15",
+                "-o", "ServerAliveCountMax=20"]
         if path := config.get("sshConfig"):
             opts += ["-F", str(Path(path).expanduser())]
         self.opts = opts
