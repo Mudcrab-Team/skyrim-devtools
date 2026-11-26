@@ -160,7 +160,6 @@ copy of the profile rather than the profile you play, and start the game through
 `SKYRIM_DEVTOOLS_IMAGE` to the hash of the executable the profile runs. The plugin then works as in the
 pinned setup; mod DLLs appear as `skse-plugin` modules, named from the PDBs they ship.
 
-<<<<<<< HEAD
 ## I/O and load traces
 
 The sampling profiler shows where CPU time goes; during a load the main thread mostly waits, so the I/O trace
@@ -202,7 +201,7 @@ the top calling functions, I/O and CPU time per thread, then DLL load times and 
 An I/O trace holds file paths of the local setup and game addresses; keep it local like a profile. The trace
 costs a few microseconds per call; reads are recorded even when they hit the file cache, so latency, not
 count, separates disk from memory.
-=======
+
 ### Profiles with local saves
 
 When the profile uses local saves, MO2 redirects the game's save path to the virtual folder `__MO_Saves`; the
@@ -221,7 +220,6 @@ Tests must never touch a user's real saves, so the folder is accepted only when 
 
 Anything else, including a played profile with local saves, is refused with a not-ready error. The same rule
 applies to `Session.listSaves`, so a refused profile's saves are not listed either.
->>>>>>> origin/mo2-local-saves
 
 ## Limits
 
