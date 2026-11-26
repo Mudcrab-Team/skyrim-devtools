@@ -303,6 +303,30 @@ namespace
         return total;
     }
 
+    // What combat_unequip took off, per hand, so drawing again brings the weapon back instead of fists.
+    RE::FormID unequippedRight = 0;
+    RE::FormID unequippedLeft = 0;
+
+    void RestoreUnequipped(RE::PlayerCharacter& player)
+    {
+        const auto manager = RE::ActorEquipManager::GetSingleton();
+        if (!manager) {
+            return;
+        }
+        const auto restore = [&](RE::FormID& id, bool left) {
+            if (!id) {
+                return;
+            }
+            const auto object = RE::TESForm::LookupByID<RE::TESBoundObject>(id);
+            id = 0;
+            if (object && !player.GetEquippedObject(left) && player.GetInventoryCounts().contains(object)) {
+                manager->EquipObject(&player, object, nullptr, 1, HandSlot(left), true, false, true, false);
+            }
+        };
+        restore(unequippedRight, false);
+        restore(unequippedLeft, true);
+    }
+
     Json PlayerVitals(RE::PlayerCharacter& player)
     {
         return Json{ { "health", Vital(player, RE::ActorValue::kHealth) }, { "magicka", Vital(player, RE::ActorValue::kMagicka) },
@@ -321,6 +345,7 @@ DEVTOOLS_MODULE(Combat)
 
         Json self = PlayerVitals(player);
         self["dead"] = player.IsDead();
+        self["level"] = player.GetLevel();
         self["inCombat"] = player.IsInCombat();
         self["weapon"] = WeaponStateName(state->GetWeaponState());
         self["drawn"] = state->IsWeaponDrawn();
@@ -392,6 +417,9 @@ DEVTOOLS_MODULE(Combat)
         auto& player = RequirePlayer();
         RequireCombatReady(player);
         const bool on = Optional<bool>(params, "on", true);
+        if (on) {
+            RestoreUnequipped(player);
+        }
         player.DrawWeaponMagicHands(on);
         return Json{ { "requested", on ? "draw" : "sheathe" }, { "weapon", WeaponStateName(player.AsActorState()->GetWeaponState()) } };
     }, { .thread = Thread::Main });
@@ -446,6 +474,7 @@ DEVTOOLS_MODULE(Combat)
             // Spells leave a hand by being replaced, not removed; the engine has no direct unequip for them.
             throw RpcError(code::invalidParams, "A spell cannot be unequipped; equip a weapon or fists over it");
         }
+        (left ? unequippedLeft : unequippedRight) = current->GetFormID();
         manager->UnequipObject(&player, current->As<RE::TESBoundObject>(), nullptr, 1, HandSlot(left));
         return Json{ { "unequipped", Equipped(current) }, { "queued", true } };
     }, { .thread = Thread::Main });

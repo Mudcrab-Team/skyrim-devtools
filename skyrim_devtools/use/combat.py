@@ -19,11 +19,12 @@ def dumps(value):
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
 
 
-def decide(state, style="melee", drink_below=35, block_incoming=True, have_potion=True):
+def decide(state, style="melee", drink_below=35, block_incoming=True, have_potion=True, have_heal_spell=False,
+           retreat_below=0):
     """Choose the next action from a Combat.state reply.
 
-    Returns (action, argument): ("done", "clear"|"dead"), ("drink", "health"), ("approach", distance),
-    ("block", None), ("cast", None), ("attack", "light"|"power").
+    Returns (action, argument): ("done", "clear"|"dead"), ("drink", "health"), ("heal", "spell"),
+    ("retreat", None), ("approach", distance), ("block", None), ("cast", None), ("attack", "light"|"power").
     """
     player = state.get("player", {})
     hostiles = state.get("hostiles", [])
@@ -32,8 +33,14 @@ def decide(state, style="melee", drink_below=35, block_incoming=True, have_potio
     if not hostiles:
         return "done", "clear"
     health = player.get("health", {}).get("pct", 100)
-    if have_potion and health < drink_below:
-        return "drink", "health"
+    if health < drink_below:
+        if have_potion:
+            return "drink", "health"
+        magicka = player.get("magicka", {}).get("pct", 100)
+        if have_heal_spell and magicka >= 15:
+            return "heal", "spell"
+        if health < retreat_below:
+            return "retreat", None
     # a chosen target that is still alive and in range wins over a nearer bystander
     target = next((h for h in hostiles if h.get("chosen")), hostiles[0])
     reach = MELEE_REACH if style not in CASTER_STYLES else 1400.0
@@ -48,6 +55,42 @@ def decide(state, style="melee", drink_below=35, block_incoming=True, have_potio
         return "cast", None
     stamina = player.get("stamina", {}).get("pct", 100)
     return "attack", "power" if stamina >= POWER_STAMINA_PCT and target.get("health", {}).get("pct", 100) > 60 else "light"
+
+
+def assess(state, trades=(), margin=1.6):
+    """Judge whether the fight is a bad one: (outmatched, reason).
+
+    Two signals. Level and health: the summed levels of the enemies near us, weighted by their health, against
+    our level weighted by ours (margin 1.6 plus a little slack), or one enemy far above our level. Trades: over
+    the recorded (our health pct, target health pct) rounds, we lost a lot and the target lost much less.
+    """
+    player = state.get("player", {})
+    level = player.get("level")
+    near = [h for h in state.get("hostiles", []) if h.get("distance", 0) < 1500]
+    if level and near:
+        own = level * max(player.get("health", {}).get("pct", 100), 10) / 100.0
+        theirs = sum(h.get("level", 1) * max(h.get("health", {}).get("pct", 100), 10) / 100.0 for h in near)
+        if theirs > margin * own + 2:
+            return True, f"enemy strength {theirs:.0f} against ours {own:.0f} (levels {[h.get('level') for h in near]} vs {level})"
+        top = max(h.get("level", 1) for h in near)
+        if top >= level + 10:
+            return True, f"an enemy of level {top} against our level {level}"
+    if len(trades) >= 5:
+        lost = trades[0][0] - trades[-1][0]
+        dealt = trades[0][1] - trades[-1][1]
+        if lost >= 40 and dealt < lost * 0.5:
+            return True, f"losing trades: we lost {lost:.0f}% health, the target {dealt:.0f}%"
+    return False, ""
+
+
+def healing_spells(spells):
+    """Self-cast healing spells from a Player.spells reply."""
+    found = []
+    for spell in spells.get("spells", []):
+        name = (spell.get("name") or "").lower()
+        if ("healing" in name or "wounds" in name) and not any(word in name for word in ("hands", "other", "aura")):
+            found.append(spell["name"])
+    return found
 
 
 def register(mcp, native, manager):
@@ -130,16 +173,30 @@ def register(mcp, native, manager):
 
     @mcp.tool()
     async def combat_fight(style: str = "melee", rounds: int = 40, drink_below: int = 35, radius: float = 2500,
-                           timeout_s: float = 90) -> str:
+                           timeout_s: float = 90, retreat_below: int = 20, stand_ground: bool = False) -> str:
         """Fight the nearby hostiles with a simple loop until none are left, you die, or rounds/timeout run out:
         face the nearest enemy, walk up to it, block when it winds up an attack, otherwise light/power attack
-        (style melee) or cast (style mage), and drink a health potion below drink_below percent health.
-        Returns what happened per round summarised, plus your lowest health. Use the primitives instead
+        (style melee) or cast (style mage). Below drink_below percent health it drinks a health potion, or casts a
+        known self-healing spell when it has no potion; with neither it backs away below retreat_below percent and
+        returns outcome "retreated" (health low, no way to heal) so you can flee with nav_goto or rest.
+        It also judges the fight (enemy levels and health against yours, and trades lost so far) and returns outcome
+        "outmatched" with `assessment` before it loses, at the start or mid-fight; stand_ground=true fights on
+        regardless. Returns what happened per round summarised, plus your lowest health. Use the primitives instead
         when you want to choose each move yourself."""
         started = time.monotonic()
         log = []
         lowest = 100
         potions = 0
+        heals = 0
+        retreats = 0
+        trades = []
+        assessment = None
+        healers = []
+        try:
+            healers = healing_spells(await native("Player.spells", kind="spell"))
+        except Exception:  # an older plugin build: potions only
+            healers = []
+        have_potion = True
         for number in range(1, rounds + 1):
             if time.monotonic() - started > timeout_s:
                 log.append("timeout")
@@ -156,8 +213,21 @@ def register(mcp, native, manager):
                 log.append("menu open: " + ", ".join(blocking))
                 break
             state = await native("Combat.state", radius=radius, limit=6)
-            lowest = min(lowest, state["player"]["health"].get("pct", 100))
-            action, arg = decide(state, style=style, drink_below=drink_below)
+            health = state["player"]["health"].get("pct", 100)
+            lowest = min(lowest, health)
+            hostiles = state.get("hostiles", [])
+            if hostiles:
+                target = next((h for h in hostiles if h.get("chosen")), hostiles[0])
+                trades.append((health, target.get("health", {}).get("pct", 100)))
+                trades = trades[-8:]
+            if not stand_ground and hostiles:
+                outmatched, reason = assess(state, trades)
+                if outmatched:
+                    assessment = reason
+                    log.append("outmatched")
+                    break
+            action, arg = decide(state, style=style, drink_below=drink_below, have_potion=have_potion,
+                                 have_heal_spell=bool(healers), retreat_below=retreat_below)
             if action == "done":
                 log.append(arg)
                 break
@@ -166,9 +236,31 @@ def register(mcp, native, manager):
                     await native("Combat.drink", kind="health")
                     potions += 1
                     log.append("drink")
-                except Exception as error:  # no potion left: keep fighting instead of looping on it
+                except Exception as error:  # no potion left: heal by spell, back away or keep fighting
                     log.append(f"no potion ({error})")
-                    drink_below = -1
+                    have_potion = False
+                continue
+            if action == "heal":
+                try:
+                    await native("Combat.equip", name=healers[0], hand="left")
+                    await asyncio.sleep(0.5)
+                    await native("Combat.cast", hand="left", holdMs=1800, face=False)
+                    heals += 1
+                    log.append("heal")
+                except Exception as error:
+                    log.append(f"heal failed ({error})")
+                    healers = []
+                await asyncio.sleep(0.4)
+                continue
+            if action == "retreat":
+                retreats += 1
+                await native("Combat.target", radius=radius, face=True)
+                await manager.call("Move.walk", timeout=20, direction="back", durationMs=1200, run=True)
+                log.append("retreat")
+                if retreats >= 4:
+                    assessment = "health low and nothing to heal with; backing away did not break contact"
+                    log.append("retreated")
+                    break
                 continue
             await native("Combat.target", radius=radius, face=True)
             if action == "approach":
@@ -189,6 +281,13 @@ def register(mcp, native, manager):
         for item in log:
             summary[item] = summary.get(item, 0) + 1
         final = await native("Combat.state", radius=radius, limit=6)
-        return dumps({"outcome": log[-1] if log else "none", "rounds": len(log), "actions": summary,
-                      "potionsDrunk": potions, "lowestHealthPct": lowest, "elapsedS": round(time.monotonic() - started, 1),
-                      "player": final["player"], "hostilesLeft": final["hostileTotal"], "hostiles": final["hostiles"]})
+        result = {"outcome": log[-1] if log else "none", "rounds": len(log), "actions": summary,
+                  "potionsDrunk": potions, "healCasts": heals, "lowestHealthPct": lowest,
+                  "elapsedS": round(time.monotonic() - started, 1),
+                  "player": final["player"], "hostilesLeft": final["hostileTotal"], "hostiles": final["hostiles"]}
+        if assessment:
+            result["assessment"] = assessment
+        if result["outcome"] in ("outmatched", "retreated"):
+            result["advice"] = ("flee with nav_goto (the enemies keep chasing; a door or a fast travel breaks contact), "
+                                "or call combat_fight again with stand_ground=true to fight on")
+        return dumps(result)

@@ -97,6 +97,30 @@ def image_parts(result):
         return None
 
 
+_STARTED = time.time()
+
+
+def source_mtime():
+    """Newest change among the client's own Python files."""
+    root = Path(__file__).resolve().parent.parent
+    return max((path.stat().st_mtime for path in root.rglob("*.py")), default=0.0)
+
+
+def daemon_state():
+    """Whether the running process predates its sources, so a rebuilt or pulled tree is not silently ignored."""
+    changed = source_mtime()
+    state = {"stale": changed > _STARTED + 1}
+    if state["stale"]:
+        state["warning"] = "the skyrim-use server started before its code last changed; restart it to use the new tools"
+    return state
+
+
+def is_busy_error(error):
+    """The game did not answer in time or the link is being recovered: what a cell load looks like from here."""
+    text = str(error)
+    return "did not answer in time" in text or "-32008" in text
+
+
 def build_server(manager, recorder=None):
     recorder = recorder or Recorder()
 
@@ -143,8 +167,11 @@ def build_server(manager, recorder=None):
     async def game_status() -> str:
         """Phase (idle/starting/running/crashed/stopped/failed), session info and the crash reason if the game
         died (`crash.log` holds the crash logger's exception and top frames when one was written). Probes the live
-        link, so it notices a crash that happened while you were idle."""
-        return dumps(await manager.status())
+        link, so it notices a crash that happened while you were idle. `daemon.stale` is true when this MCP
+        process started before its own source files were last changed: restart it to pick the changes up."""
+        status = await manager.status()
+        status["daemon"] = daemon_state()
+        return dumps(status)
 
     # ---- observation --------------------------------------------------------------------------
 
@@ -187,14 +214,17 @@ def build_server(manager, recorder=None):
         """Inject a keyboard key (name like Tab, E, W, Escape, Grave, F1, or DirectInput scancode 1-255).
         phase `tap` presses and releases after hold_ms (0-10000 ms) and returns once released; use a long
         hold_ms to walk (W for 1500) or hold. `down`/`up` hold across calls; press_release_all frees stuck keys.
-        Ignored during load fades; menus ignore it for ~0.3 s after opening."""
+        Ignored during load fades; menus ignore it for ~0.3 s after opening. Menu lists (inventory, magic,
+        journal) do not take key presses for navigation: use press_control (Accept, Cancel, Up, Down, Left,
+        Right) or ui_select_item instead."""
         return dumps(await manager.call("Input.key", key=key, phase=phase, holdMs=hold_ms))
 
     @mcp.tool()
     async def press_control(name: str, phase: str = "tap", hold_ms: int = 60) -> str:
         """Fire a game control by user-event name (Activate, Journal, Tween Menu, Jump, Sneak, Forward,
         Ready Weapon ...), resolved to whatever key is bound in the current input context. Preferred over
-        press_key because it works inside menus too. hold_ms 0-10000."""
+        press_key because it works inside menus too: Accept, Cancel, Up, Down, Left, Right move through the
+        inventory, magic and journal lists. hold_ms 0-10000."""
         return dumps(await manager.call("Input.control", name=name, phase=phase, holdMs=hold_ms))
 
     @mcp.tool()
@@ -392,6 +422,16 @@ def build_server(manager, recorder=None):
         (lineOfSightChecked:false). force=true skips the reach check. A door starts a load: wait_for
         playable afterwards."""
         return dumps(await native("Ref.activate", refID=ref_id, maxDistance=max_distance, force=True if force else None))
+
+    @mcp.tool()
+    async def quest_targets(quest: str | None = None, limit: int | None = None, include_completed: bool = False) -> str:
+        """Where the quest markers point (Quest.targets): for each displayed objective of the quest (editor id, form
+        id or name; omitted: every running quest, the tracked one first) the target reference the compass is on
+        and, when it lies in another cell, the `tracking` reference to reach first (usually a load door), each
+        with refID, name, position, cell and distance from the player (null when in another cell). Use
+        nav_goto {"questTarget": quest} to walk there. An empty list means the quest shows no marker now."""
+        return dumps(await native("Quest.targets", quest=quest, limit=limit,
+                                  includeCompleted=True if include_completed else None))
 
     @mcp.tool()
     async def quest_active(limit: int | None = None) -> str:
@@ -612,10 +652,16 @@ def build_server(manager, recorder=None):
     async def nav_goto(goal: dict, mode: str = "input", timeout_s: float | None = None, run: bool | None = None,
                        sprint: bool | None = None, on_combat: str | None = None, on_dialogue: str | None = None,
                        on_message_box: str | None = None, on_menu: str | None = None,
-                       invulnerable: bool | None = None, via: list | None = None, route: str | None = None) -> str:
+                       invulnerable: bool | None = None, via: list | None = None, route: str | None = None,
+                       activate: bool | None = None) -> str:
         """Start walking the player to a goal in the background (Nav.goto); returns at once. goal is one of
         {"refID": "0001A2B3"}, {"x":..,"y":..,"z":..}, {"cell": "<editor id>"}, {"place": "Riverwood"} (a
-        location name or id from nav_places) or {"near": "<refID>", "radius": 300}. mode "input" steers with real key presses
+        location name or id from nav_places), {"questTarget": "<quest editor id, id or name>"} (where the compass
+        marker points, see quest_targets; "" takes any running quest) or {"near": "<refID>", "radius": 300}. activate: true
+        stops within activation reach of a reference goal (90 units unless the goal gives a radius) and activates it
+        (open the door, talk to the NPC). Time spent in loading screens does not count against timeout_s. After a
+        door into an exterior the trip prefers the long-range route, and the door just used is not taken back.
+        mode "input" steers with real key presses
         over the loaded navmesh (replans as cells stream in, jumps/strafes/backs up when stuck, uses a load
         door one hop away); mode "ai" hands the player to the engine's pathfinder. Long trips: input mode
         takes a long-range route over the worldspace graph (built offline by skyrim-devtools-navgraph on the
@@ -632,7 +678,8 @@ def build_server(manager, recorder=None):
         trips with the console: `sgtm 4` (also speeds everything else; set back with `sgtm 1`)."""
         return dumps(await native("Nav.goto", goal=goal, mode=mode, timeoutS=timeout_s, run=run, sprint=sprint,
                                   onCombat=on_combat, onDialogue=on_dialogue, onMessageBox=on_message_box,
-                                  onMenu=on_menu, invulnerable=invulnerable, via=via, route=route))
+                                  onMenu=on_menu, invulnerable=invulnerable, via=via, route=route,
+                                  activate=True if activate else None))
 
     @mcp.tool()
     async def nav_plan(ref_id: str | None = None, x: float | None = None, y: float | None = None,
@@ -652,14 +699,26 @@ def build_server(manager, recorder=None):
     @mcp.tool()
     async def nav_wait(timeout_s: float = 120, poll_s: float = 2) -> str:
         """Block until the running navigation ends (arrived/failed/cancelled) or timeout_s (max 300)
-        passes; returns the final summary or the current status. Call again to keep waiting."""
+        passes; returns the final summary or the current status. Call again to keep waiting. A cell load
+        (the game cannot answer for a while) counts as progress: that time is not counted against timeout_s."""
         began = time.monotonic()
+        loading_s = 0.0
         timeout_s = min(max(timeout_s, 1), 300)
         while True:
-            status = await native("Nav.status")
+            tick = time.monotonic()
+            try:
+                status = await native("Nav.status")
+            except GameError as error:
+                if not is_busy_error(error):
+                    raise
+                await asyncio.sleep(max(poll_s, 0.25))
+                loading_s += time.monotonic() - tick
+                continue
             if not status.get("active"):
                 return dumps({"done": True, **(status.get("last") or {})})
-            if time.monotonic() - began >= timeout_s:
+            if status["nav"].get("loading"):
+                loading_s += time.monotonic() - tick + max(poll_s, 0.25)
+            if time.monotonic() - began - loading_s >= timeout_s:
                 return dumps({"done": False, **status["nav"]})
             await asyncio.sleep(max(poll_s, 0.25))
 
