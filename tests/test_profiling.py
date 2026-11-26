@@ -584,3 +584,138 @@ class ViewTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def gpu_raw():
+    raw = raw_profile(RUNS)
+    # GPU clock reads 1000 s less than the CPU clock; the tightest issue bound puts frame 1 at 0-15 ms.
+    raw["gpu"] = {"available": True, "reason": "", "backbuffer": [1920, 1080],
+                  "labels": ["frame", "present", "dsv 2048x2048 array", "rtv 1920x1080", "rtv 960x540"],
+                  "disjointFrames": 0, "staleFrames": 0,
+                  "frames": [[1, 0.0, 15.0, 4.0, 0, [[0, -999.9995], [2, -999.998], [3, -999.994], [4, -999.990], [1, -999.9845]]],
+                             [2, 16.0, 149.0, 4.0, 0, [[0, -999.8508], [3, -999.8506], [1, -999.8505]]]]}
+    raw["counters"] = [[0.0, 100, 2 << 30, 0, 0, 0, 8 << 30], [250.0, 150, 2 << 30, 1 << 20, 0, 1_250_000, 8 << 30]]
+    raw["gpuCounters"] = [[500.0, 70.0, 2048.0]]
+    raw["marks"] = [[2.0, 9.0, "load", "Loading Menu"]]
+    return raw
+
+
+class GpuTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        write_symbols(self.root)
+        self.profile = profiling.Profile(gpu_raw(), profiling.GameSymbols(self.root))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_alignment_and_passes(self):
+        from skyrim_devtools.profile_gpu import gpu_frames, pass_kind
+
+        frames, offset = gpu_frames(self.profile.raw)
+        self.assertAlmostEqual(offset, 999999.5, places=3)
+        self.assertAlmostEqual(frames[0]["gpuStart"], 0.0, places=3)
+        self.assertAlmostEqual(frames[0]["gpuMs"], 15.0, places=3)
+        self.assertAlmostEqual(frames[1]["gpuStart"], 148.7, places=3)
+        kinds = [p[1] for p in frames[0]["passes"]]
+        self.assertEqual(kinds, ["frame", "shadows", "scene", "post"])
+        self.assertEqual(pass_kind("dsv 1920x1080", [1920, 1080]), "main")
+        self.assertEqual(pass_kind("rtv 512x512", [1920, 1080]), "post")
+
+    def test_summary_and_frames(self):
+        from skyrim_devtools.profile_gpu import frame_table
+
+        rows = frame_table(self.profile)
+        self.assertEqual(rows[0]["cpuMs"], 7.0)   # on-CPU samples at 0-5 ms and 9 ms of frame 1 (0-16 ms)
+        self.assertEqual(rows[0]["bound"], "gpu")
+        self.assertTrue(rows[1]["hitch"])
+        self.assertEqual(rows[1]["bound"], "capped")
+        gpu = self.profile.summary()["gpu"]
+        self.assertEqual(gpu["frames"], 2)
+        self.assertEqual(gpu["timedPct"], 100.0)
+        self.assertEqual(gpu["passes"][0]["kind"], "post")
+        text = profiling.render_text(self.profile.summary())
+        self.assertIn("== GPU: 2 of 2 frames timed", text)
+
+    def test_no_gpu_reason(self):
+        raw = raw_profile(RUNS)
+        raw["gpu"] = {"available": False, "reason": "the device refused timestamp queries", "frames": []}
+        summary = profiling.Profile(raw, profiling.GameSymbols(self.root)).summary()
+        self.assertEqual(summary["gpu"]["frames"], 0)
+        self.assertIn("refused", profiling.render_text(summary))
+
+    def test_sqlite_export_and_queries(self):
+        from skyrim_devtools.profile_sqlite import export_sqlite, query
+
+        path = self.root / "out" / "profile.sqlite"
+        counts = export_sqlite(self.profile, path)
+        self.assertEqual(counts["Frames"], 2)
+        self.assertEqual(counts["CpuSamples"], 4)
+        top = query(path, "SELECT name, SUM(weight) AS n FROM LeafSamplesV WHERE state = 'running' "
+                          "GROUP BY name ORDER BY n DESC")
+        self.assertEqual(top["rows"][0], ["id:77+0x10", 4])
+        during_hitch = query(path, "SELECT s.name, SUM(c.weight) FROM CpuSamples c JOIN Frames f ON f.hitch = 1 "
+                                   "AND c.timestamp >= f.start AND c.timestamp < f.end JOIN Callchains cc ON cc.id = c.callchainId "
+                                   "AND cc.depth = 0 JOIN SymbolsV s ON s.id = cc.symbolId GROUP BY s.id")
+        self.assertEqual(during_hitch["rows"], [])  # the toy samples all fall in frame 1
+        gpu_first = query(path, "SELECT frame FROM Frames WHERE gpu_ms > cpu_ms")
+        self.assertEqual(gpu_first["rows"], [[1], [2]])
+        loads = query(path, "SELECT s.name, SUM(c.weight) AS n FROM MarkersV m JOIN CpuSamples c ON c.timestamp >= m.start "
+                            "AND c.timestamp < m.end JOIN Callchains cc ON cc.id = c.callchainId AND cc.depth = 0 "
+                            "JOIN SymbolsV s ON s.id = cc.symbolId WHERE m.kind = 'load' AND c.state = 'running' GROUP BY s.id ORDER BY n DESC")
+        self.assertEqual(loads["rows"][0][0], "Beta::Tick (guess)")
+        counters = query(path, "SELECT name, value FROM CountersV WHERE name IN ('page_faults_per_s', 'gpu_util_pct') ORDER BY name")
+        self.assertEqual(counters["rows"], [["gpu_util_pct", 70.0], ["page_faults_per_s", 200.0]])
+        meta = dict(query(path, "SELECT key, value FROM Meta")["rows"])
+        self.assertIn(profiling.CRASHLOGGER_CREDIT, meta["credits"])
+        passes = query(path, "SELECT kind, COUNT(*) FROM GpuRangesV GROUP BY kind ORDER BY kind")
+        self.assertIn(["shadows", 1], passes["rows"])
+        limited = query(path, "SELECT * FROM CpuSamples", limit=2)
+        self.assertTrue(limited["truncated"])
+        self.assertEqual(len(limited["rows"]), 2)
+
+    def test_documented_queries_run(self):
+        import re
+
+        from skyrim_devtools.profile_sqlite import export_sqlite, query
+
+        path = self.root / "doc.sqlite"
+        export_sqlite(self.profile, path)
+        doc = (Path(__file__).resolve().parent.parent / "docs" / "profiling.md").read_text()
+        blocks = re.findall(r"```sql\n(.*?)```", doc, re.S)
+        self.assertEqual(len(blocks), 3)
+        results = [query(path, sql.strip().rstrip(";")) for sql in blocks]
+        self.assertEqual(results[0]["rows"], [])
+        self.assertEqual([r[0] for r in results[1]["rows"]], [1, 2])
+        self.assertEqual(results[2]["rows"][0][0], "Beta::Tick (guess)")
+
+    def test_query_is_read_only(self):
+        import sqlite3
+
+        from skyrim_devtools.profile_sqlite import export_sqlite, query
+
+        path = self.root / "p.sqlite"
+        export_sqlite(self.profile, path)
+        for sql in ("DELETE FROM Frames", "PRAGMA query_only = OFF", f"ATTACH DATABASE '{self.root / 'x.db'}' AS x",
+                    "CREATE TABLE t (a)", "SELECT 1; DELETE FROM Frames"):
+            with self.assertRaises((sqlite3.DatabaseError, sqlite3.Warning, sqlite3.ProgrammingError), msg=sql):
+                query(path, sql)
+        self.assertFalse((self.root / "x.db").exists())
+        self.assertEqual(query(path, "SELECT COUNT(*) FROM Frames")["rows"], [[2]])
+
+    def test_timeline_has_gpu_rows(self):
+        data = profile_views.timeline_data(self.profile)
+        self.assertEqual(len(data["gpu"]["frames"]), 2)
+        self.assertIn(["rtv 1920x1080", "scene"], data["gpu"]["passes"])
+        html_text = profile_views.timeline_html(self.profile)
+        self.assertIn("GPU passes", html_text)
+
+    def test_save_outputs_writes_sqlite(self):
+        paths, _ = profiling.save_outputs(self.profile, self.root / "saved")
+        self.assertTrue(Path(paths["sqlite"]).is_file())
+
+    def test_top_gpu_timing(self):
+        timing = profile_views._gpu_timing({"frames": 50, "gpuMsP50": 15.5, "gpuMsP95": 16.0, "passes": []}, 16.6, 0.5)
+        self.assertEqual(timing["cpuMsP50"], 8.3)
+        self.assertEqual(timing["bound"], "gpu")

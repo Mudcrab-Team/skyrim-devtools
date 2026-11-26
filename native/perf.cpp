@@ -171,9 +171,11 @@ namespace
             const auto frame = frameCounter.fetch_add(1, std::memory_order_relaxed) + 1;
             Record(QpcSeconds(), frame);
             screen::BeforePresent(swapChain, frame);
+            profiler::GpuBeforePresent(swapChain);
             const double before = QpcSeconds();
             const auto result = originalPresent(swapChain, syncInterval, flags);
             lastPresentMs.store(static_cast<float>((QpcSeconds() - before) * 1000.0), std::memory_order_relaxed);
+            profiler::GpuAfterPresent(frame + 1);
             return result;
         }
         return originalPresent(swapChain, syncInterval, flags);
@@ -251,6 +253,19 @@ namespace devtools::perf
         // Time since the latest present counts as one long frame, so a stalled game shows up at once.
         if (lastPresent > 0.0) {
             out.maxMs = std::max(out.maxMs, (now - lastPresent) * 1000.0);
+        }
+        return out;
+    }
+
+    Json CounterSeries(double from, double to, double origin)
+    {
+        auto out = Json::array();
+        std::lock_guard lock(logMutex);
+        for (const auto& c : counterLog) {
+            if (c.at >= from && c.at <= to) {
+                out.push_back({ std::round((c.at - origin) * 1e5) / 100.0, c.faults, c.workingSet, c.readBytes, c.writeBytes,
+                    c.cpu100ns, c.availPhys });
+            }
         }
         return out;
     }

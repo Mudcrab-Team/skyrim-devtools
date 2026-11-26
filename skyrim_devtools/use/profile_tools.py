@@ -4,11 +4,12 @@ The report names game functions from a local skyrim-research checkout (config "r
 SKYRIM_DEVTOOLS_RESEARCH variable); without one it falls back to Address Library IDs and sub_<rva>.
 """
 
+import asyncio
 import json
 from pathlib import Path
 import time
 
-from .. import profile_views, profiling
+from .. import profile_sqlite, profile_views, profiling
 
 
 def dumps(value):
@@ -16,7 +17,7 @@ def dumps(value):
 
 
 def register(mcp, native, manager, recorder=None):
-    state = {"symbols": None}
+    state = {"symbols": None, "sqlite": None}
 
     def symbols():
         if state["symbols"] is None:
@@ -37,8 +38,9 @@ def register(mcp, native, manager, recorder=None):
         thread waited on, slow frames (>100 ms) with their stacks and wait chain, sampler overhead and the
         share of game samples with a real function name. Also writes raw data, a Firefox Profiler profile
         (profile.json.gz, open at profiler.firefox.com) and flame graph SVGs and timeline.html (threads, frames, cell loads, tool calls and
-        hitches on one zoomable time axis) to out_dir (default
-        .local/profiles/<stamp> on this machine) and returns their paths."""
+        hitches on one zoomable time axis), and profile.sqlite (for profile_query) to out_dir (default
+        .local/profiles/<stamp> on this machine) and returns their paths. The gpu section has per-frame GPU time,
+        passes and whether frames were GPU- or CPU-bound."""
         raw, _ = await profiling.fetch(native)
         if recorder is not None and raw.get("startEpochMs"):
             raw.setdefault("marks", []).extend(profile_views.recorder_marks(
@@ -47,6 +49,7 @@ def register(mcp, native, manager, recorder=None):
         out = Path(out_dir).expanduser() if out_dir else profiling.default_out()
         paths, summary = profiling.save_outputs(profile, out)
         summary["files"] = paths
+        state["sqlite"] = paths.get("sqlite")
         for key in ("main", "all"):
             if key in summary:
                 for field in ("topSelf", "topTotal"):
@@ -90,3 +93,19 @@ def register(mcp, native, manager, recorder=None):
         """Put a named span ending now on the running profile's timeline (kind: marker, alert, narrate or your
         own word). Ignored when no profile is running."""
         return dumps(await native("Profile.mark", kind=kind, name=name, durationMs=duration_ms))
+
+    @mcp.tool()
+    async def profile_query(sql: str, path: str | None = None, limit: int = 200) -> str:
+        """Run one read-only SQL statement (SQLite) against a profile database: path to a profile.sqlite, or by
+        default the one the last profile_stop wrote. Tables: Frames (frame, start, end, frame_ms, cpu_ms, gpu_ms,
+        hitch, bound), CpuSamples, Callchains (depth 0 = leaf), Symbols, ThreadNames, Markers, GpuRanges,
+        Counters, Meta, StringIds; views SymbolsV, LeafSamplesV, MarkersV, GpuRangesV, CountersV, ThreadsV join
+        names in. Times are ms from the profile start. Writes, ATTACH and PRAGMA are refused; at most `limit`
+        rows come back. Example queries are in docs/profiling.md, SQLite export."""
+        target = path or state["sqlite"]
+        if not target:
+            return dumps({"error": "no profile database yet: run profile_start/profile_stop or pass path"})
+        try:
+            return dumps(await asyncio.to_thread(profile_sqlite.query, target, sql, max(1, min(limit, 5000))))
+        except Exception as error:
+            return dumps({"error": f"{type(error).__name__}: {error}"})

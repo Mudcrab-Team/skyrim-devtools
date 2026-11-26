@@ -2,6 +2,8 @@
 // Timing shared by the command bus and the frame monitor: a QPC clock and the slow-call log.
 #pragma once
 
+#include "core.h"
+
 #include <string>
 
 namespace devtools::perf
@@ -21,4 +23,9 @@ namespace devtools::perf
     [[nodiscard]] RecentFrames Recent(double seconds);
 
     void NoteCall(const std::string& method, const char* thread, double startedAt, double queuedMs, double ranMs);
+
+    // The 250 ms process counters inside [from, to] as [ms after origin, page faults, working set bytes,
+    // read bytes, write bytes, CPU 100 ns, available physical bytes]; all but the time are running totals
+    // or levels.
+    Json CounterSeries(double from, double to, double origin);
 }

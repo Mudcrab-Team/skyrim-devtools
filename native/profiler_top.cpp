@@ -18,6 +18,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <string>
@@ -324,10 +325,58 @@ namespace
             }
         }
     } gpuCollector;
+    // A second PDH query for profiles, so the live view's deltas and the profile's series do not disturb
+    // each other.
+    struct GpuSample
+    {
+        double at;
+        Json utilPct;
+        Json vramMb;
+    };
+
+    std::mutex sessionGpuMutex;
+    std::deque<GpuSample> sessionGpu;
+
+    void SampleSessionGpu()
+    {
+        Gpu counters;
+        for (;;) {
+            Sleep(1000);
+            if (!profiler::Profiling()) {
+                counters.primed = false;  // a rate across an idle gap would average over it
+                continue;
+            }
+            Json sample = counters.Sample();
+            if (!sample.is_object()) {
+                continue;
+            }
+            std::lock_guard lock(sessionGpuMutex);
+            sessionGpu.push_back({ perf::Now(), sample.value("utilPct", Json(nullptr)), sample.value("vramMb", Json(nullptr)) });
+            if (sessionGpu.size() > 3600) {
+                sessionGpu.pop_front();
+            }
+        }
+    }
+}
+
+namespace devtools::profiler
+{
+    Json GpuCounters(double from, double to, double origin)
+    {
+        auto out = Json::array();
+        std::lock_guard lock(sessionGpuMutex);
+        for (const auto& sample : sessionGpu) {
+            if (sample.at >= from && sample.at <= to) {
+                out.push_back({ std::round((sample.at - origin) * 1e5) / 100.0, sample.utilPct, sample.vramMb });
+            }
+        }
+        return out;
+    }
 }
 
 DEVTOOLS_MODULE(ProfilerTop)
 {
+    std::thread(SampleSessionGpu).detach();
     Register("Profile.top", [](const Json& params) {
         AllowOnly(params, { "seconds", "threads", "gpu" });
         const double seconds = Optional<double>(params, "seconds", 3.0);
@@ -345,6 +394,7 @@ DEVTOOLS_MODULE(ProfilerTop)
         out["threads"] = Threads(memoryDone, threadLimit);
         const double threadsDone = perf::Now();
         out["gpu"] = Optional<bool>(params, "gpu", true) ? gpuCollector.Get(threadsDone) : Json(nullptr);
+        out["gpuTiming"] = profiler::GpuRecent(seconds);
         out["profiling"] = profiler::Profiling();
         const auto ms = [](double a, double b) { return Round((b - a) * 1000.0); };
         out["costMs"] = { { "samples", ms(started, sampled) }, { "memory", ms(now, memoryDone) },

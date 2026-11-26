@@ -293,6 +293,7 @@ class Profile:
         self.kinds = [module_kind(m) for m in self.modules]
         self.sources = Counter()
         self.functions = []      # (label, module name, kind)
+        self.function_meta = []  # {"rva": function start (or address) RVA, "source": where the name came from}
         self.function_index = {}
         self.opaque = {}         # function index -> module name, for frames in modules without symbols
         self.frame_function = [self._function(f) for f in raw.get("frames", [])]
@@ -322,6 +323,8 @@ class Profile:
             self.functions.append(key)
             if source == "module-offset":
                 self.opaque[self.function_index[key]] = key[1]
+            start = frame.get("start")
+            self.function_meta.append({"rva": start if start is not None else frame.get("rva"), "source": source})
         return self.function_index[key]
 
     @staticmethod
@@ -553,6 +556,10 @@ class Profile:
             report["all"] = self.report("all", top=top)
             report["threads"] = self.thread_table()[:15]
         report["hitches"] = self.hitches()
+        if "gpu" in self.raw:
+            from .profile_gpu import gpu_summary
+
+            report["gpu"] = gpu_summary(self)
         if "context" in self.raw:
             report["context"] = self.raw["context"]
         return report
@@ -830,6 +837,10 @@ def save_outputs(profile, out_dir, title="Skyrim SE"):
 
     (out_dir / "timeline.html").write_text(timeline_html(profile, f"{title} timeline"), encoding="utf-8")
     paths["timeline"] = out_dir / "timeline.html"
+    from .profile_sqlite import export_sqlite
+
+    export_sqlite(profile, out_dir / "profile.sqlite")
+    paths["sqlite"] = out_dir / "profile.sqlite"
     return {k: str(v) for k, v in paths.items()}, summary
 
 
@@ -881,6 +892,19 @@ def render_text(summary, top=10):
             lines.append("top waits (off-CPU leaf):")
             for r in report["topWaits"][:5]:
                 lines.append(f"  {r['pct']:6.2f}%  {r['function']}  [{r['module']}]")
+    gpu = summary.get("gpu")
+    if gpu:
+        lines.append("")
+        if not gpu.get("frames"):
+            lines.append(f"== GPU: no timed frames ({gpu.get('reason') or 'none in this window'})")
+        else:
+            lines.append(f"== GPU: {gpu['frames']} of {gpu['presented']} frames timed; gpu p50 {gpu['gpuMsP50']} ms, p95 "
+                         f"{gpu['gpuMsP95']} ms, max {gpu['gpuMsMax']} ms; main-thread cpu p50 {gpu['cpuMsP50']} ms; "
+                         f"frame p50 {gpu['frameMsP50']} ms")
+            lines.append("bound by: " + ", ".join(f"{k} {v}%" for k, v in gpu["boundPct"].items()) +
+                         f"; timing cost {gpu['hookUsPerFrame']} us/frame")
+            for r in gpu["passes"]:
+                lines.append(f"  {r['pct']:6.2f}%  {r['msPerFrame']:7.3f} ms  {r['pass']}  ({r['kind']})")
     for hitch in summary.get("hitches", [])[:10]:
         lines.append("")
         lines.append(f"hitch frame {hitch['frame']}: {hitch['ms']} ms, {hitch['samples']} samples, waiting {hitch['waitingPct']}%")
@@ -1132,7 +1156,38 @@ def main(argv=None):
     tl.add_argument("--recorder", default=None, help="skyrim-use timeline .jsonl whose tool calls and narration to overlay")
     tl.add_argument("--symbols", default=None)
     tl.add_argument("--config", type=Path, default=None)
+    ex = sub.add_parser("export", help="write a saved profile as a SQLite database")
+    ex.add_argument("profile", help="output directory or raw.json.gz")
+    ex.add_argument("--sqlite", required=True, help="database file to write")
+    ex.add_argument("--recorder", default=None, help="skyrim-use timeline .jsonl whose tool calls and narration to add as markers")
+    ex.add_argument("--symbols", default=None)
+    ex.add_argument("--config", type=Path, default=None)
+    qu = sub.add_parser("query", help="run one read-only SQL statement against an exported profile")
+    qu.add_argument("database", help="profile.sqlite, or an output directory that holds one")
+    qu.add_argument("sql")
+    qu.add_argument("--limit", type=int, default=200)
+    qu.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
+    if args.command == "query":
+        import sqlite3
+
+        from .profile_sqlite import query
+
+        database = Path(args.database)
+        try:
+            result = query(database / "profile.sqlite" if database.is_dir() else database, args.sql, args.limit)
+        except (sqlite3.Error, FileNotFoundError) as error:
+            print(f"query failed: {error} (read-only: SELECT only)", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(result, indent=1))
+        else:
+            print("\t".join(result["columns"]))
+            for row in result["rows"]:
+                print("\t".join("" if v is None else str(v) for v in row))
+            if result["truncated"]:
+                print(f"(first {args.limit} rows)")
+        return 0
     if args.command == "record":
         asyncio.run(record(args))
         return 0
@@ -1145,6 +1200,16 @@ def main(argv=None):
     config = json.loads(args.config.read_text()) if args.config else None
     symbols = GameSymbols(research_root(args.symbols, config), address_library_path(args.addrlib, config),
                           build_tables=not args.no_build_tables)
+    if args.command == "export":
+        from .profile_sqlite import export_sqlite
+        from .profile_views import recorder_marks
+
+        raw = load_raw(args.profile)
+        if args.recorder and raw.get("startEpochMs"):
+            raw.setdefault("marks", []).extend(recorder_marks(args.recorder, raw["startEpochMs"], raw.get("durationS", 0) * 1000.0))
+        counts = export_sqlite(Profile(raw, symbols), args.sqlite)
+        print(json.dumps({"sqlite": str(args.sqlite), "rows": counts}))
+        return 0
     if args.command == "timeline":
         from .profile_views import recorder_marks, timeline_html
 

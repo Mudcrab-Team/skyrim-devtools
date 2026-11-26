@@ -4,6 +4,7 @@
 
 #include "game.h"
 #include "methods.h"
+#include "nvtx.h"
 #include "perf.h"
 
 #include <algorithm>
@@ -134,15 +135,17 @@ namespace devtools
                 Thread thread;
                 double enqueuedAt;
                 double started;
+                std::uint64_t range;
                 ~Timing()
                 {
+                    nvtx::RangeEnd(range);
                     if (thread != Thread::Any) {
                         const double ended = perf::Now();
                         perf::NoteCall(name, thread == Thread::Main ? "main" : "ui", started, (started - enqueuedAt) * 1000.0,
                             (ended - started) * 1000.0);
                     }
                 }
-            } timing{ name, thread, enqueuedAt, started };
+            } timing{ name, thread, enqueuedAt, started, thread != Thread::Any ? nvtx::RangeStart(name) : 0 };
             try {
                 method.handler(params, reply);
             } catch (const RpcError& error) {
