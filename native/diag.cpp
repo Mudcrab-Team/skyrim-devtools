@@ -3,9 +3,11 @@
 // Hang evidence: a crash logger covers access violations, but a frozen game leaves nothing behind.
 // A watchdog notices that the main thread stopped taking queued tasks and records where it is
 // stuck as module+offset frames (no memory contents) in the plugin log.
+#include "events.h"
 #include "game.h"
 #include "logs.h"
 #include "methods.h"
+#include "options.h"
 
 #include <Windows.h>
 
@@ -21,7 +23,6 @@ namespace
     using namespace std::chrono_literals;
 
     constexpr int maxFrames = 40;
-    constexpr auto stallThreshold = 6s;
     constexpr auto repeatEvery = 20s;
     constexpr int maxCaptures = 6;
 
@@ -103,6 +104,7 @@ namespace
         std::atomic<std::int64_t> sent = 0;
         auto lastReport = std::chrono::steady_clock::time_point{};
         int reports = 0;
+        bool announced = false;  // a stall event went out for the probe that is still waiting
         const auto nowMs = [] {
             return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         };
@@ -115,15 +117,26 @@ namespace
                 continue;
             }
             if (!flag->load()) {
+                if (announced) {
+                    announced = false;
+                    events::Emit("mainThreadResumed", { { "stalledMs", nowMs() - sent.load() } });
+                }
                 flag->store(true);
                 sent = nowMs();
                 tasks->AddTask([flag] { flag->store(false); });
                 continue;
             }
             const auto stalled = nowMs() - sent.load();
+            if (stalled < options::StallThresholdMs()) {
+                continue;
+            }
+            // The event is the agent's signal, so it is not rate limited like the stack capture below.
+            if (!announced) {
+                announced = true;
+                events::Emit("mainThreadStalled", { { "stalledMs", stalled }, { "thresholdMs", options::StallThresholdMs() } });
+            }
             const auto now = std::chrono::steady_clock::now();
-            if (stalled >= std::chrono::duration_cast<std::chrono::milliseconds>(stallThreshold).count() &&
-                reports < maxCaptures && now - lastReport >= repeatEvery) {
+            if (reports < maxCaptures && now - lastReport >= repeatEvery) {
                 lastReport = now;
                 ++reports;
                 ReportStall(stalled);
@@ -134,6 +147,8 @@ namespace
 
 DEVTOOLS_MODULE(Diagnostics)
 {
+    events::Declare("mainThreadStalled", "The main thread stopped taking queued tasks: {stalledMs, thresholdMs}; see Options.set stallThresholdMs");
+    events::Declare("mainThreadResumed", "The main thread took a task again after a stall: {stalledMs}");
     // The module installs from the plugin load callback, which runs on the game's main thread.
     gameThreadId = GetCurrentThreadId();
     OnSkseMessage([](SKSE::MessagingInterface::Message& message) {

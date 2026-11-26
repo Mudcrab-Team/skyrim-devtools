@@ -33,9 +33,26 @@ target_link_libraries(SkyrimDevToolsServer PUBLIC nlohmann_json::nlohmann_json P
 file(GLOB DEVTOOLS_MODULES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 add_library(SkyrimDevTools SHARED ${DEVTOOLS_MODULES})
 target_compile_features(SkyrimDevTools PRIVATE cxx_std_23)
-target_include_directories(SkyrimDevTools PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+# The extension header is public API; a synced build tree carries it as ext/ next to the sources.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ext")
+    set(DEVTOOLS_EXT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ext")
+    set(DEVTOOLS_EXAMPLES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/examples")
+else()
+    set(DEVTOOLS_EXT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ext")
+    set(DEVTOOLS_EXAMPLES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../examples")
+endif()
+target_include_directories(SkyrimDevTools PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${DEVTOOLS_EXT_DIR}")
 target_compile_definitions(SkyrimDevTools PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(SkyrimDevTools PRIVATE
     CommonLibSSE::CommonLibSSE SkyrimDevToolsServer minhook::minhook user32)
 # Game headers dominate every module's compile time, so they are parsed once per build.
 target_precompile_headers(SkyrimDevTools PRIVATE pch.h)
+
+# The example extension plugin shows the extension API end to end; it loads next to the main plugin.
+if(EXISTS "${DEVTOOLS_EXAMPLES_DIR}/hello-ext/hello_ext.cpp")
+    add_library(SkyrimDevToolsExample SHARED "${DEVTOOLS_EXAMPLES_DIR}/hello-ext/hello_ext.cpp")
+    target_compile_features(SkyrimDevToolsExample PRIVATE cxx_std_23)
+    target_include_directories(SkyrimDevToolsExample PRIVATE "${DEVTOOLS_EXT_DIR}")
+    target_compile_definitions(SkyrimDevToolsExample PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(SkyrimDevToolsExample PRIVATE CommonLibSSE::CommonLibSSE)
+endif()

@@ -305,6 +305,22 @@ server adds actionLoop, a screenshot-based blindCamera and moveStuck (from `move
 `Screen.capture` replies also carry `meanLuma` (0-255) and `dominantShare` of the encoded frame. See
 docs/skyrim-use.md, Alerts.
 
+### Extensions and options
+
+| Method | Thread | Params | Result |
+|---|---|---|---|
+| Extensions.info | any | | `{apiVersion, owners: {plugin: methodCount}}` |
+| Options.get | any | | The current options plus `foreground`, `deactivationsBlocked` (window-deactivation notices swallowed by alwaysActive) and `menusDismissed` |
+| Options.set | main | alwaysActive?, autoDismissMenus?, cleanTransition?, cleanTransitionCell?, stallThresholdMs? | The options after the change; `ignored` lists autoDismissMenus entries that are never dismissed (message boxes, core menus) |
+
+`Session.getInfo` method entries registered by other plugins also carry `owner`, `description` and `schema` (JSON Schema
+of the params object). Events: `methodsChanged {added: [names]}` or `{removed: [names]}` when a plugin registers or
+removes methods after the client connected, `menuAutoDismissed {menu}`, `mainThreadStalled {stalledMs, thresholdMs}`
+(the main thread has not taken a queued task for at least the threshold, default 6000 ms; once per stall) and
+`mainThreadResumed {stalledMs}`. With cleanTransition on, `World.centerOnCell` and `Console.execute` of a `coc`/`cow`
+command first send the player to the bounce cell and wait for its loading screen to finish; their replies then carry
+`bounced: true` and their timeout is 90 s. Methods and events from plugins are described in docs/extending.md.
+
 ## Errors
 
 | Code | Meaning |

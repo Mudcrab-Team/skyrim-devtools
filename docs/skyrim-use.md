@@ -48,9 +48,13 @@ server speaks plain stdio. When the client exits the server stops the game, so a
 | Navigate | `nav_nearby {radius, kind}`, `nav_places {contains}`, `nav_goto {goal, mode=input\|ai, timeout_s, on_combat, on_dialogue, on_message_box, on_menu, invulnerable, via, route, activate}`, `nav_plan {ref_id \| x, y, z, route}`, `nav_status`, `nav_wait {timeout_s}`, `nav_cancel` |
 | Record | `record_start {hz, fields, name}`, `record_stop`, `record_fetch {name, dest_dir?, plot}`, `trajectory_plot {file, color_by, route}`, `record_replay_camera {name, speed}` |
 | Alerts | `agent_alerts {history, limit, dismiss, dismiss_seconds, configure}` (every other reply also carries the active alerts, see Alerts) |
-| Generic | `rpc_methods`, `rpc_call {method, params}` |
+| Generic | `rpc_methods`, `rpc_call {method, params}`, `game_options {changes}` (see docs/extending.md, Options) |
+| Extensions | one tool per method that another plugin registered, named after the method (`HelloExt.echo` is `hello_ext_echo`); the list updates when plugins register later |
 
 `game_start` and `game_status` report `plugin` {buildId, missingMethods, stale} and, when the plugin DLL on the host is older than this client, a top-level `warning`; redeploy with `tools/pc-build --deploy` rather than debugging tools that silently do nothing.
+
+Every tool reply carries a `warnings` entry when the call had arguments the tool does not accept (a misspelt name is
+otherwise dropped silently), naming the accepted keys. `game_options {changes: {strictArgs: true}}` turns that into an error.
 
 The state tools wrap native methods that older plugin builds lack. They answer "method X is not available in
 this plugin build" instead of failing obscurely, and `rpc_call` reaches any method before a wrapper exists.

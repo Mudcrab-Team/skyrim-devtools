@@ -17,6 +17,7 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <optional>
 
 namespace devtools
 {
@@ -56,12 +57,25 @@ namespace devtools
         std::function<void(Json)> deliver_;
     };
 
+    // Shown to clients through Session.getInfo. Built-in methods leave it empty; methods registered by other
+    // plugins carry their description, JSON Schema for the params object and the registering plugin's name.
+    struct MethodInfo
+    {
+        std::string description;
+        Json schema;
+        std::string owner;
+    };
+
     using ReplyPtr = std::shared_ptr<Reply>;
     using Handler = std::function<Json(const Json& params)>;
     using DeferredHandler = std::function<void(const Json& params, ReplyPtr reply)>;
 
     void Register(std::string name, Handler handler, MethodSpec spec = {});
-    void RegisterDeferred(std::string name, DeferredHandler handler, MethodSpec spec = {});
+    void RegisterDeferred(std::string name, DeferredHandler handler, MethodSpec spec = {}, MethodInfo info = {});
+    // Removes a method; only its registering owner may do so. False when it does not exist or belongs to another owner.
+    bool Unregister(const std::string& name, const std::string& owner);
+    // The owner of a method ("" for built-ins), or nullopt when no such method exists.
+    [[nodiscard]] std::optional<std::string> OwnerOf(const std::string& name);
     [[nodiscard]] Json ListMethods();
 
     // Features a client can rely on, reported by Session.getInfo. A module marks its feature

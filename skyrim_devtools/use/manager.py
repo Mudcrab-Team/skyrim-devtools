@@ -16,6 +16,7 @@ import time
 from ..client import MAX_MESSAGE, TIMEOUT, ConnectionLost, RpcError, Session, observe
 from ..smoke import ACTIVE, WindowsHost
 from .health import HealthWatch
+from .options import split_options
 
 KEEPALIVE_SECONDS = 15
 HEALTH_SAMPLE_SECONDS = 60
@@ -93,6 +94,14 @@ class GameManager:
         self._connect = connect
         self.keepalive_seconds = keepalive
         self.event_listeners = []
+        self.methods_listeners = []
+        # Options outlive a game: they are applied again to every game this manager starts.
+        self.option_state = dict(config.get("options") or {})
+        split_options(self.option_state)
+        self.option_state.setdefault("disableVanityCamera", not config.get("vanityCamera"))
+        self._vanity_previous = None
+        self._tasks = set()
+        self.stall = None
         self.lock = asyncio.Lock()
         self.reset()
 
@@ -104,7 +113,11 @@ class GameManager:
         self.port = None
         self.tunnel = None
         self.info = {}
+        had_methods = bool(getattr(self, "methods", None))
         self.methods = {}
+        if had_methods:
+            self._methods_changed()
+        self.stall = None
         self.mode = None
         self.crash = None
         self.keepalive_task = None
@@ -127,10 +140,39 @@ class GameManager:
                 listener(compact)
             except Exception:  # a broken listener must not cost the agent its event stream
                 pass
+        if compact["type"] == "methodsChanged":
+            self._schedule(self.refresh_methods())
+        elif compact["type"] == "mainThreadStalled":
+            self.stall = dict(compact.get("data") or {})
+        elif compact["type"] == "mainThreadResumed":
+            self.stall = None
         if compact["type"] in ALERT_EVENTS:
             return
         self.events.append(compact)
         self.event_total += 1
+
+    def _schedule(self, coroutine):
+        try:
+            task = asyncio.get_running_loop().create_task(coroutine)
+        except RuntimeError:
+            coroutine.close()
+            return
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    def _methods_changed(self):
+        for listener in self.methods_listeners:
+            try:
+                listener()
+            except Exception:  # a broken listener must not cost the agent its connection
+                pass
+
+    async def refresh_methods(self):
+        """Re-read the method list after a plugin registered or removed methods at runtime."""
+        if not self.alive:
+            return
+        with contextlib.suppress(ConnectionLost, OSError, RpcError, TimeoutError, asyncio.TimeoutError):
+            await self._get_info()
 
     def note_warning(self, code, message):
         """Put a tool-side warning into the event buffer, where events_drain and the timeline can see it."""
@@ -228,23 +270,39 @@ class GameManager:
                 await self._close_link()
                 await asyncio.sleep(1)
         await observe(self._snapshot_raw, lambda s: any(m["name"] == "Main Menu" for m in s["menus"]), "Main menu", 60)
-        await self._quiet_vanity_camera()
+        await self.apply_options()
         self.phase = "running"
         self.keepalive_task = asyncio.create_task(self._keepalive())
         if save:
             await self._load_save_locked(save)
 
-    async def _quiet_vanity_camera(self):
-        """The idle orbit camera starts after a couple of minutes without input, which is most of an agent's
-        thinking time, and turns screenshots and recordings into a slow spin. Config vanityCamera=true keeps it."""
-        if self.config.get("vanityCamera") or "Setting.set" not in self.methods:
-            return
+    async def apply_options(self, changed=None):
+        """Push the option state to the running game. The idle orbit camera starts after a couple of minutes without
+        input, which is most of an agent's thinking time, and turns screenshots and recordings into a slow spin, so
+        it is off unless disableVanityCamera is false (config vanityCamera=true keeps it too)."""
+        keys = set(changed) if changed is not None else set(self.option_state)
+        native, _ = split_options(self.option_state)
+        if "disableVanityCamera" in keys and "Setting.set" in self.methods:
+            await self._set_vanity(bool(self.option_state.get("disableVanityCamera")))
+        native = {key: value for key, value in native.items() if key in keys}
+        if native and "Options.set" in self.methods:
+            return await self.session.call("Options.set", **native)
+        return None
+
+    async def _set_vanity(self, disable):
         with contextlib.suppress(RpcError, TimeoutError, asyncio.TimeoutError):
-            await self.session.call("Setting.set", name="fAutoVanityModeDelay:Camera", value=VANITY_OFF_SECONDS)
+            if disable:
+                reply = await self.session.call("Setting.set", name="fAutoVanityModeDelay:Camera", value=VANITY_OFF_SECONDS)
+                if self._vanity_previous is None and isinstance(reply, dict) and reply.get("previous") != VANITY_OFF_SECONDS:
+                    self._vanity_previous = reply.get("previous")
+            elif self._vanity_previous is not None:
+                await self.session.call("Setting.set", name="fAutoVanityModeDelay:Camera", value=self._vanity_previous)
+                self._vanity_previous = None
 
     async def _get_info(self):
         info = await self.session.call("Session.getInfo")
         self.methods = {item["name"]: item for item in info.get("methods", [])}
+        self._methods_changed()
         return info
 
     async def _snapshot_raw(self):
@@ -472,6 +530,10 @@ class GameManager:
             if result["plugin"].get("warning"):
                 result["warning"] = result["plugin"]["warning"]
             result["bufferedEvents"] = self.event_total - self.drain_cursor
+            if self.stall:
+                result["mainThreadStalled"] = self.stall
+                note = f"the game's main thread has not run a task for {self.stall.get('stalledMs')} ms"
+                result["warning"] = f"{result['warning']}; {note}" if result.get("warning") else note
         if self.stale_cleared:
             result["staleCleared"] = self.stale_cleared
         return result

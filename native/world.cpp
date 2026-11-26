@@ -5,6 +5,7 @@
 #include "events.h"
 #include "game.h"
 #include "methods.h"
+#include "transition.h"
 
 #include <algorithm>
 #include <cctype>
@@ -55,7 +56,7 @@ DEVTOOLS_MODULE(World)
         }
     });
 
-    Register("World.centerOnCell", [](const Json& params) {
+    RegisterDeferred("World.centerOnCell", [](const Json& params, ReplyPtr reply) {
         AllowOnly(params, { "cell", "loadEpoch" });
         RequirePlayable(params);
         const auto cell = Require<std::string>(params, "cell");
@@ -63,7 +64,13 @@ DEVTOOLS_MODULE(World)
             !std::ranges::all_of(cell, [](unsigned char c) { return std::isalnum(c) || c == '_'; })) {
             throw RpcError(code::invalidParams, "cell is an editor ID such as WhiterunBanneredMare");
         }
-        const auto lines = console::Run("coc " + cell, nullptr);
-        return Json{ { "cell", cell }, { "lines", lines } };
-    }, { .thread = Thread::Main, .timeout = 30s });
+        const auto command = "coc " + cell;
+        if (!transition::Wanted(command)) {
+            reply->Ok({ { "cell", cell }, { "lines", console::Run(command, nullptr) } });
+            return;
+        }
+        transition::Bounce(reply, [reply, cell, command] {
+            reply->Ok({ { "cell", cell }, { "bounced", true }, { "lines", console::Run(command, nullptr) } });
+        });
+    }, { .thread = Thread::Main, .timeout = 90s });
 }

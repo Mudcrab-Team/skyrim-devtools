@@ -76,6 +76,7 @@ game_stop {}                                     {"phase":"stopped","cleanExit":
 ## Documentation
 
 - [docs/skyrim-use.md](docs/skyrim-use.md): tools, alerts, combat, perception, dialogue, performance, showcase video
+- [docs/extending.md](docs/extending.md): let your own SKSE plugin publish test methods and events; session options
 - [docs/protocol.md](docs/protocol.md): JSON-RPC methods and events, how to add one
 - [docs/mod-testing.md](docs/mod-testing.md): dialogue exploration and coverage
 - [docs/test-pipeline.md](docs/test-pipeline.md): sharing one test machine between agents
