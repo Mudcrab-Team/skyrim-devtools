@@ -12,6 +12,7 @@ import time
 MELEE_REACH = 170.0
 POWER_STAMINA_PCT = 70
 CASTER_STYLES = {"mage", "caster"}
+PASSIVE_MENUS = {"HUD Menu", "Cursor Menu"}
 
 
 def dumps(value):
@@ -142,6 +143,17 @@ def register(mcp, native, manager):
         for number in range(1, rounds + 1):
             if time.monotonic() - started > timeout_s:
                 log.append("timeout")
+                break
+            # a tutorial popup ("Health Low") pauses the game, so every swing after it would do nothing
+            menus = await manager.call("UI.listMenus")
+            blocking = [m["name"] for m in menus if m.get("open") and m["name"] not in PASSIVE_MENUS]
+            if blocking:
+                if blocking == ["Tutorial Menu"]:
+                    await native("UI.closeMenu", name="Tutorial Menu")
+                    log.append("closed tutorial popup")
+                    await asyncio.sleep(0.4)
+                    continue
+                log.append("menu open: " + ", ".join(blocking))
                 break
             state = await native("Combat.state", radius=radius, limit=6)
             lowest = min(lowest, state["player"]["health"].get("pct", 100))

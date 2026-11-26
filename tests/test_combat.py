@@ -82,11 +82,28 @@ class ToolTests(unittest.TestCase):
             h = Harness()
             await h.text("game_start")
             socket = h.sockets[0]
+            socket.menus = set()
             player = {"dead": False, "health": {"cur": 100, "max": 100, "pct": 100}, "stamina": {"pct": 100}}
             socket.results["Combat.state"] = {"player": player, "hostileTotal": 0, "hostiles": []}
             result = json.loads(await h.text("combat_fight"))
             self.assertEqual(result["outcome"], "clear")
             self.assertEqual(result["hostilesLeft"], 0)
+            await h.text("game_stop")
+        run(scenario())
+
+    def test_fight_loop_closes_a_tutorial_popup_and_stops_on_other_menus(self):
+        async def scenario():
+            h = Harness()
+            await h.text("game_start")
+            socket = h.sockets[0]
+            player = {"dead": False, "health": {"cur": 100, "max": 100, "pct": 100}, "stamina": {"pct": 100}}
+            socket.results["Combat.state"] = {"player": player, "hostileTotal": 0, "hostiles": []}
+            socket.results["UI.listMenus"] = [{"name": "Tutorial Menu", "open": True}]
+            result = json.loads(await h.text("combat_fight", rounds=3))
+            self.assertIn(("UI.closeMenu", {"name": "Tutorial Menu", "wait": True}), [(m, p) for m, p in socket.calls])
+            socket.results["UI.listMenus"] = [{"name": "InventoryMenu", "open": True}]
+            result = json.loads(await h.text("combat_fight", rounds=3))
+            self.assertEqual(result["outcome"], "menu open: InventoryMenu")
             await h.text("game_stop")
         run(scenario())
 

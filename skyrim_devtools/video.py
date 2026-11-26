@@ -476,12 +476,58 @@ def compose(options):
     return 0
 
 
+def compose_parts(options):
+    """Compose one video from several recording sessions: each part is footage:timeline, cards go around the whole."""
+    import copy
+
+    workdir = Path(tempfile.mkdtemp(prefix="skyrim-video-parts-"))
+    pieces = []
+    total_calls = total_captions = 0
+    try:
+        for number, spec in enumerate(options.part):
+            footage, _, timeline_path = spec.partition(":")
+            if not timeline_path:
+                raise SystemExit("--part is footage.mp4:timeline.jsonl")
+            part = copy.copy(options)
+            part.footage, part.timeline, part.no_cards, part.dry_run = footage, timeline_path, True, False
+            part.output = workdir / f"part{number}.mp4"
+            sidecar = Path(footage).with_suffix(".capture.json")
+            part.footage_start_ms = json.loads(sidecar.read_text()).get("startEpochMs") if sidecar.exists() else None
+            timeline = load_timeline(timeline_path, part.footage_start_ms)
+            total_calls += len(timeline.calls)
+            total_captions += len(timeline.captions)
+            compose(part)
+            pieces.append(part.output)
+        intro_card, outro_card = workdir / "intro.png", workdir / "outro.png"
+        draw_card([(options.title or "An AI agent plays Skyrim", 78, FG, "bold"), (options.subtitle, 36, DIM, "sans")], intro_card)
+        draw_card([("Played entirely through tool calls", 62, FG, "bold"),
+                   (f"{total_calls} tool calls, {total_captions} comments, no human input", 36, DIM, "sans"),
+                   ("skyrim-use: automated playtesting for Skyrim mods", 28, ACCENT, "sans")], outro_card)
+        command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+        command += ["-loop", "1", "-t", "3.5", "-framerate", str(FPS), "-i", str(intro_card)]
+        for piece in pieces:
+            command += ["-i", str(piece)]
+        command += ["-loop", "1", "-t", "4", "-framerate", str(FPS), "-i", str(outro_card)]
+        count = len(pieces) + 2
+        chain = ";".join(f"[{i}:v]fps={FPS},scale={W}:{H},setsar=1,format=yuv420p[v{i}]" for i in range(count))
+        chain += ";" + "".join(f"[v{i}]" for i in range(count)) + f"concat=n={count}:v=1:a=0[out]"
+        command += ["-filter_complex", chain, "-map", "[out]", "-c:v", options.encoder, "-pix_fmt", "yuv420p",
+                    "-movflags", "+faststart", str(options.output)]
+        if subprocess.run(command).returncode:
+            raise SystemExit("ffmpeg failed while joining the parts")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    print(f"wrote {options.output}")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="skyrim-devtools-video", description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     c = sub.add_parser("compose", help="footage + timeline -> showcase video")
-    c.add_argument("--footage", required=True, help="MP4 from capture_stop")
-    c.add_argument("--timeline", required=True, help="session timeline JSONL")
+    c.add_argument("--footage", help="MP4 from capture_stop")
+    c.add_argument("--timeline", help="session timeline JSONL")
+    c.add_argument("--part", action="append", help="footage.mp4:timeline.jsonl; repeat for a recording split over sessions")
     c.add_argument("-o", "--output", required=True)
     c.add_argument("--speedup-idle", type=float, default=4.0, help="speed factor for stretches with nothing to watch")
     c.add_argument("--idle-threshold", type=float, default=3.0, help="only gaps at least this long (s) are sped up")
@@ -495,6 +541,10 @@ def main(argv=None):
     c.add_argument("--encoder", default="libx264", help="ffmpeg video encoder (h264_videotoolbox is faster on a Mac)")
     c.add_argument("--no-sidecar", dest="use_sidecar", action="store_false")
     options = parser.parse_args(argv)
+    if options.part:
+        return compose_parts(options)
+    if not options.footage or not options.timeline:
+        parser.error("pass --footage and --timeline, or one or more --part footage:timeline")
     return compose(options)
 
 
