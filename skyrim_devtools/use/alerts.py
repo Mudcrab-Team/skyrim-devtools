@@ -27,6 +27,10 @@ LOOP_EXEMPT = {"agent_alerts", "narrate", "game_status", "wait_for", "nav_wait",
                "perf_frame_stats", "perf_hitches", "events_drain", "events_list", "rpc_methods", "game_start",
                "game_stop", "nav_status", "capture_status"}
 
+# a new movement goal makes an earlier stuck report obsolete; a loaded save or a teleport does too
+NEW_GOAL_TOOLS = {"nav_goto", "nav_cancel", "walk"}
+WORLD_CHANGE_TOOLS = {"load_save", "reload", "center_on_cell"}
+
 HINTS = {
     "actionLoop": "the same call keeps giving the same result: change the approach, read quest_targets, or look at a screenshot",
     "blindCamera": "the view is black or one colour: check for a menu or fade, look to level, or move the camera",
@@ -140,8 +144,20 @@ class AlertBoard:
             if isinstance(detail, (dict, list)):
                 detail = json.dumps(detail, separators=(",", ":"))[:160]
             self.raise_("moveStuck", "warn", HINTS["moveStuck"], str(detail), source="move")
-        elif kind == "moveUnstuck":
-            self.clear("moveStuck", "movement resumed")
+        elif kind in ("moveUnstuck", "navArrived"):
+            self.clear("moveStuck", "movement resumed" if kind == "moveUnstuck" else "arrived")
+        elif kind == "loadGame":
+            # the plugin's alerts that still hold are put back by the next sync with Alerts.state
+            for active in list(self.active):
+                self.clear(active, "a save was loaded")
+        elif kind == "cellChange" and data.get("entered", True):
+            for active in ("moveStuck", "blindCamera"):
+                self.clear(active, "the player changed cell")
+
+    def call_started(self, tool):
+        """Called before a tool runs: a stuck report ends when the agent sets a new goal or leaves the place."""
+        if tool in NEW_GOAL_TOOLS or tool in WORLD_CHANGE_TOOLS:
+            self.clear("moveStuck", "a new movement goal was set" if tool in NEW_GOAL_TOOLS else "the world changed")
 
     # ---- MCP-side detectors --------------------------------------------------------------------
 

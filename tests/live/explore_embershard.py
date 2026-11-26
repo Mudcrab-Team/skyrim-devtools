@@ -51,6 +51,7 @@ async def run(ctx, cell=CELL, tool=None):
         checks["rooms 5..40"] = 5 <= summary["rooms"] <= 40
         checks["exit identified"] = bool(summary["exit"])
         checks["hostiles listed"] = summary["hostilesAlive"] > 0
+        cursor = manager.event_total
         began = time.monotonic()
         result = json.loads(await tool("explore", goal="clear", fight=True, invulnerable=True, rooms=80, timeout_s=1200))
         details.update(clearS=round(time.monotonic() - began, 1), status=result["status"], legs=len(result["legs"]),
@@ -60,6 +61,10 @@ async def run(ctx, cell=CELL, tool=None):
         if result["status"] in ("stuck", "cleared_reachable"):
             details["why"] = result.get("why")
             details["hostiles"] = result.get("hostiles") or result.get("unreachable")
+        lost_events = manager.events_since(cursor)
+        details["navEvents"] = [e for e in (lost_events[0] if isinstance(lost_events, tuple) else lost_events)
+                                if e.get("type") in ("navReplan", "navFailed", "navArrived", "moveStuck")][:60]
+        details["allLegs"] = result["legs"]
         checks["cleared"] = result["status"] == "cleared"
         checks["no hostile left"] = result["map"].get("hostilesAlive") == 0
         checks["step log written"] = bool(result.get("logFile")) and Path(result["logFile"]).exists()

@@ -41,7 +41,7 @@ server speaks plain stdio. When the client exits the server stops the game, so a
 | Observe | `snapshot`, `list_menus {open_only}`, `events_list`, `events_subscribe`, `events_drain {types?, limit}`, `wait_for` |
 | Act | `open_menu`, `close_menu`, `console {command, target}`, `press_key`, `press_control`, `mouse`, `release_all_input`, `look {yaw_deg, pitch_deg}` |
 | Saves and world | `list_saves`, `load_save`, `reload`, `center_on_cell` |
-| State (newer plugin builds) | `player_state`, `player_inventory`, `world_nearby`, `world_crosshair`, `quest_get`, `quest_find`, `quest_active`, `quest_targets {quest}`, `activate`, `message_box`, `message_box_select`, `dialogue_state`, `dialogue_select`, `dialogue_wait`, `dialogue_advance`, `dialogue_close`, `ui_list_items`, `ui_select_item`, `ui_dump`, `ui_get`, `ui_set`, `ui_invoke`, `ui_list`, `dialogue_start`, `screenshot` (image), `perf_frame_stats`, `perf_hitches`, `perf_check`, `papyrus_log` |
+| State (newer plugin builds) | `player_state`, `player_inventory`, `world_nearby`, `world_crosshair`, `quest_get`, `quest_find`, `quest_active`, `quest_targets {quest}`, `activate`, `message_box`, `message_box_select`, `dialogue_state`, `dialogue_select`, `dialogue_wait`, `dialogue_advance`, `dialogue_close`, `ui_list_items`, `ui_select_item`, `ui_dump`, `ui_get`, `ui_set`, `ui_invoke`, `ui_list`, `dialogue_start`, `screenshot` (image), `perf_frame_stats`, `perf_hitches`, `perf_check`, `profile_start`, `profile_stop`, `profile_status`, `profile_watch`, `profile_hitches`, `papyrus_log` |
 | Perceive | `world_inspect {ref_id, nodes, graph, scripts}`, `world_models {contains, radius, limit}`, `screen_capture {ref_id or x,y,z or region, zoom, pad, include_ui}` (image), `game_setting {name, value?}` |
 | Move and camera | `walk {direction, duration_ms or distance, run?, sprint?}`, `turn_to {heading_deg or x,y or ref_id}`, `jump`, `sneak {on}`, `camera_state`, `camera_set {mode, yaw_deg, pitch_deg, zoom, fov}`, `camera_look_at {ref_id or x,y,z}` |
 | Combat | `combat_state {radius}`, `combat_target`, `combat_face`, `combat_draw`, `combat_equip {name, hand}`, `combat_unequip`, `combat_attack {kind=light\|power, hand}`, `combat_block`, `combat_cast`, `combat_drink {kind}`, `combat_shoot {target, shots, draw_s, part, reposition, weapon}`, `combat_fight {style, rounds, drink_below}` (a bounded loop over the primitives), `player_equipped`, `player_spells` |
@@ -59,6 +59,18 @@ this plugin build" instead of failing obscurely, and `rpc_call` reaches any meth
 `wait_for` blocks until all given conditions hold: `menu_open`, `menu_closed`, `playable`, `event_type`
 (a buffered, not yet drained event; it does not consume it) and a generic probe `method` + `path` + `equals`,
 for example `method=Player.state path=location.cell equals=WhiterunBanneredMare`.
+
+**Stuck handling.** Every movement path (`walk`, `nav_goto` in both modes, combat approach) runs the
+same native detector: no displacement while moving input is held, a route whose distance to the goal
+stops shrinking, ping-pong between spots and a door that keeps being re-entered. It steps back and
+strafes, jumps, replans around the spot (blocking a looped door), and then stops with `stuck` within
+about 15 s: `walk` returns `{"stuck": true, "error": "stuck", reason, pos, facingDeg, blockers,
+screenshotHint}` and `nav_wait` returns `"error": "stuck"` with the same report under `stuck`; take a
+`screenshot` to see the blocker. Tune it per call with the `stuck` argument (`false` disables;
+`{"distance": 40, "windowS": 3, "maxFailures": 3, "totalS": 20, "progressWindowS": 10}`).
+`moveStuck` / `moveUnstuck` events land in the timeline JSONL. `walk` also has a client-side backstop:
+if the player covers under 40 units in 20 s the walk is stopped and reported `reason: hardCap`.
+Details: docs/protocol.md, "Stuck detector".
 
 `nav_goto` returns at once; follow it with `nav_wait` (blocks up to 300 s per call) or `wait_for
 event_type=navArrived`. Use `mode=ai` for long overland trips (the engine pathfinder handles cell
@@ -193,7 +205,7 @@ the showcase composer shows the active kinds in the status panel.
 | `crime` | a bounty gained, stolen goods value rising, or a hostile guard (held 60 s) | pay, jail or avoid |
 | `targetDead`, `targetUnreachable` | a tracked quest's target actor is dead (the detail says if it is essential), or is disabled or in no cell; checked every `targetCheckS` (10 s) | re-check the quest, reload, or another route |
 | `lowHealthNoHeal` | health under `lowHealthPct` (30) with no restoring potion and no healing spell | retreat, rest, console heal |
-| `moveStuck` | the movement stuck detector's `moveStuck` event, until `moveUnstuck` | another route, open the door |
+| `moveStuck` | the movement stuck detector's `moveStuck` event, until `moveUnstuck`, an arrival, a new `nav_goto`/`walk`/`nav_cancel`, a teleport or a cell change; a loaded save clears every alert (those still true in the plugin return at the next sync) | another route, open the door |
 
 Change thresholds with `agent_alerts {configure: {"thresholds": {"questStalledMin": 3}, "disable": ["crime"]}}`;
 the plugin owns the native keys (`Alerts.configure`), the MCP server the `actionLoop*` and `blind*` ones. Alerts
@@ -216,6 +228,9 @@ once a second into a CSV), and restart the game if nothing explains it.
 
 * `Perf.hitches` logs every frame over 100 ms (`Perf.configure {hitchLogMs}`); `slowCalls` tallies each handler
   that held the game thread over 5 ms (also written to the plugin log from 20 ms).
+* To see which functions take the time, profile: `profile_start` / `profile_stop` sample the game's call
+  stacks and report hot functions, waits and slow-frame stacks; `profile_watch` keeps the stacks of every
+  hitch. See [profiling](profiling.md).
 * `tools/perf_session.py` is the A/B harness: one visible game session, phases of idle, walking, polling,
   scanning and a Riverwood navigation loop with the desktop capture, one reading per phase.
 * Long visible sessions have hung (the game's thread count grows by about 2 per second until the main thread waits

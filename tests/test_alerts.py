@@ -51,6 +51,31 @@ class BoardTests(unittest.TestCase):
         board.on_event({"type": "moveUnstuck", "data": {}})
         self.assertNotIn("moveStuck", board.active)
 
+    def test_move_stuck_clears_on_arrival_new_goal_and_cell_change(self):
+        for ending in (lambda b: b.on_event({"type": "navArrived", "data": {}}),
+                       lambda b: b.call_started("nav_goto"),
+                       lambda b: b.call_started("center_on_cell"),
+                       lambda b: b.on_event({"type": "cellChange", "data": {"entered": True}})):
+            board, _, records = make_board()
+            board.on_event({"type": "moveStuck", "data": {"reason": "wall"}})
+            ending(board)
+            self.assertNotIn("moveStuck", board.active)
+            self.assertEqual(records[-1]["action"], "cleared")
+
+    def test_other_calls_and_leaving_a_cell_keep_the_stuck_alert(self):
+        board, _, _ = make_board()
+        board.on_event({"type": "moveStuck", "data": {}})
+        board.call_started("screenshot")
+        board.on_event({"type": "cellChange", "data": {"entered": False}})
+        self.assertIn("moveStuck", board.active)
+
+    def test_loading_a_save_clears_every_alert(self):
+        board, _, _ = make_board()
+        board.on_event({"type": "moveStuck", "data": {}})
+        board.raise_("lowFps", "warn", "pause", source="native")
+        board.on_event({"type": "loadGame", "data": {"success": True}})
+        self.assertEqual(board.active, {})
+
     def test_action_loop_needs_same_call_same_result(self):
         board, clock, _ = make_board()
         for _ in range(2):
@@ -181,3 +206,20 @@ class ServerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SamplerFlagTests(unittest.TestCase):
+    def test_flags_that_are_off_are_written_false(self):
+        import asyncio
+        from skyrim_devtools.use.timeline import Recorder
+
+        class Manager:
+            def has_method(self, name):
+                return name == "Player.state"
+
+            async def call(self, method, **params):
+                return {"cell": "Riverwood", "inCombat": False, "sneaking": False, "dead": False}
+
+        with tempfile.TemporaryDirectory() as folder:
+            sample = asyncio.run(Recorder(folder).sample(Manager()))
+        self.assertIs(sample["inCombat"], False)

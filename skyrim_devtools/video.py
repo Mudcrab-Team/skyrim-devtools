@@ -378,11 +378,17 @@ def describe_args(args):
     return "  ".join(parts)
 
 
+# state flags describe the moment of one sample; a newer sample that leaves one out means it is off
+STATE_FLAGS = ("inCombat", "dead", "sneaking", "walking")
+
+
 def current_status(timeline, t):
     status = {}
     for when, sample in timeline.statuses:
         if when > t:
             break
+        for flag in STATE_FLAGS:
+            status.pop(flag, None)
         status.update(sample)
     if not status and timeline.statuses:
         # before the first sample the panel shows that sample rather than an empty block
