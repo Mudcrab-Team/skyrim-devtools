@@ -217,6 +217,11 @@ function Write-ProfileSettings($Headless, $Config) {
             $prefs = Set-IniValue $prefs 'AudioMenu' 'fAudioMasterVolume' '0.0000'
         }
     } else {
+        if ($Config.disableAudio -eq $true) {
+            # With no audio output device present the engine's XAudio2 layer keeps spawning threads (about
+            # 2 per second) until the process hangs or crashes inside XAudio2 after 15-45 minutes.
+            $main = Set-IniValue $main 'Audio' 'bEnableAudio' '0'
+        }
         # Exclusive fullscreen drew the game into a corner of the monitor with black margins (the HUD placed for
         # a larger frame) and made desktop capture grab black; a borderless window at the desktop size has neither
         # problem and takes the resolution from the profile's own iSize W/H.

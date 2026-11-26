@@ -118,6 +118,11 @@ once a second into a CSV), and restart the game if nothing explains it.
   that held the game thread over 5 ms (also written to the plugin log from 20 ms).
 * `tools/perf_session.py` is the A/B harness: one visible game session, phases of idle, walking, polling,
   scanning and a Riverwood navigation loop with the desktop capture, one reading per phase.
+* Long visible sessions have hung (the game's thread count grows by about 2 per second until the main thread waits
+  forever or `XAudio2_7.dll` crashes) on a PC with no audio output device; see
+  [the Embershard playtest](playtests/embershard-mine.md). `disableAudio: true` in the host's `config.json` writes
+  `bEnableAudio=0` for visible runs and slows the growth. Restart the game after about 30 minutes, and watch
+  `Get-Process SkyrimSE` thread count next to `perf_check`.
 * A visible game runs borderless-windowed at the profile's resolution (`bFull Screen=0`): exclusive fullscreen
   drew the picture in a corner of the monitor and made the desktop capture black. `Window.info` reports the
   window, client, monitor, swap chain size and DPI awareness, to check the game fills the screen.
