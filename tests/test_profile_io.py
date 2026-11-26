@@ -112,6 +112,25 @@ class IoTraceTest(unittest.TestCase):
         cpu = {row[0]: row[2] for row in load["busiestCpuThreads"]}
         self.assertAlmostEqual(cpu[111], 0.5, places=2)
 
+    def test_metadata_calls(self):
+        meta, blob = toy()
+        blob = blob[:-profile_io.EVENT.size] + b"".join([
+            ev(5.4, 0.004, 12, file=2, stack=2),                                     # stat
+            ev(5.41, 0.003, 12, file=2, stack=2, flags=profile_io.FLAG_FAILED),
+            ev(5.5, 0.020, 13, file=3, result=40, stack=2, extra=30000),             # listing of 40 entries
+            ev(5.6, 0.001, 14, stack=1),                                             # GetCurrentDirectory
+            ev(5.7, 0.001, 12, file=2, stack=1, flags=profile_io.FLAG_NESTED),       # counted by its outer call
+        ])
+        meta["events"] = 18
+        load = next(p for p in profile_io.IoTrace(meta, blob).summary()["phases"] if p["name"] == "load Riverwood")
+        self.assertEqual(load["metadata"]["stat"][0], 3)
+        self.assertEqual(load["metadata"]["stat"][2], 1)
+        self.assertEqual(load["listedEntries"], 40)
+        callers = {row[0]: row for row in load["topMetadataCallers"]}
+        self.assertEqual(callers["Foo.dll!Reader::Pull"][2:], [2, 1, 0])
+        report = profile_io.render_text({**profile_io.IoTrace(meta, blob).summary(), "plugins": [], "dlls": []})
+        self.assertIn("listed entries 40", report)
+
     def test_plugins_and_dlls(self):
         trace = self.trace()
         plugins = trace.plugin_times()

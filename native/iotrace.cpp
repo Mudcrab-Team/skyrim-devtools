@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // COMMUNITY(alandtse/CommonLibSSE-NG@7c27a75da3eb0db080c1f1f63f6df1b7cd733c2a, GPL-3.0-or-later)
-// I/O and load tracing: every file open, read, seek, mapping and DLL load in the game process, with file,
+// I/O and load tracing: every file open, read, seek, mapping, attribute probe, directory listing and DLL load in
+// the game process, with file,
 // bytes, latency, thread and call stack, plus memory, page-fault and per-thread CPU counters and load-phase
 // marks. The client turns a dump into SQLite tables, a Perfetto timeline and a report
 // (skyrim_devtools/profile_io.py).
@@ -52,6 +53,10 @@ namespace
         opNtRead = 9,       // NtReadFile not reached through ReadFile
         opLoadLibrary = 10, // `file` is the DLL path
         opPluginLoad = 11,  // SKSEPlugin_Load of the DLL in `file`
+        opStat = 12,        // GetFileAttributes(Ex) or a direct NtQuery(Full)AttributesFile; `file` is the path asked for
+        opEnum = 13,        // one directory listing, FindFirstFile to FindClose; `result` is the entries returned, the
+                            // duration is the time spent inside the Find calls, `extra` the wall time to FindClose
+        opCwd = 14,         // GetCurrentDirectory; cheap natively, but a virtual file system may hook it
     };
 
     enum Flag : std::uint8_t
@@ -87,9 +92,10 @@ namespace
     {
         bool armed = false;
         int stackDepth = 10;
-        std::uint64_t maxEvents = 3'000'000;
+        std::uint64_t maxEvents = 6'000'000;
         int counterMs = 50;
         int threadMs = 250;
+        int threadScanMs = 2000;  // a system-wide thread snapshot is costly, so new threads are picked up less often
     } settings;
 
     std::atomic_bool recording = false;
@@ -225,8 +231,10 @@ namespace
         return it->second;
     }
 
+    constexpr std::uint32_t captureStack = UINT32_MAX;
+
     void Record(Op op, std::int64_t start, std::int64_t end, std::uint32_t file, std::uint64_t offset, std::uint32_t size,
-        std::uint32_t result, std::uint8_t flags, std::uint64_t extra, bool stack = true)
+        std::uint32_t result, std::uint8_t flags, std::uint64_t extra, bool stack = true, std::uint32_t stackId = captureStack)
     {
         auto* e = Slot();
         if (!e) {
@@ -238,7 +246,7 @@ namespace
         e->offset = offset;
         e->size = size;
         e->result = result;
-        e->stack = stack ? CaptureStack() : 0;
+        e->stack = !stack ? 0 : stackId != captureStack ? stackId : CaptureStack();
         e->thread = ThreadIndex();
         e->flags = static_cast<std::uint8_t>(flags | (depth > 1 ? flagNested : 0));
         e->extra = extra;
@@ -708,9 +716,8 @@ namespace
     }
     constexpr auto pluginWrappers = MakeWrappers(std::make_index_sequence<pluginSlots>{});
 
-    FARPROC WINAPI HookedGetProcAddress(HMODULE module, LPCSTR name)
+    FARPROC WrapPluginLoad(HMODULE module, LPCSTR name, FARPROC proc)
     {
-        const auto proc = getProcAddress.original(module, name);
         if (!proc || !recording.load(std::memory_order_relaxed) || reinterpret_cast<std::uintptr_t>(name) <= 0xFFFF ||
             std::strcmp(name, "SKSEPlugin_Load") != 0) {
             return proc;
@@ -734,6 +741,270 @@ namespace
         pluginCount = slot + 1;
         SetLastError(error);
         return reinterpret_cast<FARPROC>(pluginWrappers[slot]);
+    }
+
+    FARPROC WINAPI HookedGetProcAddress(HMODULE module, LPCSTR name)
+    {
+        return WrapPluginLoad(module, name, getProcAddress.original(module, name));
+    }
+
+    // kernel32!GetProcAddress, which SKSE imports, enters kernelbase here rather than through its GetProcAddress.
+    using GetProcAddressForCallerFn = FARPROC(WINAPI*)(HMODULE, LPCSTR, PVOID);
+    Hook<GetProcAddressForCallerFn> getProcAddressForCaller;
+
+    FARPROC WINAPI HookedGetProcAddressForCaller(HMODULE module, LPCSTR name, PVOID caller)
+    {
+        return WrapPluginLoad(module, name, getProcAddressForCaller.original(module, name, caller));
+    }
+
+    // ---- metadata: attribute probes, directory listings, current directory ----------------------
+
+    Hook<decltype(&GetFileAttributesW)> getFileAttributesW;
+    Hook<decltype(&GetFileAttributesA)> getFileAttributesA;
+    Hook<decltype(&GetFileAttributesExW)> getFileAttributesExW;
+    Hook<decltype(&GetFileAttributesExA)> getFileAttributesExA;
+    Hook<decltype(&FindFirstFileExW)> findFirstFileExW;
+    Hook<decltype(&FindFirstFileExA)> findFirstFileExA;
+    Hook<decltype(&FindFirstFileW)> findFirstFileW;
+    Hook<decltype(&FindFirstFileA)> findFirstFileA;
+    Hook<decltype(&FindNextFileW)> findNextFileW;
+    Hook<decltype(&FindNextFileA)> findNextFileA;
+    Hook<decltype(&FindClose)> findClose;
+    Hook<decltype(&GetCurrentDirectoryW)> getCurrentDirectoryW;
+    Hook<decltype(&GetCurrentDirectoryA)> getCurrentDirectoryA;
+    using NtQueryAttributesFileFn = NTSTATUS(NTAPI*)(POBJECT_ATTRIBUTES, PVOID);
+    Hook<NtQueryAttributesFileFn> ntQueryAttributesFile;
+    Hook<NtQueryAttributesFileFn> ntQueryFullAttributesFile;
+
+    std::wstring Widen(LPCSTR text)
+    {
+        wchar_t wide[1024];
+        const auto n = text ? MultiByteToWideChar(CP_ACP, 0, text, -1, wide, static_cast<int>(std::size(wide))) : 0;
+        return n > 0 ? std::wstring(wide, n - 1) : std::wstring(L"?");
+    }
+
+    template <class Call, class Ok>
+    auto Stat(std::wstring_view path, Call call, Ok ok)
+    {
+        Scope scope;
+        const auto start = Now();
+        const auto result = call();
+        if (scope.on && depth == 1) {
+            const auto error = GetLastError();
+            const auto end = Now();
+            scope.Begin();
+            const bool good = ok(result);
+            Record(opStat, start, end, InternFile(path), 0, 0, good ? 0 : error, static_cast<std::uint8_t>(good ? 0 : flagFailed), 0);
+            scope.End();
+            SetLastError(error);
+        }
+        return result;
+    }
+
+    constexpr auto attributesOk = [](DWORD r) { return r != INVALID_FILE_ATTRIBUTES; };
+    constexpr auto boolOk = [](BOOL r) { return r != FALSE; };
+    constexpr auto statusOk = [](NTSTATUS r) { return r >= 0; };
+
+    DWORD WINAPI HookedGetFileAttributesW(LPCWSTR path)
+    {
+        if (!path) {
+            return getFileAttributesW.original(path);
+        }
+        return Stat(path, [&] { return getFileAttributesW.original(path); }, attributesOk);
+    }
+
+    DWORD WINAPI HookedGetFileAttributesA(LPCSTR path)
+    {
+        if (!path || !recording.load(std::memory_order_relaxed)) {
+            return getFileAttributesA.original(path);
+        }
+        return Stat(Widen(path), [&] { return getFileAttributesA.original(path); }, attributesOk);
+    }
+
+    BOOL WINAPI HookedGetFileAttributesExW(LPCWSTR path, GET_FILEEX_INFO_LEVELS level, LPVOID info)
+    {
+        if (!path) {
+            return getFileAttributesExW.original(path, level, info);
+        }
+        return Stat(path, [&] { return getFileAttributesExW.original(path, level, info); }, boolOk);
+    }
+
+    BOOL WINAPI HookedGetFileAttributesExA(LPCSTR path, GET_FILEEX_INFO_LEVELS level, LPVOID info)
+    {
+        if (!path || !recording.load(std::memory_order_relaxed)) {
+            return getFileAttributesExA.original(path, level, info);
+        }
+        return Stat(Widen(path), [&] { return getFileAttributesExA.original(path, level, info); }, boolOk);
+    }
+
+    std::wstring ObjectPath(POBJECT_ATTRIBUTES attributes)
+    {
+        if (!attributes || !attributes->ObjectName || !attributes->ObjectName->Buffer) {
+            return L"?";
+        }
+        std::wstring path(attributes->ObjectName->Buffer, attributes->ObjectName->Length / sizeof(wchar_t));
+        if (attributes->RootDirectory) {
+            path.insert(0, L"<relative>\\");
+        }
+        return path;
+    }
+
+    // Only direct callers: kernelbase's own attribute calls arrive here nested and are already recorded.
+    NTSTATUS NTAPI HookedNtQueryAttributesFile(POBJECT_ATTRIBUTES attributes, PVOID info)
+    {
+        if (depth > 0 || quiet || !recording.load(std::memory_order_relaxed)) {
+            return ntQueryAttributesFile.original(attributes, info);
+        }
+        return Stat(ObjectPath(attributes), [&] { return ntQueryAttributesFile.original(attributes, info); }, statusOk);
+    }
+
+    NTSTATUS NTAPI HookedNtQueryFullAttributesFile(POBJECT_ATTRIBUTES attributes, PVOID info)
+    {
+        if (depth > 0 || quiet || !recording.load(std::memory_order_relaxed)) {
+            return ntQueryFullAttributesFile.original(attributes, info);
+        }
+        return Stat(ObjectPath(attributes), [&] { return ntQueryFullAttributesFile.original(attributes, info); }, statusOk);
+    }
+
+    // Open listings: find handle -> where and when it started, the time spent in Find calls, entries returned.
+    struct Listing
+    {
+        std::int64_t start;
+        std::int64_t ticks;
+        std::uint32_t file;
+        std::uint32_t stack;
+        std::uint32_t entries;
+    };
+    std::mutex listingMutex;
+    std::unordered_map<HANDLE, Listing> listings;
+
+    template <class Call>
+    HANDLE FindFirst(std::wstring_view pattern, Call call)
+    {
+        Scope scope;
+        const auto start = Now();
+        const auto handle = call();
+        if (scope.on && depth == 1) {
+            const auto error = GetLastError();
+            const auto end = Now();
+            scope.Begin();
+            const auto file = InternFile(pattern);
+            if (handle == INVALID_HANDLE_VALUE) {
+                Record(opEnum, start, end, file, 0, 0, 0, flagFailed, static_cast<std::uint64_t>(end - start));
+            } else {
+                const auto stack = CaptureStack();
+                std::lock_guard lock(listingMutex);
+                listings[handle] = { start, end - start, file, stack, 1 };
+            }
+            scope.End();
+            SetLastError(error);
+        }
+        return handle;
+    }
+
+    template <class Call>
+    BOOL FindNext(HANDLE handle, Call call)
+    {
+        Scope scope;
+        const auto start = Now();
+        const auto ok = call();
+        if (scope.on && depth == 1) {
+            const auto error = GetLastError();
+            const auto ticks = Now() - start;
+            scope.Begin();
+            {
+                std::lock_guard lock(listingMutex);
+                if (const auto it = listings.find(handle); it != listings.end()) {
+                    it->second.ticks += ticks;
+                    it->second.entries += ok ? 1 : 0;
+                }
+            }
+            scope.End();
+            SetLastError(error);
+        }
+        return ok;
+    }
+
+    HANDLE WINAPI HookedFindFirstFileExW(LPCWSTR pattern, FINDEX_INFO_LEVELS level, LPVOID data, FINDEX_SEARCH_OPS op, LPVOID filter, DWORD flags)
+    {
+        return FindFirst(pattern ? pattern : L"?", [&] { return findFirstFileExW.original(pattern, level, data, op, filter, flags); });
+    }
+
+    HANDLE WINAPI HookedFindFirstFileExA(LPCSTR pattern, FINDEX_INFO_LEVELS level, LPVOID data, FINDEX_SEARCH_OPS op, LPVOID filter, DWORD flags)
+    {
+        return FindFirst(recording.load(std::memory_order_relaxed) ? Widen(pattern) : std::wstring(),
+            [&] { return findFirstFileExA.original(pattern, level, data, op, filter, flags); });
+    }
+
+    HANDLE WINAPI HookedFindFirstFileW(LPCWSTR pattern, LPWIN32_FIND_DATAW data)
+    {
+        return FindFirst(pattern ? pattern : L"?", [&] { return findFirstFileW.original(pattern, data); });
+    }
+
+    HANDLE WINAPI HookedFindFirstFileA(LPCSTR pattern, LPWIN32_FIND_DATAA data)
+    {
+        return FindFirst(recording.load(std::memory_order_relaxed) ? Widen(pattern) : std::wstring(),
+            [&] { return findFirstFileA.original(pattern, data); });
+    }
+
+    BOOL WINAPI HookedFindNextFileW(HANDLE handle, LPWIN32_FIND_DATAW data)
+    {
+        return FindNext(handle, [&] { return findNextFileW.original(handle, data); });
+    }
+
+    BOOL WINAPI HookedFindNextFileA(HANDLE handle, LPWIN32_FIND_DATAA data)
+    {
+        return FindNext(handle, [&] { return findNextFileA.original(handle, data); });
+    }
+
+    BOOL WINAPI HookedFindClose(HANDLE handle)
+    {
+        Listing listing{};
+        bool found = false;
+        if (recording.load(std::memory_order_relaxed)) {
+            std::lock_guard lock(listingMutex);
+            if (const auto it = listings.find(handle); it != listings.end()) {
+                listing = it->second;
+                listings.erase(it);
+                found = true;
+            }
+        }
+        const auto ok = findClose.original(handle);
+        if (found) {
+            const auto error = GetLastError();
+            const auto now = Now();
+            Record(opEnum, listing.start, listing.start + listing.ticks, listing.file, 0, 0, listing.entries, 0,
+                static_cast<std::uint64_t>(now - listing.start), true, listing.stack);
+            SetLastError(error);
+        }
+        return ok;
+    }
+
+    template <class Call>
+    DWORD Cwd(Call call)
+    {
+        Scope scope;
+        const auto start = Now();
+        const auto n = call();
+        if (scope.on && depth == 1) {
+            const auto error = GetLastError();
+            const auto end = Now();
+            scope.Begin();
+            Record(opCwd, start, end, 0, 0, 0, n, 0, 0);
+            scope.End();
+            SetLastError(error);
+        }
+        return n;
+    }
+
+    DWORD WINAPI HookedGetCurrentDirectoryW(DWORD size, LPWSTR buffer)
+    {
+        return Cwd([&] { return getCurrentDirectoryW.original(size, buffer); });
+    }
+
+    DWORD WINAPI HookedGetCurrentDirectoryA(DWORD size, LPSTR buffer)
+    {
+        return Cwd([&] { return getCurrentDirectoryA.original(size, buffer); });
     }
 
     NTSTATUS NTAPI HookedNtReadFile(HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, PVOID context, PIO_STATUS_BLOCK io, PVOID buffer,
@@ -839,25 +1110,44 @@ namespace
         return s;
     }
 
-    void SampleThreads()
+    // Thread handles stay open between samples; only the snapshot that finds new threads walks every thread in
+    // the system, which is what made sampling expensive, so it runs every threadScanMs.
+    std::unordered_map<DWORD, HANDLE> sampledThreads;
+
+    void ScanThreads()
     {
         const auto snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (snapshot == INVALID_HANDLE_VALUE) {
             return;
         }
         const auto pid = GetCurrentProcessId();
-        const auto now = Now();
         THREADENTRY32 entry{ sizeof(entry) };
-        std::vector<ThreadSample> batch;
         for (auto more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
-            if (entry.th32OwnerProcessID != pid) {
+            if (entry.th32OwnerProcessID != pid || sampledThreads.contains(entry.th32ThreadID)) {
                 continue;
             }
-            const auto thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
-            if (!thread) {
+            if (const auto thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID)) {
+                sampledThreads[entry.th32ThreadID] = thread;
+            }
+        }
+        CloseHandle(snapshot);
+    }
+
+    void SampleThreads()
+    {
+        const auto now = Now();
+        std::vector<ThreadSample> batch;
+        batch.reserve(sampledThreads.size());
+        for (auto it = sampledThreads.begin(); it != sampledThreads.end();) {
+            const auto [tid, thread] = *it;
+            DWORD code = 0;
+            if (!GetExitCodeThread(thread, &code) || code != STILL_ACTIVE) {
+                CloseHandle(thread);
+                it = sampledThreads.erase(it);
                 continue;
             }
-            ThreadSample t{ now, entry.th32ThreadID, 0, 0 };
+            ++it;
+            ThreadSample t{ now, tid, 0, 0 };
             ULONG64 cycles = 0;
             QueryThreadCycleTime(thread, &cycles);
             t.cycles = cycles;
@@ -869,7 +1159,7 @@ namespace
             bool named = false;
             {
                 std::lock_guard lock(counterMutex);
-                named = threadNames.contains(entry.th32ThreadID);
+                named = threadNames.contains(tid);
             }
             if (!named) {
                 using GetDescriptionFn = HRESULT(WINAPI*)(HANDLE, PWSTR*);
@@ -882,12 +1172,10 @@ namespace
                     LocalFree(description);
                 }
                 std::lock_guard lock(counterMutex);
-                threadNames[entry.th32ThreadID] = name;
+                threadNames[tid] = name;
             }
-            CloseHandle(thread);
             batch.push_back(t);
         }
-        CloseHandle(snapshot);
         std::lock_guard lock(counterMutex);
         threadSamples.insert(threadSamples.end(), batch.begin(), batch.end());
     }
@@ -902,11 +1190,15 @@ namespace
         const auto query = reinterpret_cast<NtQuerySystemInformationFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation"));
         int tick = 0;
         const int threadEvery = std::max(1, settings.threadMs / std::max(1, settings.counterMs));
+        const int scanEvery = std::max(1, settings.threadScanMs / std::max(1, settings.counterMs));
         while (!samplerStop.load()) {
             const auto sample = TakeCounters(query);
             {
                 std::lock_guard lock(counterMutex);
                 counters.push_back(sample);
+            }
+            if (tick % scanEvery == 0) {
+                ScanThreads();
             }
             if (tick++ % threadEvery == 0) {
                 SampleThreads();
@@ -985,6 +1277,8 @@ namespace
                     settings.maxEvents = static_cast<std::uint64_t>(std::clamp<long long>(value, 1000, 50'000'000));
                 } else if (key == "counterMs") {
                     settings.counterMs = static_cast<int>(std::clamp<long long>(value, 5, 5000));
+                } else if (key == "threadScanMs") {
+                    settings.threadScanMs = static_cast<int>(std::clamp<long long>(value, 100, 60000));
                 } else if (key == "threadMs") {
                     settings.threadMs = static_cast<int>(std::clamp<long long>(value, 10, 10000));
                 }
@@ -1028,7 +1322,26 @@ namespace
         Install(kb, "CloseHandle", &HookedCloseHandle, closeHandle);
         Install(kb, "LoadLibraryExW", &HookedLoadLibraryExW, loadLibraryExW);
         Install(kb, "LoadLibraryExA", &HookedLoadLibraryExA, loadLibraryExA);
-        Install(kb, "GetProcAddress", &HookedGetProcAddress, getProcAddress);
+        if (GetProcAddress(GetModuleHandleA(kb), "GetProcAddressForCaller")) {
+            Install(kb, "GetProcAddressForCaller", &HookedGetProcAddressForCaller, getProcAddressForCaller);
+        } else {
+            Install(kb, "GetProcAddress", &HookedGetProcAddress, getProcAddress);
+        }
+        Install(kb, "GetFileAttributesW", &HookedGetFileAttributesW, getFileAttributesW);
+        Install(kb, "GetFileAttributesA", &HookedGetFileAttributesA, getFileAttributesA);
+        Install(kb, "GetFileAttributesExW", &HookedGetFileAttributesExW, getFileAttributesExW);
+        Install(kb, "GetFileAttributesExA", &HookedGetFileAttributesExA, getFileAttributesExA);
+        Install(kb, "FindFirstFileExW", &HookedFindFirstFileExW, findFirstFileExW);
+        Install(kb, "FindFirstFileExA", &HookedFindFirstFileExA, findFirstFileExA);
+        Install(kb, "FindFirstFileW", &HookedFindFirstFileW, findFirstFileW);
+        Install(kb, "FindFirstFileA", &HookedFindFirstFileA, findFirstFileA);
+        Install(kb, "FindNextFileW", &HookedFindNextFileW, findNextFileW);
+        Install(kb, "FindNextFileA", &HookedFindNextFileA, findNextFileA);
+        Install(kb, "FindClose", &HookedFindClose, findClose);
+        Install(kb, "GetCurrentDirectoryW", &HookedGetCurrentDirectoryW, getCurrentDirectoryW);
+        Install(kb, "GetCurrentDirectoryA", &HookedGetCurrentDirectoryA, getCurrentDirectoryA);
+        Install("ntdll.dll", "NtQueryAttributesFile", &HookedNtQueryAttributesFile, ntQueryAttributesFile);
+        Install("ntdll.dll", "NtQueryFullAttributesFile", &HookedNtQueryFullAttributesFile, ntQueryFullAttributesFile);
         Install("ntdll.dll", "NtReadFile", &HookedNtReadFile, ntReadFile);
         if (!setFilePointerEx.original) {
             setFilePointerEx.original = &SetFilePointerEx;

@@ -24,7 +24,8 @@ from skyrim_devtools.profiling import GameSymbols, address_library_path, researc
 
 EVENT = struct.Struct("<qIIQIIIHBBQ")
 OPS = {1: "open", 2: "read", 3: "read-issue", 4: "read-wait", 5: "seek", 6: "mapping", 7: "map-view", 8: "close",
-       9: "nt-read", 10: "load-library", 11: "plugin-load"}
+       9: "nt-read", 10: "load-library", 11: "plugin-load", 12: "stat", 13: "enum", 14: "cwd"}
+META_OPS = {12, 13, 14}
 READ_OPS = {2, 3, 9}
 FLAG_FAILED, FLAG_OVERLAPPED, FLAG_NOBUF, FLAG_SEQ, FLAG_RANDOM, FLAG_WRITE, FLAG_PENDING, FLAG_NESTED = (
     1, 2, 4, 8, 16, 32, 64, 128)
@@ -317,6 +318,12 @@ class IoTrace:
                 callers[caller]["reads"] += 1
                 callers[caller]["readS"] += e.dur
                 callers[caller]["bytes"] += e.result or e.size
+            meta_callers = defaultdict(Counter)
+            for e in events:
+                if e.op in META_OPS and not e.flags & FLAG_NESTED:
+                    caller = self.callers.get(e.stack, ("?", "?", []))[0]
+                    meta_callers[caller][OPS[e.op]] += 1
+                    meta_callers[caller]["s"] += e.dur
             cpu = self.thread_cpu(a, b)
             hist, time_hist = self.size_histogram(events)
             top_files = sorted(stats.items(), key=lambda kv: -(kv[1]["readS"] + kv[1]["openS"]))[:top]
@@ -328,6 +335,11 @@ class IoTrace:
                 "readBytes": sum(e.result or e.size for e in reads),
                 "overlappedWaits": len(waits), "overlappedWaitS": round(sum(e.dur for e in waits), 3),
                 "mapViews": sum(1 for e in events if e.op == 7),
+                "metadata": {OPS[op]: [sum(1 for e in events if e.op == op), round(sum(e.dur for e in events if e.op == op), 3),
+                                       sum(1 for e in events if e.op == op and e.flags & FLAG_FAILED)] for op in sorted(META_OPS)},
+                "listedEntries": sum(e.result for e in events if e.op == 13),
+                "topMetadataCallers": [[c, round(v["s"], 3), v["stat"], v["enum"], v["cwd"]]
+                                       for c, v in sorted(meta_callers.items(), key=lambda kv: -kv[1]["s"])[:top]],
                 "counters": self.counter_delta(a, b),
                 "sizeHistogram": {str(k): [hist[k], round(time_hist[k], 3)] for k in SIZE_BUCKETS + ["larger"] if hist[k]},
                 "byKind": {k: {kk: (round(v, 3) if isinstance(v, float) else v) for kk, v in c.items()}
@@ -484,6 +496,11 @@ def perfetto_trace(trace, min_us=50.0):
             continue
         path = trace.files[e.file][0] if e.file < len(trace.files) else "?"
         tid = trace.thread_ids[e.thread] if e.thread < len(trace.thread_ids) else 0
+        if e.op == 13:
+            # A listing's Find calls are spread between other work on the thread, so a slice would overlap it.
+            events.append({"ph": "i", "pid": pid, "tid": tid, "s": "t", "name": f"enum {path}", "ts": e.t * 1e6, "cat": "enum",
+                           "args": {"entries": e.result, "findS": e.dur, "caller": trace.callers.get(e.stack, ("?",))[0]}})
+            continue
         events.append({"ph": "X", "pid": pid, "tid": tid, "name": f"{OPS.get(e.op)} {path.rsplit(chr(92), 1)[-1]}",
                        "ts": e.t * 1e6, "dur": e.dur * 1e6, "cat": OPS.get(e.op),
                        "args": {"file": path, "size": e.size, "result": e.result,
@@ -524,6 +541,13 @@ def render_text(summary, top=10):
         lines.append(f"  opens {p['opens']} ({p['openS']:.2f} s, {p['failedOpens']} failed)  reads {p['reads']} "
                      f"({p['readS']:.2f} s, {fmt_bytes(p['readBytes'])})  overlapped waits {p['overlappedWaits']} "
                      f"({p['overlappedWaitS']:.2f} s)  map views {p['mapViews']}")
+        m = p.get("metadata") or {}
+        if any(v[0] for v in m.values()):
+            lines.append("  metadata: " + "  ".join(f"{k} {v[0]} ({v[1]:.2f} s, {v[2]} failed)" for k, v in m.items())
+                         + f"  listed entries {p.get('listedEntries', 0)}")
+            lines.append("  top metadata callers (s, stat, enum, cwd):")
+            for r in p.get("topMetadataCallers", [])[:top]:
+                lines.append(f"    {r[1]:7.3f} {r[2]:7d} {r[3]:6d} {r[4]:6d}  {r[0]}")
         if c:
             lines.append(f"  page faults {c.get('pageFaults', 0)}  system hard-fault reads {c.get('sysPageReads', 0)} "
                          f"in {c.get('sysPageReadIos', 0)} I/Os  transition {c.get('sysTransition', 0)}  demand-zero "
