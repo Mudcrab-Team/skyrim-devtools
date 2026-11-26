@@ -40,6 +40,11 @@ namespace devtools
     void OnSkseMessage(std::function<void(SKSE::MessagingInterface::Message&)> listener);
     void DispatchSkseMessage(SKSE::MessagingInterface::Message& message);
 
+    // The save the last successful Session.loadSave/reload loaded; empty when none did.
+    std::string LastLoadedSave();
+    // A module that loads a save itself names it first, so LastLoadedSave reflects it once the load finishes.
+    void NotePendingSave(const std::string& name);
+
     RE::UI& RequireUI();
     bool MovieReady(RE::UI& ui, std::string_view menu);
     bool Playable(RE::UI& ui);

@@ -25,6 +25,34 @@ namespace
     bool hooked = false;
 
     thread_local std::vector<std::string>* capture = nullptr;
+    // Set while Run executes a script, so the compiler detour does not report it a second time as typed.
+    thread_local bool insideRun = false;
+
+    console::CommandObserver observer;
+    bool compilerHooked = false;
+
+    using CompileAndRun = void (*)(RE::Script*, RE::ScriptCompiler*, RE::COMPILER_NAME, RE::TESObjectREFR*);
+    CompileAndRun originalCompile = nullptr;
+
+    void HookedCompile(RE::Script* script, RE::ScriptCompiler* compiler, RE::COMPILER_NAME name, RE::TESObjectREFR* target)
+    {
+        // The console window compiles with the system-window compiler; script and quest compilers are not typed input.
+        if (!insideRun && observer && script && name == RE::COMPILER_NAME::kSystemWindowCompiler) {
+            const auto command = script->GetCommand();
+            if (!command.empty()) {
+                observer(command, true);
+            }
+        }
+        originalCompile(script, compiler, name, target);
+    }
+
+    bool InstallCompileHook()
+    {
+        REL::Relocation<std::uintptr_t> target{ RELOCATION_ID(21416, 21890) };
+        auto* address = reinterpret_cast<void*>(target.address());
+        return MH_CreateHook(address, reinterpret_cast<void*>(&HookedCompile), reinterpret_cast<void**>(&originalCompile)) == MH_OK &&
+               MH_EnableHook(address) == MH_OK;
+    }
 
     std::mutex historyMutex;
     std::deque<std::pair<std::uint64_t, std::string>> history;
@@ -99,6 +127,8 @@ namespace
 
 namespace devtools::console
 {
+    void SetCommandObserver(CommandObserver next) { observer = std::move(next); }
+
     std::vector<std::string> Run(std::string_view command, RE::TESObjectREFR* target)
     {
         if (!hooked) {
@@ -114,8 +144,13 @@ namespace devtools::console
         }
         std::vector<std::string> lines;
         capture = &lines;
+        insideRun = true;
         script->SetCommand(command);
+        if (observer) {
+            observer(command, false);
+        }
         script->CompileAndRun(target);
+        insideRun = false;
         capture = nullptr;
         delete script;
         return lines;
@@ -126,6 +161,8 @@ DEVTOOLS_MODULE(Console)
 {
     events::Declare("console", "A line printed to the game console: {line, lineSeq}");
     hooked = InstallHook();
+    compilerHooked = InstallCompileHook();
+    SetCapability("consoleTyped", compilerHooked);
     SetCapability("console", hooked);
 
     Register("Console.execute", [](const Json& params) {

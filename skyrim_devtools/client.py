@@ -320,6 +320,20 @@ class Session:
     async def record_list(self):
         return await self.call("Record.list")
 
+    async def recording_start(self, name=None, interval_ms=None, notes=None, coupling=None):
+        return await self._call_set("Recording.start", name=name, intervalMs=interval_ms, notes=notes, coupling=coupling,
+                                    loadEpoch=self.epoch)
+
+    async def recording_stop(self):
+        return await self.call("Recording.stop")
+
+    async def recording_replay(self, path, **options):
+        """Start a replay (options are Recording.replay parameters); returns at once with the replay id."""
+        return await self._call_set("Recording.replay", path=path, **options)
+
+    async def recording_status(self):
+        return await self.call("Recording.status")
+
     # --- Menus by meaning (see docs/protocol.md, "Menu semantics") ---
 
     async def ui_get(self, menu, path, depth=None):
