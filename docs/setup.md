@@ -85,7 +85,7 @@ scratch root with the following layout.
 - **config.json** with {"port":48682,"cloudSyncDisabled":true} after disabling Steam Cloud for Skyrim.
   Optional keys are `headless` (default false), `width` and `height` (1280x720),
   `muteAudio` (true), `watchdogMinutes` (240, 0 turns it off), `idleTimeoutSeconds` (1800) and
-  `connectTimeoutSeconds` (600). For the two timeouts, 0 turns them off.
+  `connectTimeoutSeconds` (600) and `modules` (a comma-separated plugin module allow-list, default all). For the two timeouts, 0 turns them off.
 
 The first launch copies Skyrim.ini and SkyrimPrefs.ini to profile/ini-original/. Every launch
 writes the effective INIs from those copies. A headless launch adds bAlwaysActive=1, bFull

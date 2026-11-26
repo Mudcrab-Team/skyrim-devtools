@@ -207,6 +207,11 @@ once a second into a CSV), and restart the game if nothing explains it.
   [the Embershard playtest](playtests/embershard-mine.md). `disableAudio: true` in the host's `config.json` writes
   `bEnableAudio=0` for visible runs and slows the growth. Restart the game after about 30 minutes, and watch
   `Get-Process SkyrimSE` thread count next to `perf_check`.
+* `windows/thread-census.ps1` (copy it next to host.ps1) groups a running game's threads by start address, state and
+  wait reason, and with `-AllStacks` by the call sites that own them (module+offset, heuristic). `tests/live/thread_leak.py`
+  runs it once a minute during a soak and ranks the groups that grow. The host config key `modules` (a comma-separated
+  list such as `Events,Session,Input,NavMove,StatePlayer`) installs only those plugin modules, to tell what the plugin
+  creates from what the game or SKSE creates.
 * A visible game runs borderless-windowed at the profile's resolution (`bFull Screen=0`): exclusive fullscreen
   drew the picture in a corner of the monitor and made the desktop capture black. `Window.info` reports the
   window, client, monitor, swap chain size and DPI awareness, to check the game fills the screen.

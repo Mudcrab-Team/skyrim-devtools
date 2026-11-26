@@ -13,4 +13,6 @@ namespace devtools::bus
 {
     void Handle(const std::string& text, const std::shared_ptr<Outbox>& outbox);
     [[nodiscard]] Json Stats();
+    // Stops and joins the deadline thread. Calls made afterwards run without a timeout.
+    void Shutdown();
 }

@@ -551,6 +551,12 @@ function Run-Game {
         $env:SKYRIM_DEVTOOLS_HEADLESS = if ($headless) { '1' } else { '0' }
         $env:SKYRIM_DEVTOOLS_IDLE_TIMEOUT = Read-Seconds $config.idleTimeoutSeconds 1800
         $env:SKYRIM_DEVTOOLS_CONNECT_TIMEOUT = Read-Seconds $config.connectTimeoutSeconds 600
+        # A comma-separated module allow-list for bisecting; unset installs everything.
+        if ($config.modules -is [string] -and $config.modules -match '^[A-Za-z0-9,]+$') {
+            $env:SKYRIM_DEVTOOLS_MODULES = $config.modules
+        } else {
+            Remove-Item Env:SKYRIM_DEVTOOLS_MODULES -ErrorAction SilentlyContinue
+        }
         $reason = 'loader'
         $loaderProcess = Start-Process -FilePath (Join-Path $games 'skse64_loader.exe') -WorkingDirectory $games -PassThru
         $deadline = [DateTime]::UtcNow.AddSeconds(25)
