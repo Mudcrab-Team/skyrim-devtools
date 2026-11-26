@@ -3,6 +3,7 @@
 // Generic menu control: any menu the game registered can be opened, closed and observed.
 #include "events.h"
 #include "game.h"
+#include "input.h"
 #include "methods.h"
 
 #include <algorithm>
@@ -56,6 +57,18 @@ namespace
         }
     };
 
+    // These menus are driven by game state that only the engine's own flow sets up (a trainer, a
+    // container, a conversation). Showing one without it leaves a half-initialised menu, and hiding one
+    // behind the engine's back left the game frozen, so they are opened by activating the right actor
+    // and closed with the Cancel control the way a player leaves them.
+    bool ContextBound(const std::string& name)
+    {
+        static const std::initializer_list<std::string_view> names{ RE::TrainingMenu::MENU_NAME, RE::BarterMenu::MENU_NAME,
+            RE::GiftMenu::MENU_NAME, RE::ContainerMenu::MENU_NAME, RE::LockpickingMenu::MENU_NAME,
+            RE::CraftingMenu::MENU_NAME, RE::DialogueMenu::MENU_NAME, RE::BookMenu::MENU_NAME };
+        return std::ranges::find(names, std::string_view(name)) != names.end();
+    }
+
     bool Registered(RE::UI& ui, const std::string& name)
     {
         return ui.menuMap.find(RE::BSFixedString(name)) != ui.menuMap.end();
@@ -63,11 +76,16 @@ namespace
 
     void SetMenu(const Json& params, const ReplyPtr& reply, bool opening)
     {
-        AllowOnly(params, { "name", "wait", "anyState", "loadEpoch" });
+        AllowOnly(params, { "name", "wait", "anyState", "loadEpoch", "force" });
         auto& ui = RequireUI();
         const auto name = Require<std::string>(params, "name");
         if (!Registered(ui, name)) {
             throw RpcError(code::notFound, "No menu is registered as " + name);
+        }
+        const bool bound = ContextBound(name);
+        if (opening && bound && !ui.IsMenuOpen(name) && !Optional(params, "force", false)) {
+            throw RpcError(code::invalidParams,
+                name + " needs the game's own context (activate the trainer, container or actor instead); pass force=true to show it anyway");
         }
         // Most menus assume a loaded world; anyState is for menus that are valid at the main menu.
         if (!Optional(params, "anyState", false)) {
@@ -82,9 +100,19 @@ namespace
         if (!queue) {
             throw RpcError(code::notReady, "The menu queue is unavailable");
         }
+        const bool cancel = !opening && bound && !Optional(params, "force", false);
+        if (cancel && !input::Hooked()) {
+            throw RpcError(code::inputUnavailable, name + " must be left with the Cancel control, which needs the input hook");
+        }
         if (wait) {
             std::lock_guard lock(waitersMutex);
             waiters.push_back({ name, opening, reply });
+        }
+        if (cancel && TapControl("Cancel")) {
+            if (!wait) {
+                reply->Ok({ { "menu", name }, { "accepted", true }, { "via", "cancel" } });
+            }
+            return;
         }
         queue->AddMessage(RE::BSFixedString(name), opening ? RE::UI_MESSAGE_TYPE::kShow : RE::UI_MESSAGE_TYPE::kHide,
             nullptr);

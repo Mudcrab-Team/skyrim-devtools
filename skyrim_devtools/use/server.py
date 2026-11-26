@@ -110,14 +110,17 @@ def build_server(manager, recorder=None):
         return dumps(await manager.start(headless=headless, save=save))
 
     @mcp.tool()
-    async def game_stop() -> str:
-        """Close the game and release the connection. Always call this when finished."""
-        return dumps(await manager.stop())
+    async def game_stop(grace_seconds: int = 12) -> str:
+        """Close the game and release the connection. Always call this when finished. The game is asked to quit
+        and killed if it has not exited after grace_seconds (1-120); `path` in the result says which way it
+        ended (graceful, killed-after-Ns, closing-crashed) and `crash` carries the crash log's top frames."""
+        return dumps(await manager.stop(grace=max(1, min(120, grace_seconds))))
 
     @mcp.tool()
     async def game_status() -> str:
         """Phase (idle/starting/running/crashed/stopped/failed), session info and the crash reason if the game
-        died. Probes the live link, so it notices a crash that happened while you were idle."""
+        died (`crash.log` holds the crash logger's exception and top frames when one was written). Probes the live
+        link, so it notices a crash that happened while you were idle."""
         return dumps(await manager.status())
 
     # ---- observation --------------------------------------------------------------------------

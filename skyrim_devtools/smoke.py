@@ -47,12 +47,16 @@ class WindowsHost:
         if type(self.local_port) is not int or not 1024 <= self.local_port <= 65535:
             raise ValueError("Local port must be between 1024 and 65535")
 
-    async def command(self, action, session_id="", mode=""):
-        if action not in {"start", "status", "stop", "evidence"} or (session_id and not re.fullmatch("[a-f0-9]{32}", session_id)):
+    async def command(self, action, session_id="", mode="", grace=None):
+        if action not in {"start", "status", "stop", "evidence", "crashes"} or (session_id and not re.fullmatch("[a-f0-9]{32}", session_id)):
             raise ValueError("Invalid Windows session operation")
         if mode not in {"", "headless", "windowed"}:
             raise ValueError("Invalid display mode")
         argument = f"-Mode {mode}" if mode else session_id
+        if grace is not None:
+            if type(grace) is not int or not 1 <= grace <= 120:
+                raise ValueError("Grace period must be 1 to 120 seconds")
+            argument += f" -Grace {grace}"
         script = rf"& (Join-Path $env:USERPROFILE '.local\skyrim-devtools\host.ps1') {action} {argument}"
         encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
         process = await asyncio.create_subprocess_exec(
@@ -83,13 +87,14 @@ class WindowsHost:
 
         return await observe(read, lambda state: state["phase"] == "running", "Windows launch", 60)
 
-    async def stop(self, session_id):
-        await self.command("stop", session_id)
+    async def stop(self, session_id, grace=12):
+        """Ask the game to quit; the host kills it when it has not exited after `grace` seconds."""
+        await self.command("stop", session_id, grace=grace)
 
         async def read():
             return await self.command("status", session_id)
 
-        return await observe(read, lambda state: state["phase"] not in ACTIVE, "Windows shutdown", 22)
+        return await observe(read, lambda state: state["phase"] not in ACTIVE, "Windows shutdown", grace + 10)
 
     async def tunnel(self, port):
         if type(port) is not int or not 1024 <= port <= 65535:

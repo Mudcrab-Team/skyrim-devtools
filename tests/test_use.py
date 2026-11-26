@@ -104,19 +104,27 @@ class FakeHost:
         self.status = {"phase": "running", "reason": "", "exitCode": None}
         self.commands = []
         self.stopped = False
+        self.stop_result = {"phase": "stopped", "exitCode": 0, "reason": ""}
+        self.crash_logs = []
+        self.grace = None
 
-    async def command(self, action, session_id="", mode=""):
+    async def command(self, action, session_id="", mode="", grace=None):
         self.commands.append((action, mode))
         if action == "start":
             return {"sessionId": SESSION, "token": TOKEN, "port": 4000}
+        if action == "crashes":
+            return list(self.crash_logs)
+        if action == "evidence":
+            return {"crashLogs": list(self.crash_logs)}
         return dict(self.status)
 
     async def wait_ready(self, session_id):
         return self.status
 
-    async def stop(self, session_id):
+    async def stop(self, session_id, grace=12):
         self.stopped = True
-        return {"phase": "stopped", "exitCode": 0, "reason": ""}
+        self.grace = grace
+        return dict(self.stop_result)
 
     async def tunnel(self, port):
         return FakeTunnel()
@@ -296,6 +304,68 @@ class UseTests(unittest.TestCase):
             await asyncio.sleep(0.4)
             self.assertEqual(h.manager.phase, "crashed")
             await h.manager.stop()
+        run(scenario())
+
+    def test_stop_reports_the_path_taken(self):
+        async def scenario():
+            h = Harness()
+            await h.text("game_start")
+            stopped = json.loads(await h.text("game_stop", grace_seconds=30))
+            self.assertEqual((stopped["path"], stopped["cleanExit"], h.host.grace), ("graceful", True, 30))
+            await h.text("game_start")
+            h.host.stop_result = {"phase": "forced", "exitCode": None, "reason": "requested", "stopPath": "killed-after-5s"}
+            stopped = json.loads(await h.text("game_stop", grace_seconds=5))
+            self.assertEqual((stopped["path"], stopped["cleanExit"]), ("killed-after-5s", False))
+        run(scenario())
+
+    def test_crash_on_quit_carries_the_log(self):
+        async def scenario():
+            h = Harness()
+            await h.text("game_start")
+            h.host.crash_logs = [{"name": "crash-x.log", "exception": 'Unhandled exception "EXCEPTION_ACCESS_VIOLATION"\tcall [rax]',
+                                  "topFrames": ["0 SkyrimSE.exe+1193E59 -> 87837+0x59"]}]
+            h.host.stop_result = {"phase": "crashed", "exitCode": 1, "reason": "nonzero-exit", "stopPath": "closing-crashed",
+                                  "evidence": "evidence"}
+            stopped = json.loads(await h.text("game_stop"))
+            self.assertEqual(stopped["path"], "closing-crashed")
+            self.assertEqual(stopped["crash"]["log"]["topFrames"][0], "0 SkyrimSE.exe+1193E59 -> 87837+0x59")
+            self.assertNotIn("\t", stopped["crash"]["log"]["exception"])
+        run(scenario())
+
+    def test_status_reports_crash_log_after_a_silent_crash(self):
+        async def scenario():
+            h = Harness(keepalive=0.05)
+            await h.text("game_start")
+            h.host.status = {"phase": "crashed", "reason": "nonzero-exit", "exitCode": 1, "evidence": "evidence"}
+            h.host.crash_logs = [{"name": "crash-y.log", "exception": "Unhandled exception", "topFrames": ["0 SkyrimSE.exe+1"]}]
+            h.sockets[0].dead = True
+            await asyncio.sleep(0.4)
+            status = json.loads(await h.text("game_status"))
+            self.assertEqual(status["phase"], "crashed")
+            self.assertEqual(status["crash"]["log"]["file"], "crash-y.log")
+            await h.manager.stop()
+        run(scenario())
+
+    def test_start_is_repeated_when_the_engine_dies_at_launch(self):
+        async def scenario():
+            h = Harness()
+            real = h.host.wait_ready
+            calls = []
+
+            async def flaky(session_id):
+                calls.append(session_id)
+                if len(calls) == 1:
+                    h.host.status = {"phase": "crashed", "reason": "nonzero-exit", "exitCode": 1}
+                    raise RuntimeError("Windows host ended during startup (crashed, nonzero-exit)")
+                h.host.status = {"phase": "running", "reason": "", "exitCode": None}
+                return await real(session_id)
+
+            h.host.wait_ready = flaky
+            started = json.loads(await h.text("game_start"))
+            self.assertEqual(started["phase"], "running")
+            self.assertEqual(len(started["startRetries"]), 1)
+            self.assertEqual(started["startRetries"][0]["exitCode"], 1)
+            await h.text("game_stop")
         run(scenario())
 
     def test_dig(self):
