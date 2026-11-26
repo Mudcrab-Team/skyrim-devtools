@@ -6,11 +6,14 @@
 #include "methods.h"
 
 #include <algorithm>
+#include <chrono>
 #include <format>
+#include <thread>
 
 namespace
 {
     using namespace devtools;
+    using namespace std::chrono_literals;
 
     constexpr std::size_t maxItems = 500;
 
@@ -279,11 +282,71 @@ DEVTOOLS_MODULE(MenuItems)
         return Json{ { "menu", menuName }, { "count", rows.size() }, { "selectedIndex", selected }, { "items", items } };
     }, { .thread = Thread::UI });
 
-    Register("UI.selectItem", [](const Json& params) {
+    // The list the player sees is rebuilt by the menu's own update after the inventory changes, a frame or
+    // more after the action. The reply waits for that rebuild so a following UI.listItems is current.
+    RegisterDeferred("UI.selectItem", [](const Json& params, ReplyPtr reply) {
         AllowOnly(params, { "menu", "index", "text", "action", "count" });
         const auto menuName = Require<std::string>(params, "menu");
         const auto source = RequireSource(menuName);
         const auto rows = Rows(source);
-        return Act(params, menuName, source, Pick(params, rows));
-    }, { .thread = Thread::UI });
+        const auto row = Pick(params, rows);
+        auto result = Act(params, menuName, source, row);
+        const bool changed = result.contains("did") || result.contains("moved") || result.contains("dropped");
+        if (!changed || !source.list) {
+            reply->Ok(std::move(result));
+            return;
+        }
+        if (const auto player = RE::PlayerCharacter::GetSingleton()) {
+            RE::SendUIMessage::SendInventoryUpdateMessage(player, row.object);
+        }
+        struct Probe
+        {
+            std::string menu;
+            std::string formId;
+            std::string name;
+            std::uint32_t count;
+            std::uint32_t equipState;
+            Json result;
+            ReplyPtr reply;
+        };
+        auto probe = std::make_shared<Probe>(Probe{ menuName, FormId(row.form), row.name, row.count, row.equipState, std::move(result), reply });
+        std::thread([probe] {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+            const auto done = std::make_shared<std::atomic_bool>(false);
+            while (!probe->reply->Done() && !done->load()) {
+                SKSE::GetTaskInterface()->AddUITask([probe, done, deadline] {
+                    if (done->load() || probe->reply->Done()) {
+                        return;
+                    }
+                    bool settled = false;
+                    Json after = nullptr;
+                    try {
+                        const auto fresh = Rows(RequireSource(probe->menu));
+                        bool found = false;
+                        for (const auto& candidate : fresh) {
+                            if (FormId(candidate.form) == probe->formId && candidate.name == probe->name) {
+                                found = true;
+                                after = Describe(candidate);
+                                settled = candidate.count != probe->count || candidate.equipState != probe->equipState;
+                                break;
+                            }
+                        }
+                        settled = settled || !found;
+                    } catch (const RpcError&) {
+                        settled = true;
+                    }
+                    if (settled || std::chrono::steady_clock::now() >= deadline) {
+                        done->store(true);
+                        probe->result["listUpdated"] = settled;
+                        probe->result["after"] = after;
+                        probe->reply->Ok(std::move(probe->result));
+                    }
+                });
+                std::this_thread::sleep_for(std::chrono::milliseconds(40));
+                if (std::chrono::steady_clock::now() >= deadline + std::chrono::milliseconds(500)) {
+                    break;
+                }
+            }
+        }).detach();
+    }, { .thread = Thread::UI, .timeout = 8s });
 }

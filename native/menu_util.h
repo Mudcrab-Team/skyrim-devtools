@@ -50,4 +50,13 @@ namespace devtools::menu
 {
     // Subtitles the game is showing right now, as [{speaker, text}].
     Json CurrentSubtitleLines();
+
+    struct SubtitleLine
+    {
+        RE::ObjectRefHandle speaker;
+        std::string name;
+        std::string text;
+    };
+    // Safe from any thread: the subtitle manager is read under its own lock.
+    std::vector<SubtitleLine> SubtitleSnapshot();
 }

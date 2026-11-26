@@ -304,6 +304,16 @@ class Session:
     async def dialogue_select(self, index=None, text=None):
         return await self.call("Dialogue.select", **_params(index=index, text=text))
 
+    async def dialogue_wait(self, timeout_ms=None, skip=None, since=None):
+        return await self.call("Dialogue.waitIdle", timeout=((timeout_ms or 30000) / 1000) + 10,
+                               **_params(timeoutMs=timeout_ms, skip=skip, since=since))
+
+    async def dialogue_advance(self):
+        return await self.call("Dialogue.advance")
+
+    async def dialogue_close(self):
+        return await self.call("Dialogue.close")
+
     async def dialogue_start(self, ref_id=None):
         return await self.call("Dialogue.start", **_params(refID=ref_id, loadEpoch=self.epoch))
 

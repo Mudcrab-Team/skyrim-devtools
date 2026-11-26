@@ -45,6 +45,10 @@ namespace devtools
     // Throws not-ready unless the world is playable and, when the caller passed loadEpoch, unchanged.
     void RequirePlayable(const Json& params);
 
+    // Presses a ControlMap user event the way a player's key does (needs the input hook). False when
+    // input injection is unavailable.
+    bool TapControl(const std::string& control);
+
     HWND MainWindow();
     bool GameIsForeground();
 }

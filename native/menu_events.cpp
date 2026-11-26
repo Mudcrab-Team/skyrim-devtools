@@ -64,13 +64,8 @@ namespace
     std::vector<std::pair<std::string, std::string>> CurrentSubtitles()
     {
         std::vector<std::pair<std::string, std::string>> out;
-        if (const auto manager = RE::SubtitleManager::GetSingleton()) {
-            RE::BSSpinLockGuard guard(manager->lock);
-            for (const auto& info : manager->subtitles) {
-                if (info.subtitle.c_str() && *info.subtitle.c_str()) {
-                    out.emplace_back(SpeakerName(info.speaker), info.subtitle.c_str());
-                }
-            }
+        for (auto& line : menu::SubtitleSnapshot()) {
+            out.emplace_back(std::move(line.name), std::move(line.text));
         }
         return out;
     }
@@ -99,6 +94,26 @@ namespace
 
 namespace devtools::menu
 {
+    std::vector<SubtitleLine> SubtitleSnapshot()
+    {
+        std::vector<SubtitleLine> out;
+        if (const auto manager = RE::SubtitleManager::GetSingleton()) {
+            {
+                // Only copy under the subtitle lock; resolving a speaker takes other engine locks.
+                RE::BSSpinLockGuard guard(manager->lock);
+                for (const auto& info : manager->subtitles) {
+                    if (info.subtitle.c_str() && *info.subtitle.c_str()) {
+                        out.push_back({ info.speaker, {}, info.subtitle.c_str() });
+                    }
+                }
+            }
+            for (auto& line : out) {
+                line.name = SpeakerName(line.speaker);
+            }
+        }
+        return out;
+    }
+
     Json CurrentSubtitleLines()
     {
         auto out = Json::array();
@@ -117,6 +132,11 @@ DEVTOOLS_MODULE(MenuEvents)
     SetCapability("hudEvents", hooked);
     OnSkseMessage([](SKSE::MessagingInterface::Message& message) {
         if (message.type == SKSE::MessagingInterface::kDataLoaded) {
+            // The engine only builds subtitle entries while the preference is on; with it off an
+            // observer sees no NPC line at all.
+            if (const auto setting = RE::GetINISetting("bDialogueSubtitles:Interface")) {
+                setting->data.b = true;
+            }
             std::thread(PollSubtitles).detach();
         }
     });

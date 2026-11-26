@@ -9,6 +9,7 @@
 #include <Windows.h>
 
 #include <mutex>
+#include <thread>
 
 namespace
 {
@@ -107,6 +108,10 @@ namespace
         }
     }
 
+    std::mutex cacheMutex;
+    Json cachedMenus = Json::array();
+    bool cachedPlayable = false;
+
     Json Snapshot()
     {
         auto& ui = RequireUI();
@@ -129,11 +134,37 @@ namespace
             std::lock_guard lock(loadMutex);
             save = lastSave;
         }
+        const bool playable = Playable(ui);
+        {
+            std::lock_guard lock(cacheMutex);
+            cachedMenus = menus;
+            cachedPlayable = playable;
+        }
         return { { "seq", ++snapshotSequence }, { "loadEpoch", state::epoch.load() },
             { "dataLoaded", state::dataLoaded.load() }, { "loadCompleted", state::loadCompleted.load() },
-            { "loadSucceeded", state::loadSucceeded.load() }, { "playable", Playable(ui) },
+            { "loadSucceeded", state::loadSucceeded.load() }, { "playable", playable },
             { "menus", std::move(menus) }, { "foreground", GameIsForeground() },
-            { "headless", GetConfig().headless }, { "lastSave", save.empty() ? Json(nullptr) : Json(save) } };
+            { "headless", GetConfig().headless }, { "lastSave", save.empty() ? Json(nullptr) : Json(save) },
+            { "uiBusy", false } };
+    }
+
+    // Built from state that is safe to read off the UI thread: used when the UI thread is not running
+    // tasks (a long load, a paused window), so a poller still gets an answer. The menu list and
+    // `playable` are those of the last full snapshot and may be stale.
+    Json PartialSnapshot()
+    {
+        std::string save;
+        {
+            std::lock_guard lock(loadMutex);
+            save = lastSave;
+        }
+        std::lock_guard lock(cacheMutex);
+        return { { "seq", ++snapshotSequence }, { "loadEpoch", state::epoch.load() },
+            { "dataLoaded", state::dataLoaded.load() }, { "loadCompleted", state::loadCompleted.load() },
+            { "loadSucceeded", state::loadSucceeded.load() }, { "playable", cachedPlayable },
+            { "menus", cachedMenus }, { "foreground", GameIsForeground() },
+            { "headless", GetConfig().headless }, { "lastSave", save.empty() ? Json(nullptr) : Json(save) },
+            { "uiBusy", true } };
     }
 }
 
@@ -207,8 +238,24 @@ DEVTOOLS_MODULE(Session)
         BeginLoad(name, Optional(params, "wait", false), reply);
     }, { .thread = Thread::Main, .timeout = 180s });
 
-    Register("Events.snapshot", [](const Json& params) {
+    // The UI thread answers when it can; after a short wait the connection falls back to the partial
+    // snapshot so the call never times out on a busy game.
+    RegisterDeferred("Events.snapshot", [](const Json& params, ReplyPtr reply) {
         AllowOnly(params, {});
-        return Snapshot();
-    }, { .thread = Thread::UI });
+        SKSE::GetTaskInterface()->AddUITask([reply] {
+            if (!reply->Done()) {
+                try {
+                    reply->Ok(Snapshot());
+                } catch (const RpcError& error) {
+                    reply->Fail(error.code, error.message, error.data);
+                }
+            }
+        });
+        std::thread([reply] {
+            std::this_thread::sleep_for(1500ms);
+            if (!reply->Done()) {
+                reply->Ok(PartialSnapshot());
+            }
+        }).detach();
+    }, { .thread = Thread::Any, .timeout = 10s });
 }
