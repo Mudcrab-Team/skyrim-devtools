@@ -464,6 +464,19 @@ namespace devtools
     }
 }
 
+namespace devtools
+{
+    void HoldControl(const std::string& control, std::chrono::milliseconds holdMs, ReplyPtr reply)
+    {
+        Request request;
+        request.control = control;
+        request.phase = Phase::Tap;
+        request.hold = holdMs;
+        request.reply = std::move(reply);
+        Submit(std::move(request));
+    }
+}
+
 namespace devtools::input
 {
     void SetPollListener(PollListener listener)

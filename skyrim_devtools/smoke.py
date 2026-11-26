@@ -65,7 +65,7 @@ class WindowsHost:
             "-EncodedCommand", encoded, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
         try:
-            async with asyncio.timeout(12):
+            async with asyncio.timeout(45):
                 data, _ = await process.communicate()
         finally:
             if process.returncode is None:

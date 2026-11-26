@@ -34,6 +34,11 @@ WARN = (250, 204, 21)
 
 # Tools whose duration is waiting or walking rather than something to watch.
 BORING_TOOLS = ("wait_for", "game_start", "load_save", "reload", "center_on_cell", "nav_", "walk", "travel", "capture_")
+# Instant state reads: nothing to watch, so they only hold the video at normal speed for a moment.
+QUERY_TOOLS = ("combat_state", "player_state", "player_inventory", "player_equipped", "player_spells", "world_nearby",
+               "world_crosshair", "list_menus", "quest_get", "quest_active", "quest_find", "nav_status", "nav_nearby",
+               "nav_places", "snapshot", "game_status", "camera_state", "events_", "list_saves", "message_box", "look",
+               "turn_to", "close_menu")
 # Conversations are what a viewer wants to read at normal speed.
 DIALOGUE_TOOLS = ("dialogue_", "message_box")
 FONT_CANDIDATES = {
@@ -146,7 +151,8 @@ def merge(windows):
     return out
 
 
-def plan_segments(timeline, duration, speedup=4.0, idle_threshold=3.0, max_idle_out=6.0):
+def plan_segments(timeline, duration, speedup=4.0, idle_threshold=3.0, max_idle_out=6.0, speedup_walk=None,
+                  speedup_action=1.0):
     """Return [(start, end, speed)] over source time covering [0, duration]; gaps with nothing to watch run faster."""
     windows = []
     for call in timeline.calls:
@@ -154,6 +160,8 @@ def plan_segments(timeline, duration, speedup=4.0, idle_threshold=3.0, max_idle_
             continue
         if is_dialogue(call.name):
             windows.append((call.start - 1.0, call.end + 2.0))
+        elif call.name.startswith(QUERY_TOOLS) and call.end - call.start < 2.0:
+            windows.append((call.start - 0.15, call.end + 0.4))
         elif is_boring(call.name):
             # the moment of the call and of its result stay at normal speed; the middle is the wait
             windows.append((call.start - 0.5, call.start + 1.0))
@@ -172,7 +180,19 @@ def plan_segments(timeline, duration, speedup=4.0, idle_threshold=3.0, max_idle_
         cursor = end
     if duration - cursor > 0:
         segments.append(gap_segment(cursor, duration, speedup, idle_threshold, max_idle_out))
-    return [s for s in segments if s[1] - s[0] > 0.02]
+    segments = [s for s in segments if s[1] - s[0] > 0.02]
+    if speedup_action > 1.0:
+        # tool activity with no caption or conversation to read (fights, searching) runs a little faster
+        watch = [(a - 0.3, b) for a, b, _ in timeline.captions]
+        watch += [(c.start - 1.0, c.end + 2.0) for c in timeline.calls if is_dialogue(c.name)]
+        segments = [(a, b, speedup_action) if speed == 1.0 and not any(w0 < b and a < w1 for w0, w1 in watch)
+                    else (a, b, speed) for a, b, speed in segments]
+    if speedup_walk and speedup_walk > speedup:
+        # long walks and waits run faster than other idle stretches
+        walks = [(c.start, c.end) for c in timeline.calls if is_boring(c.name) and c.end - c.start > idle_threshold]
+        segments = [(a, b, max(speed, speedup_walk, (b - a) / max_idle_out)) if speed > 1.0 and any(
+            w0 <= (a + b) / 2 <= w1 for w0, w1 in walks) else (a, b, speed) for a, b, speed in segments]
+    return segments
 
 
 def gap_segment(start, end, speedup, idle_threshold, max_idle_out):
@@ -227,6 +247,9 @@ def current_status(timeline, t):
         if when > t:
             break
         status.update(sample)
+    if not status and timeline.statuses:
+        # before the first sample the panel shows that sample rather than an empty block
+        status = dict(timeline.statuses[0][1])
     return status
 
 
@@ -293,16 +316,16 @@ def draw_frame(state, title):
     draw.text((x0, top), "STATUS", font=font("bold", 20), fill=DIM)
     top += 32
     lines = []
-    if status.get("cell"):
-        lines.append(("Location", str(status["cell"])))
     quest = status.get("quest")
     if quest:
         lines.append(("Quest", f"{quest.get('name')}  (stage {quest.get('stage')})"))
         if quest.get("objective"):
             lines.append(("Goal", quest["objective"]))
+    else:
+        lines.append(("Quest", "none tracked yet"))
     health = status.get("health")
-    if health and health[1]:
-        lines.append(("Health", f"{health[0]:g} / {health[1]:g}"))
+    lines.append(("Health", f"{health[0]:g} / {health[1]:g}" if health and health[1] else "unknown"))
+    lines.append(("Location", str(status["cell"]) if status.get("cell") else "unknown"))
     state_flags = [name for name, on in (("in combat", status.get("inCombat")), ("walking", status.get("walking")),
                                          ("sneaking", status.get("sneaking"))) if on]
     if state_flags:
@@ -421,7 +444,8 @@ def compose(options):
         start_ms = json.loads(sidecar.read_text()).get("startEpochMs")
     timeline = load_timeline(options.timeline, start_ms)
     duration = probe_duration(footage)
-    segments = plan_segments(timeline, duration, options.speedup_idle, options.idle_threshold, options.max_idle)
+    segments = plan_segments(timeline, duration, options.speedup_idle, options.idle_threshold, options.max_idle,
+                             options.speedup_walk, options.speedup_action)
     out_seconds = sum((e - s) / sp for s, e, sp in segments)
     print(f"footage {duration:.1f}s, {len(timeline.calls)} tool calls, {len(timeline.captions)} captions, "
           f"{len(segments)} segments -> {out_seconds:.1f}s")
@@ -473,14 +497,64 @@ def compose(options):
     return 0
 
 
+def compose_parts(options):
+    """Compose one video from several recording sessions: each part is footage:timeline, cards go around the whole."""
+    import copy
+
+    workdir = Path(tempfile.mkdtemp(prefix="skyrim-video-parts-"))
+    pieces = []
+    total_calls = total_captions = 0
+    try:
+        for number, spec in enumerate(options.part):
+            footage, _, timeline_path = spec.partition(":")
+            if not timeline_path:
+                raise SystemExit("--part is footage.mp4:timeline.jsonl")
+            part = copy.copy(options)
+            part.footage, part.timeline, part.no_cards, part.dry_run = footage, timeline_path, True, False
+            part.output = workdir / f"part{number}.mp4"
+            sidecar = Path(footage).with_suffix(".capture.json")
+            part.footage_start_ms = json.loads(sidecar.read_text()).get("startEpochMs") if sidecar.exists() else None
+            timeline = load_timeline(timeline_path, part.footage_start_ms)
+            total_calls += len(timeline.calls)
+            total_captions += len(timeline.captions)
+            compose(part)
+            pieces.append(part.output)
+        intro_card, outro_card = workdir / "intro.png", workdir / "outro.png"
+        draw_card([(options.title or "An AI agent plays Skyrim", 78, FG, "bold"), (options.subtitle, 36, DIM, "sans")], intro_card)
+        draw_card([("Played entirely through tool calls", 62, FG, "bold"),
+                   (f"{total_calls} tool calls, {total_captions} comments, no human input", 36, DIM, "sans"),
+                   ("skyrim-use: automated playtesting for Skyrim mods", 28, ACCENT, "sans")], outro_card)
+        command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+        command += ["-loop", "1", "-t", "3.5", "-framerate", str(FPS), "-i", str(intro_card)]
+        for piece in pieces:
+            command += ["-i", str(piece)]
+        command += ["-loop", "1", "-t", "4", "-framerate", str(FPS), "-i", str(outro_card)]
+        count = len(pieces) + 2
+        chain = ";".join(f"[{i}:v]fps={FPS},scale={W}:{H},setsar=1,format=yuv420p[v{i}]" for i in range(count))
+        chain += ";" + "".join(f"[v{i}]" for i in range(count)) + f"concat=n={count}:v=1:a=0[out]"
+        command += ["-filter_complex", chain, "-map", "[out]", "-c:v", options.encoder, "-pix_fmt", "yuv420p",
+                    "-movflags", "+faststart", str(options.output)]
+        if subprocess.run(command).returncode:
+            raise SystemExit("ffmpeg failed while joining the parts")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    print(f"wrote {options.output}")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="skyrim-devtools-video", description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     c = sub.add_parser("compose", help="footage + timeline -> showcase video")
-    c.add_argument("--footage", required=True, help="MP4 from capture_stop")
-    c.add_argument("--timeline", required=True, help="session timeline JSONL")
+    c.add_argument("--footage", help="MP4 from capture_stop")
+    c.add_argument("--timeline", help="session timeline JSONL")
+    c.add_argument("--part", action="append", help="footage.mp4:timeline.jsonl; repeat for a recording split over sessions")
     c.add_argument("-o", "--output", required=True)
     c.add_argument("--speedup-idle", type=float, default=4.0, help="speed factor for stretches with nothing to watch")
+    c.add_argument("--speedup-walk", type=float, default=None,
+                   help="speed factor for the middle of long walks and waits (nav_*, walk, wait_for); default: same as --speedup-idle")
+    c.add_argument("--speedup-action", type=float, default=1.0,
+                   help="speed factor for tool activity with no caption or conversation on screen (fights, searching)")
     c.add_argument("--idle-threshold", type=float, default=3.0, help="only gaps at least this long (s) are sped up")
     c.add_argument("--max-idle", type=float, default=6.0, help="no sped-up stretch lasts longer than this (s) in the result")
     c.add_argument("--title")
@@ -492,6 +566,10 @@ def main(argv=None):
     c.add_argument("--encoder", default="libx264", help="ffmpeg video encoder (h264_videotoolbox is faster on a Mac)")
     c.add_argument("--no-sidecar", dest="use_sidecar", action="store_false")
     options = parser.parse_args(argv)
+    if options.part:
+        return compose_parts(options)
+    if not options.footage or not options.timeline:
+        parser.error("pass --footage and --timeline, or one or more --part footage:timeline")
     return compose(options)
 
 

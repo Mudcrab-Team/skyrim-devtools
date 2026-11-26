@@ -3,6 +3,7 @@
 #pragma once
 
 #include "core.h"
+#include "methods.h"
 
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
@@ -48,6 +49,9 @@ namespace devtools
     // Presses a ControlMap user event the way a player's key does (needs the input hook). False when
     // input injection is unavailable.
     bool TapControl(const std::string& control);
+    // Holds a control down for holdMs and answers the reply once the release was dispatched; used by
+    // modules that act on the player with button semantics (attacks, blocking, casting).
+    void HoldControl(const std::string& control, std::chrono::milliseconds holdMs, ReplyPtr reply);
 
     HWND MainWindow();
     bool GameIsForeground();

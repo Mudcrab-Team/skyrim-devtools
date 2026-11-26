@@ -124,6 +124,14 @@ class Recorder:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
 
+    async def sample_now(self, manager):
+        """Write a status line immediately; used when a recording or tracked quest starts so the panel is never blank."""
+        self.last_status = None
+        with contextlib.suppress(Exception):
+            sample = await self.sample(manager)
+            if sample:
+                self.write({"t": "status", "ms": now_ms(), **sample})
+
     async def _sample_loop(self, manager, interval):
         while True:
             await asyncio.sleep(interval)
@@ -141,7 +149,9 @@ class Recorder:
             with contextlib.suppress(Exception):
                 state = await manager.call("Player.state", timeout=5)
                 cell = state.get("cell")
-                sample["cell"] = cell.get("name") or cell.get("editorID") if isinstance(cell, dict) else cell
+                # an exterior cell has no name; the location (Riverwood) reads better than its editor ID
+                sample["cell"] = (state.get("location") or cell.get("name") or cell.get("editorID")
+                                  if isinstance(cell, dict) else cell)
                 pos = state.get("pos")
                 if isinstance(pos, dict):
                     sample["pos"] = [round(pos.get(axis, 0)) for axis in "xyz"]

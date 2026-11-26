@@ -221,6 +221,25 @@ episodes on the plot, and `--route` overlays a saved Nav.plan reply or navRoute 
 navigation times scale with it; `etaS` and `elapsedS` are real seconds. Values above about 4
 make collisions and streaming less reliable. `set timescale to <n>` only changes the game clock.
 
+### Combat
+
+Actions go through the same controls a keyboard presses (`Right Attack/Block`, `Left Attack/Block`),
+so stamina, animation, timing and spell costs all apply; only equipping and turning to face a target
+call into the engine. The chosen target is remembered between calls.
+
+| Method | Thread | Params | Result and meaning |
+| --- | --- | --- | --- |
+| Combat.state | main | radius? (3000), limit? (10) | `{player:{health,magicka,stamina:{cur,max,pct}, dead, inCombat, weapon, drawn, blocking, attack, rightHand, leftHand}, hostileTotal, hostiles:[{refID, name, distance, bearingDeg (relative to facing, positive right), dz, level, health, inCombat, targetsPlayer, attack, blocking, chosen?}], target?}`. Hostile means alive, loaded, targeting the player or hostile to the player's factions. |
+| Combat.target | main | refID?, radius?, face? (true), clear? | Picks the nearest hostile (or refID), remembers it and turns to it. |
+| Combat.face | main | refID? | Yaw and pitch towards the chosen target, refID or nearest hostile. |
+| Combat.draw | main | on? (true) | Draws or sheathes weapon and hands. |
+| Combat.equip | main | name or formID or editorID, hand? (`right`, `left`, `both`) | Equips a weapon, shield, armor, ammo or spell (inventory or spell list match by display name). Applies shortly after the reply. |
+| Combat.unequip | main | hand? | Takes a weapon or shield out of a hand. |
+| Combat.attack | main (deferred) | kind? (`light`, `power`), hand?, face? (true), refID?, holdMs? | Holds the attack control (light 120 ms, power 900 ms) and replies after the release. |
+| Combat.block | main (deferred) | holdMs? (1500), face?, refID? | Holds the left-hand control. |
+| Combat.cast | main (deferred) | hand?, holdMs? (concentration 2000, otherwise 250), face?, refID? | Casts the spell in that hand; refuses a spell the magicka cannot pay for. |
+| Combat.drink | main | kind? (`health`, `magicka`, `stamina`) or name or formID | Drinks the weakest potion that covers the missing amount, else the strongest; skips poisons and food. |
+
 ## Errors
 
 | Code | Meaning |
