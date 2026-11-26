@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cmath>
 #include <format>
+#include <vector>
 
 namespace
 {
@@ -140,6 +141,44 @@ namespace
     {
         const auto extra = ref ? ref->extraList.GetByType<RE::ExtraMapMarker>() : nullptr;
         return extra ? extra->mapData : nullptr;
+    }
+
+    struct MarkerHit
+    {
+        RE::TESObjectREFR* ref;
+        std::string name;
+    };
+
+    // Every placed map marker whose displayed name contains `text` (case-insensitive); exact matches first.
+    // Markers live on persistent references, so the whole form table is scanned, as FindByEditorId does.
+    std::vector<MarkerHit> FindMarkers(const std::string& text, std::size_t limit)
+    {
+        std::vector<MarkerHit> exact, partial;
+        const auto& [forms, lock] = RE::TESForm::GetAllForms();
+        if (!forms) {
+            return exact;
+        }
+        const auto wanted = Lower(text);
+        const RE::BSReadLockGuard guard{ lock };
+        for (const auto& [id, form] : *forms) {
+            if (!form || form->GetFormType() != RE::FormType::Reference) {
+                continue;
+            }
+            const auto ref = form->AsReference();
+            const auto data = MarkerData(ref);
+            const auto full = data ? data->locationName.GetFullName() : nullptr;
+            if (!full || !*full) {
+                continue;
+            }
+            const auto lowered = Lower(full);
+            if (lowered == wanted) {
+                exact.push_back({ ref, full });
+            } else if (lowered.find(wanted) != std::string::npos && partial.size() < limit) {
+                partial.push_back({ ref, full });
+            }
+        }
+        exact.insert(exact.end(), partial.begin(), partial.end());
+        return exact;
     }
 }
 
@@ -290,17 +329,28 @@ DEVTOOLS_MODULE(Scenario)
         const auto to = Require<std::string>(params, "to");
         RE::TESObjectREFR* marker = nullptr;
         std::string label;
-        if (const auto location = FindLocation(to)) {
-            marker = location->worldLocMarker.get().get();
-            label = location->GetFullName();
-        } else if (to.find_first_not_of("0123456789abcdefABCDEFxX") == std::string::npos) {
+        Json others = Json::array();
+        if (to.find_first_not_of("0123456789abcdefABCDEFxX") == std::string::npos) {
             const auto form = RE::TESForm::LookupByID(ParseFormId(Json(to), "to"));
             marker = form ? form->AsReference() : nullptr;
             label = to;
+        } else {
+            const auto hits = FindMarkers(to, 20);
+            if (!hits.empty()) {
+                marker = hits.front().ref;
+                label = hits.front().name;
+                for (std::size_t i = 1; i < hits.size() && i < 8; ++i) {
+                    others.push_back(hits[i].name);
+                }
+            } else if (const auto location = FindLocation(to)) {
+                marker = location->worldLocMarker.get().get();
+                label = location->GetFullName();
+            }
         }
         const auto data = MarkerData(marker);
         if (!marker || !data) {
-            throw RpcError(code::notFound, "No map marker or location named '" + to + "'; see Nav.places");
+            throw RpcError(code::notFound, "No map marker named '" + to + "'; Game.mapMarkers lists them",
+                { { "markerFound", marker != nullptr } });
         }
         const bool force = Optional<bool>(params, "force", false);
         const bool visible = data->flags.all(RE::MapMarkerData::Flag::kVisible);
@@ -313,7 +363,7 @@ DEVTOOLS_MODULE(Scenario)
         const auto from = player.GetParentCell() ? DescribeCell(player.GetParentCell()) : Json(nullptr);
         player.MoveTo(marker);
         Json out{ { "to", label }, { "marker", Hex(marker->GetFormID()) }, { "markerPos", Vec3(marker->GetPosition()) },
-            { "distance", Round(distance, 0) }, { "forced", force && !(visible && canTravel) }, { "from", from } };
+            { "otherMatches", others }, { "distance", Round(distance, 0) }, { "forced", force && !(visible && canTravel) }, { "from", from } };
         // About 3 hours across 20000 units, in line with the game's own estimate; only when the worlds are the same.
         if (Optional<bool>(params, "skipTime", true) && distance > 500.0F) {
             const auto hours = std::clamp(distance / 6500.0F, 0.25F, 24.0F);
@@ -323,4 +373,28 @@ DEVTOOLS_MODULE(Scenario)
         events::Emit("fastTravel", out);
         return out;
     }, { .thread = Thread::Main, .timeout = 20s });
+
+    Register("Game.mapMarkers", [](const Json& params) {
+        AllowOnly(params, { "contains", "discoveredOnly", "limit" });
+        const auto contains = Optional<std::string>(params, "contains", "");
+        const bool discoveredOnly = Optional<bool>(params, "discoveredOnly", false);
+        const auto limit = static_cast<std::size_t>(std::clamp(Optional<int>(params, "limit", 50), 1, 500));
+        const auto hits = FindMarkers(contains, 100000);
+        auto list = Json::array();
+        auto& player = RequirePlayer();
+        for (const auto& hit : hits) {
+            const auto data = MarkerData(hit.ref);
+            const bool visible = data->flags.all(RE::MapMarkerData::Flag::kVisible);
+            const bool canTravel = data->flags.all(RE::MapMarkerData::Flag::kCanTravelTo);
+            if (discoveredOnly && !(visible && canTravel)) {
+                continue;
+            }
+            if (list.size() < limit) {
+                list.push_back({ { "name", hit.name }, { "marker", Hex(hit.ref->GetFormID()) }, { "visible", visible },
+                    { "canTravelTo", canTravel }, { "pos", Vec3(hit.ref->GetPosition()) },
+                    { "distance", Round(player.GetPosition().GetDistance(hit.ref->GetPosition()), 0) } });
+            }
+        }
+        return Json{ { "count", hits.size() }, { "markers", std::move(list) } };
+    }, { .thread = Thread::Main, .timeout = 30s });
 }

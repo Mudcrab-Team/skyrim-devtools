@@ -24,6 +24,10 @@ namespace
     float boost = 0.0F;       // automatic boost, 0 when off
     float applied = 0.0F;
 
+    float tempDelta = 0.0F;  // the temporary modifier this module has put on SpeedMult
+
+    // A temporary modifier goes through the same path as a spell effect, so the movement code's cached
+    // speed is recomputed; writing the base value alone left it stale on every other change.
     void Write(float value)
     {
         const auto player = RE::PlayerCharacter::GetSingleton();
@@ -31,9 +35,12 @@ namespace
             return;
         }
         const auto values = player->AsActorValueOwner();
-        values->SetActorValue(kSpeed, value);
-        // The movement code reads the cached value; a zero-delta modifier refreshes it.
-        values->ModActorValue(RE::ACTOR_VALUE_MODIFIER::kTemporary, kSpeed, 0.0F);
+        const float wanted = value - original;
+        const float change = wanted - tempDelta;
+        if (change != 0.0F) {
+            values->ModActorValue(RE::ACTOR_VALUE_MODIFIER::kTemporary, kSpeed, change);
+            tempDelta = wanted;
+        }
         applied = value;
     }
 
@@ -115,6 +122,7 @@ DEVTOOLS_MODULE(Speed)
             manual = 0.0F;
             boost = 0.0F;
             applied = 0.0F;
+            tempDelta = 0.0F;
         }
     });
 

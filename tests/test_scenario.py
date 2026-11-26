@@ -187,3 +187,53 @@ class ToolTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LiveScriptTests(unittest.TestCase):
+    def test_live_script_runs_against_the_fake_plugin(self):
+        import contextlib
+        import io
+        import sys
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent / "live"))
+        import scenario_speed
+
+        async def scenario():
+            h = Harness()
+            real_start = h.manager.start
+
+            async def start(headless=True, save=None):
+                result = await real_start(headless=headless, save=save)
+                for method in ("Game.speed", "Game.setSpeed", "Game.fastTravel", "Game.waitHours", "Game.mapMarkers",
+                               "Scenario.character", "Scenario.setStage", "Quest.get", "Quest.find", "Quest.targets",
+                               "Game.time", "Nav.places", "Player.teleport", "Session.reload", "Move.walk"):
+                    h.manager.methods[method] = {}
+                h.sockets[0].results.update({
+                    "Game.time": {"daysPassed": 1.0}, "Quest.get": {"stage": 10}, "Player.state": {"level": 3, "pos": [1, 2, 3]},
+                    "Game.fastTravel": {"to": "Whiterun"}, "Game.waitHours": {"waitedHours": 30}, "Game.mapMarkers": {"markers": []},
+                    "Scenario.character": {"steps": []}, "Scenario.setStage": {"after": 10}, "Quest.targets": {"targets": []},
+                    "Move.walk": {"distance": 1000.0}, "Game.setSpeed": {"speedMult": 100}})
+                return result
+
+            h.manager.start = start
+
+            config_file = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+            config_file.write("{}")
+            config_file.close()
+
+            class Options:
+                config = config_file.name
+                cases = "speed,lovely,travel"
+                headless = True
+                dry_run = False
+
+            scenario_speed.GameManager = lambda config: h.manager
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                await scenario_speed.main(Options)
+            return json.loads(buffer.getvalue())
+
+        out = run(scenario())
+        self.assertIn("speed", out["details"])
+        self.assertIn("lovely", out["details"])
+        self.assertIn("travel", out["details"])

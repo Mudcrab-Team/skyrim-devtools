@@ -20,8 +20,8 @@ KITS = {
         {"item": "Potion of Minor Healing", "count": 3}, {"item": "Lockpick", "count": 10}, {"item": "Gold", "count": 200},
     ],
     "medium": [
-        {"item": "Steel Armor", "equip": True}, {"item": "Steel Boots", "equip": True},
-        {"item": "Steel Gauntlets", "equip": True}, {"item": "Steel Helmet", "equip": True},
+        {"item": "Steel Armor", "equip": True}, {"item": "00013952", "equip": True},
+        {"item": "00013953", "equip": True}, {"item": "Steel Helmet", "equip": True},
         {"item": "Steel Sword", "equip": True}, {"item": "Steel Shield", "equip": True},
         {"item": "Hunting Bow"}, {"item": "Iron Arrow", "count": 40},
         {"item": "Potion of Healing", "count": 5}, {"item": "Lockpick", "count": 10}, {"item": "Gold", "count": 500},
