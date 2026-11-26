@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 license = "MIT"
 license-files = ["licenses/MIT.txt"]
-dependencies = ["websockets==16.0", "mcp>=1.12,<2"]
+dependencies = ["websockets==16.0", "mcp>=1.12,<2", "pyyaml>=6"]
 
 [project.optional-dependencies]
 video = ["Pillow>=10.1"]
@@ -21,6 +21,7 @@ skyrim-use = "skyrim_devtools.use.server:main"
 skyrim-devtools-video = "skyrim_devtools.video:main"
 skyrim-devtools-trajectory = "skyrim_devtools.trajectory:main"
 skyrim-devtools-navgraph = "skyrim_devtools.navgraph:main"
+skyrim-devtools-livetest = "skyrim_devtools.livetest:main"
 
 [tool.setuptools.packages.find]
 include = ["skyrim_devtools*"]

@@ -136,3 +136,14 @@ Because the Tester uses every new tool, it is also the first user. Each batch re
 - Running more than one game session at a time on the PC.
 - A server or database for the queue. Files in a directory are enough at this scale.
 - Replacing unit tests: requests must arrive with unit tests passing.
+
+## The harness
+
+`skyrim-devtools-livetest run|batch` (module `skyrim_devtools/livetest.py`) needs the lock to be held by its caller; it never
+takes it. It starts the game visibly (windowed), loads each request's `setup` once per group (a save name, or
+`scenario:<name>` for `Scenario.setup`), runs the cases, calls `perf_check` before the first case and again once 15 min
+have passed, restarts the game after a crash and continues, and writes `results/<id>.md` next to the queue. A script is a
+module with `async def run(ctx)` or a standalone program whose last stdout line is the JSON result (it gets
+`SKYRIM_LIVETEST_CONFIG`). Cases without a script are `manual`: the harness saves a screenshot for the Tester to judge.
+Per-case limit: 300 s, or `timeout_s` on the case. Use `--root` to point at the integration checkout whose `tests/live/`
+scripts should run.
