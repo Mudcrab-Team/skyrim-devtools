@@ -44,7 +44,7 @@ server speaks plain stdio. When the client exits the server stops the game, so a
 | State (newer plugin builds) | `player_state`, `player_inventory`, `world_nearby`, `world_crosshair`, `quest_get`, `quest_find`, `quest_active`, `quest_targets {quest}`, `activate`, `message_box`, `message_box_select`, `dialogue_state`, `dialogue_select`, `dialogue_wait`, `dialogue_advance`, `dialogue_close`, `ui_list_items`, `ui_select_item`, `ui_dump`, `ui_get`, `ui_set`, `ui_invoke`, `ui_list`, `dialogue_start`, `screenshot` (image), `perf_frame_stats`, `perf_hitches`, `perf_check`, `papyrus_log` |
 | Perceive | `world_inspect {ref_id, nodes, graph, scripts}`, `world_models {contains, radius, limit}`, `screen_capture {ref_id or x,y,z or region, zoom, pad, include_ui}` (image), `game_setting {name, value?}` |
 | Move and camera | `walk {direction, duration_ms or distance, run?, sprint?}`, `turn_to {heading_deg or x,y or ref_id}`, `jump`, `sneak {on}`, `camera_state`, `camera_set {mode, yaw_deg, pitch_deg, zoom, fov}`, `camera_look_at {ref_id or x,y,z}` |
-| Combat | `combat_state {radius}`, `combat_target`, `combat_face`, `combat_draw`, `combat_equip {name, hand}`, `combat_unequip`, `combat_attack {kind=light\|power, hand}`, `combat_block`, `combat_cast`, `combat_drink {kind}`, `combat_fight {style, rounds, drink_below}` (a bounded loop over the primitives), `player_equipped`, `player_spells` |
+| Combat | `combat_state {radius}`, `combat_target`, `combat_face`, `combat_draw`, `combat_equip {name, hand}`, `combat_unequip`, `combat_attack {kind=light\|power, hand}`, `combat_block`, `combat_cast`, `combat_drink {kind}`, `combat_shoot {target, shots, draw_s, part, reposition, weapon}`, `combat_fight {style, rounds, drink_below}` (a bounded loop over the primitives), `player_equipped`, `player_spells` |
 | Navigate | `nav_nearby {radius, kind}`, `nav_places {contains}`, `nav_goto {goal, mode=input\|ai, timeout_s, on_combat, on_dialogue, on_message_box, on_menu, invulnerable, via, route, activate}`, `nav_plan {ref_id \| x, y, z, route}`, `nav_status`, `nav_wait {timeout_s}`, `nav_cancel` |
 | Record | `record_start {hz, fields, name}`, `record_stop`, `record_fetch {name, dest_dir?, plot}`, `trajectory_plot {file, color_by, route}`, `record_replay_camera {name, speed}` |
 | Generic | `rpc_methods`, `rpc_call {method, params}` |
@@ -68,6 +68,32 @@ keys. With a worldspace graph built by `skyrim-devtools-navgraph build` (see doc
 `skyrim-devtools-trajectory plot <file> -o out.svg [--color speed|frame]`. A long trip can be
 sped up with `console sgtm 4` (and `sgtm 1` afterwards); see docs/protocol.md for the navigation
 modes and their limits.
+
+## Ranged combat
+
+`combat_shoot {target?, shots=3, draw_s?, part=torso|head, reposition=false, max_repositions=2, weapon=bow|spell}`
+equips the best bow and arrows (or reports `{"error":"missing","missing":["bow"|"arrows"|"bolts"]}`) and shoots. Why
+the naive loop fails and what the tool does about it:
+
+- Short draws give weak, short arrows. Every draw is held for `draw_s` seconds, by default `max(1.5, 1.1 / bow speed + 0.5)`,
+  a little longer than a full draw; each shot reports the `heldS` it actually held.
+- Aim at the target, not at what is in front of it. The aim point is the target's torso (or head), corrected for arrow
+  drop and for movement (the target's velocity is measured over 0.12 s and led by flight time). Arrow speed and gravity come
+  from the ammunition's projectile form, then from the first arrow's observed flight (`Ranged.arrows`); the angle between
+  the commanded and the actual launch is learnt the same way. A miss reads the arrow's path at the target's range and
+  trims the next aim (`missVertical` / `missLateral` in the shot detail).
+- A blocked line is detected before drawing. An engine ray from the eye to the target's torso that meets geometry (a
+  bridge deck, a wall) returns `noLineOfSight` with the blocker (`hitDistance`, `hitLayer`) and `suggestedPosition`
+  `{x,y,z,rangeToTarget}`: points on rings up to 600 units around the player, kept when their own ray is clear and the navmesh
+  reaches them, ranked by walking distance and by how far the range lies outside 600-1500. `reposition=true` walks there
+  with `Nav.goto` and shoots; the line is re-checked before every shot.
+- Hits are verified by the target's health change; `shots`, `hits`, `hitRate`, `damage`, `targetDead`, `repositions` and a
+  per-shot `detail` come back. `weapon: "spell"` does the same for a projectile spell in the right hand (a fire bolt, not a
+  concentration spell): same ray, ballistic aim with the spell projectile's speed and gravity, a short press instead of a draw.
+
+`combat_fight` switches by itself: when the nearest target cannot be walked to (`Nav.plan` finds no complete path, as for an archer
+on a bridge above) it shoots if a bow with arrows is carried, otherwise it ends with outcome `unreachable` and an `advice` line.
+The check repeats every 4 rounds. `style="ranged"` shoots instead of walking up.
 
 ## Perception
 

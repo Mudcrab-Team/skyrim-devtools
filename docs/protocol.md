@@ -273,6 +273,11 @@ call into the engine. The chosen target is remembered between calls.
 | Combat.block | main (deferred) | holdMs? (1500), face?, refID? | Holds the left-hand control. |
 | Combat.cast | main (deferred) | hand?, holdMs? (concentration 2000, otherwise 250), face?, refID? | Casts the spell in that hand; refuses a spell the magicka cannot pay for. |
 | Combat.drink | main | kind? (`health`, `magicka`, `stamina`) or name or formID | Drinks the weakest potion that covers the missing amount, else the strongest; skips poisons and food. |
+| Ranged.loadout | main | equip? (true), spell? | The best bow (or crossbow) and matching ammunition in the inventory, equipped unless `equip: false`: `{weapon, ready, missing[], bow{formID,name,speed,crossbow,damage,reach}, ammo{formID,name,kind,count,damage,projectile{speed,gravity,range}}, bowEquipped, ammoEquipped, equipQueued}`. With `spell: true` it describes the projectile spell in the right hand instead (`spell`, `projectile`, `concentration`, `cost`, `magicka`). |
+| Ranged.los | main | refID, part? (`torso`, `head`), from? [x,y,z], points? [[x,y,z]...] | Engine ray (collision layer LOS) from the player's eye, or `from`, to the target's torso or head: `{clear, hitDistance?, hitLayer?, hitPoint?, from, torso, head, target, distance, health, dead, points?:[{clear, hitDistance?, distance}]}`. An actor hit within the last tenth of the line counts as the target. `points` are candidate standing positions (feet; the eye height is added) tested against the same aim point. |
+| Ranged.aim | main | headingDeg, pitchDeg | Absolute aim: heading clockwise from north, pitch in degrees above the horizon (clamped to +-80). Replies with the attack and weapon state ints and the eye position. |
+| Ranged.arrows | main | | The player's own projectiles in the manager: `{arrows:[{refID, pos, velocity, distance, power, destroyed}]}` (velocity in units per second), for flight tracking and calibration. |
+| Ranged.state | main | | `{attackState, weaponState, drawn, eye, position, headingDeg, ammoLeft?}`. |
 
 ## Errors
 
