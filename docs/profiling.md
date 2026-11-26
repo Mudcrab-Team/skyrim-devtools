@@ -160,6 +160,48 @@ copy of the profile rather than the profile you play, and start the game through
 `SKYRIM_DEVTOOLS_IMAGE` to the hash of the executable the profile runs. The plugin then works as in the
 pinned setup; mod DLLs appear as `skse-plugin` modules, named from the PDBs they ship.
 
+## I/O and load traces
+
+The sampling profiler shows where CPU time goes; during a load the main thread mostly waits, so the I/O trace
+records what it waits for. Start the game with `SKYRIM_DEVTOOLS_IOTRACE=1` (or a list such as
+`stack=12,events=3000000,counterMs=50,threadMs=250`; the defaults are 10 frames, 3 million events, 50 ms and
+250 ms). The plugin then installs inline hooks on the kernelbase file functions while its DLL is being loaded,
+before SKSE calls any plugin, and records for every call in the process:
+
+* `CreateFileW/A`, `CreateFile2`: path as asked for, physical path of the handle (under Mod Organizer the mod
+  it came from), size, flags, latency;
+* `ReadFile`, `ReadFileEx`, `GetOverlappedResult(Ex)`, `NtReadFile` called directly: file, offset, size, bytes,
+  latency, thread, call stack; overlapped reads keep their issue time so a wait shows the full latency;
+* `SetFilePointer(Ex)` seeks, `CreateFileMapping`/`MapViewOfFile` of files, `CloseHandle` of traced files;
+* `LoadLibraryEx` per DLL and each SKSE plugin's `SKSEPlugin_Load`, timed through a wrapper handed out by
+  `GetProcAddress`.
+
+A sampler thread adds process page faults, working set, private bytes, available memory and I/O counters every
+`counterMs`, the system memory manager's hard-fault page reads, transition and demand-zero faults, and every
+thread's CPU time every `threadMs`. SKSE messages, the loading, fader and main menus and `IoTrace.mark` calls
+become marks. Hook bookkeeping is timed and reported as `hookOverheadS`.
+
+Name the DLL so it sorts first in `SKSE\Plugins` (for example `!SkyrimDevTools.dll`) to time every other
+plugin's load. Mod Organizer's virtual file system hooks the same functions earlier; the trace sits above it,
+so its redirection is unaffected and is part of the measured latency.
+
+`IoTrace.dump` writes `iotrace-<n>.bin` and `.json` into the run directory; copy both and run
+
+    skyrim-devtools-io iotrace-2-final.json --addrlib versionlib-1-7-104-0.bin --symbols ../skyrim-research
+
+which writes `io-report.txt`, `io-summary.json`, `io.sqlite` (tables `io_events`, `io_files`, `io_stacks`,
+`io_threads`, `io_marks`, `io_phases`, `io_counters`, `io_thread_cpu`, `io_dlls`, `io_plugins`) and
+`io-perfetto.json.gz` (open in ui.perfetto.dev: a track per thread with its I/O calls of 50 us or more,
+phases, marks, and fault, memory and read-rate counters). Phases come from the marks: `skse-plugins`
+(to PostLoad), `data-load` (InputLoaded to DataLoaded), `to-main-menu`, `startup` (to the main menu) and
+`load <cell>` for each `coc <cell> begin`/`end` mark pair. The report gives per phase the open and read
+totals, a read-size histogram, time by file kind and by mod, the top files with non-sequential and small reads,
+the top calling functions, I/O and CPU time per thread, then DLL load times and per-plugin read spans.
+
+An I/O trace holds file paths of the local setup and game addresses; keep it local like a profile. The trace
+costs a few microseconds per call; reads are recorded even when they hit the file cache, so latency, not
+count, separates disk from memory.
+
 ## Limits
 
 * User-mode stacks only; time inside the kernel is attributed to the system-call stub (`NtWaitFor...`).
