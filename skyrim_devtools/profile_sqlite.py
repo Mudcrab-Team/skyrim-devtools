@@ -18,7 +18,7 @@ CREATE TABLE StringIds (id INTEGER PRIMARY KEY, value TEXT NOT NULL UNIQUE);
 CREATE TABLE ThreadNames (threadId INTEGER PRIMARY KEY, nameId INTEGER, isMain INTEGER, isFrameThread INTEGER,
     onCpuSamples INTEGER, waitingSamples INTEGER);
 CREATE TABLE Frames (frame INTEGER PRIMARY KEY, start REAL, end REAL, frame_ms REAL, cpu_ms REAL, gpu_ms REAL,
-    gpu_start REAL, gpu_end REAL, hitch INTEGER, bound TEXT);
+    gpu_start REAL, gpu_end REAL, hitch INTEGER, bound TEXT, excess_ms REAL, gpu_busy_ms REAL, util_pct REAL);
 CREATE TABLE Symbols (id INTEGER PRIMARY KEY, rva INTEGER, nameId INTEGER, moduleId INTEGER, kind TEXT, sourceId INTEGER);
 CREATE TABLE Callchains (id INTEGER, depth INTEGER, symbolId INTEGER, moduleId INTEGER, PRIMARY KEY (id, depth));
 CREATE TABLE CpuSamples (timestamp REAL, threadId INTEGER, callchainId INTEGER, state TEXT, weight INTEGER, end REAL);
@@ -91,7 +91,7 @@ def export_sqlite(profile, path):
                               f"frame {hitch.get('frame')}: {hitch.get('ms')} ms"])
         markers = [(i, m[2], m[0], m[1], sid(m[3])) for i, m in enumerate(sorted(marks, key=lambda m: m[0] or 0))]
         frames = [(r["frame"], r["start"], r["end"], r["frameMs"], r["cpuMs"], r["gpuMs"], r["gpuStart"], r["gpuEnd"],
-                   int(r["hitch"]), r["bound"]) for r in frame_table(profile)]
+                   int(r["hitch"]), r["bound"], r["excessMs"], r["gpuBusyMs"], r["utilPct"]) for r in frame_table(profile)]
         timed, offset = gpu_frames(raw)
         ranges = [(f["frame"], sid(label), kind, start, end, round(end - start, 3))
                   for f in timed for label, kind, start, end in f["passes"]]
@@ -109,7 +109,7 @@ def export_sqlite(profile, path):
         }
         db.executemany("INSERT INTO StringIds VALUES (?, ?)", ((i, t) for t, i in strings.items()))
         db.executemany("INSERT INTO ThreadNames VALUES (?, ?, ?, ?, ?, ?)", thread_rows)
-        db.executemany("INSERT INTO Frames VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", frames)
+        db.executemany("INSERT INTO Frames VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", frames)
         db.executemany("INSERT INTO Symbols VALUES (?, ?, ?, ?, ?, ?)", symbols)
         db.executemany("INSERT INTO Callchains VALUES (?, ?, ?, ?)", chains)
         db.executemany("INSERT INTO CpuSamples VALUES (?, ?, ?, ?, ?, ?)", samples)
