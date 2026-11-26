@@ -15,6 +15,11 @@ from pathlib import Path
 PROTOCOL = 2
 BUILD = "sse-steam-1-7-104"
 IMAGE_SHA256 = "846efccf0c1374d71f892907f46549560f2fcb0a75cb87a3eed438baa0f1402f"
+# Every runtime the plugin accepts, by build id; the pinned BUILD above is the isolated test install.
+BUILDS = {
+    BUILD: IMAGE_SHA256,
+    "sse-steam-1-6-1170": "c434208894f07f604b852f29b8edc3a58c4de63de783373733e72b2b73f33be9",
+}
 INVENTORY = "InventoryMenu"
 CONSOLE = "Console"
 MAX_MESSAGE = 16 * 1024 * 1024
@@ -39,9 +44,11 @@ class ConnectionLost(RuntimeError):
 
 
 class Session:
-    def __init__(self, socket, session_id, event_limit=10000):
+    def __init__(self, socket, session_id, event_limit=10000, build=BUILD):
+        """`build` is the runtime the caller launched; None accepts any runtime in BUILDS."""
         self.socket = socket
         self.session_id = session_id
+        self.build = build
         self.epoch = None
         self.events = asyncio.Queue(maxsize=event_limit)
         self.dropped_events = 0
@@ -125,8 +132,8 @@ class Session:
         info = await self.call("Session.getInfo")
         if (
             info["protocol"] != PROTOCOL
-            or info["build"] != BUILD
-            or info["imageSha256"] != IMAGE_SHA256
+            or BUILDS.get(info["build"]) != info["imageSha256"]
+            or (self.build is not None and info["build"] != self.build)
             or info["sessionId"] != self.session_id
         ):
             raise RuntimeError("Protocol, image or session identity mismatch")

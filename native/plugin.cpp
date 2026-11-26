@@ -16,7 +16,33 @@
 
 namespace
 {
-    constexpr char imageSha[] = "846efccf0c1374d71f892907f46549560f2fcb0a75cb87a3eed438baa0f1402f";
+    // Runtimes the plugin has been run on. Game code is reached only through Address Library IDs and
+    // CommonLibSSE-NG's runtime-aware layouts, so one build serves every row; the image hash pins each
+    // executable and the SKSE version is the release made for it.
+    struct Runtime
+    {
+        REL::Version game;
+        REL::Version skse;
+        const char*  build;
+        const char*  imageSha;
+    };
+
+    constexpr std::array runtimes{
+        Runtime{ SKSE::RUNTIME_SSE_1_7_104, REL::Version{ 2, 3, 1, 0 }, "sse-steam-1-7-104",
+            "846efccf0c1374d71f892907f46549560f2fcb0a75cb87a3eed438baa0f1402f" },
+        Runtime{ SKSE::RUNTIME_SSE_1_6_1170, REL::Version{ 2, 2, 6, 0 }, "sse-steam-1-6-1170",
+            "c434208894f07f604b852f29b8edc3a58c4de63de783373733e72b2b73f33be9" },
+    };
+
+    const Runtime* FindRuntime(const SKSE::LoadInterface& skse)
+    {
+        for (const auto& runtime : runtimes) {
+            if (skse.RuntimeVersion() == runtime.game && skse.SKSEVersion() == runtime.skse.pack()) {
+                return &runtime;
+            }
+        }
+        return nullptr;
+    }
 
     std::string Environment(const char* name)
     {
@@ -69,14 +95,14 @@ SKSE_PLUGIN_VERSION = [] {
     SKSE::PluginVersionData version{};
     version.PluginVersion(REL::Version{ 2, 0, 0, 0 });
     version.PluginName("SkyrimDevTools");
-    version.CompatibleVersions({ SKSE::RUNTIME_SSE_1_7_104 });
+    version.CompatibleVersions({ SKSE::RUNTIME_SSE_1_7_104, SKSE::RUNTIME_SSE_1_6_1170 });
     return version;
 }();
 
 SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* skse)
 {
-    if (skse->RuntimeVersion() != SKSE::RUNTIME_SSE_1_7_104 ||
-        skse->SKSEVersion() != REL::Version{ 2, 3, 1, 0 }.pack()) {
+    const auto* runtime = FindRuntime(*skse);
+    if (!runtime) {
         return false;
     }
 
@@ -87,8 +113,8 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* skse)
     if (token.empty() && config.sessionId.empty()) {
         return true;
     }
-    config.build = "sse-steam-1-7-104";
-    config.imageSha256 = imageSha;
+    config.build = runtime->build;
+    config.imageSha256 = runtime->imageSha;
     config.headless = Environment("SKYRIM_DEVTOOLS_HEADLESS") == "1";
     config.savesDir = EnvironmentPath(L"SKYRIM_DEVTOOLS_SAVES_DIR");
     const auto port = Integer("SKYRIM_DEVTOOLS_PORT", 0, 1024, 65535);
@@ -96,7 +122,7 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* skse)
     const auto connect = Integer("SKYRIM_DEVTOOLS_CONNECT_TIMEOUT", 600, 0, 7 * 24 * 3600);
     const auto runDir = EnvironmentPath(L"SKYRIM_DEVTOOLS_RUN_DIR");
     if (!port || !idle || !connect || token.size() != 64 || config.sessionId.size() != 32 || runDir.empty() ||
-        Environment("SKYRIM_DEVTOOLS_IMAGE") != imageSha) {
+        Environment("SKYRIM_DEVTOOLS_IMAGE") != runtime->imageSha) {
         return false;
     }
 

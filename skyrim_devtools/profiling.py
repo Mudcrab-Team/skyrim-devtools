@@ -18,6 +18,7 @@ import json
 import os
 from pathlib import Path
 import re
+import struct
 import sys
 import time
 import zlib
@@ -34,10 +35,14 @@ WAIT_RE = re.compile(
     r"^(Nt|Zw)(WaitFor|DelayExecution|RemoveIoCompletion|SignalAndWait|UserMsgWaitFor|AlertThreadByThreadId|"
     r"WaitForAlertByThreadId|ReplyWaitReceivePort|AlpcSendWaitReceivePort|UserGetMessage|GdiDdDDIWaitFor|"
     r"YieldExecution|ReadFile|DeviceIoControlFile|FsControlFile|QueryVolumeInformationFile)")
+SKSE_PLUGIN_RE = re.compile(r"\\data\\skse\\plugins\\[^\\]+$", re.I)
 SYSTEM_DIR_RE = re.compile(r"\\windows\\(system32|syswow64|winsxs)\\", re.I)
 GPU_DRIVER_RE = re.compile(r"^(nvwgf2umx|nvldumdx|nvd3dumx|nvoglv64|amdxx64|atidxx64|amdxc64|igd10iumd64|igdumdim64|igc64|"
                            r"d3d11|d3d12|dxgi|d3d10warp|nvapi64|nvgpucomp64|igdgmm64)", re.I)
 PLUGIN_NAME = "skyrimdevtools.dll"
+# The build the skyrim-research symbol tables describe; a profile of another runtime reaches them through
+# Address Library IDs, which name the same function in every AE build.
+SYMBOLS_BUILD = "sse-steam-1-7-104"
 CHUNK_TIMEOUT = 60
 
 
@@ -54,13 +59,78 @@ def research_root(explicit=None, config=None):
     return None
 
 
+def address_library_path(explicit=None, config=None):
+    """The Address Library table of SYMBOLS_BUILD (versionlib-1-7-104-0.bin), or None."""
+    for candidate in (explicit, os.environ.get("SKYRIM_DEVTOOLS_ADDRLIB"), (config or {}).get("addressLibrary")):
+        if candidate:
+            path = Path(candidate).expanduser()
+            if path.is_file():
+                return path
+    return None
+
+
+def read_address_library(path):
+    """{id: rva} from an Address Library table: format 5 (1.7.x, a 0x60-byte header and one u32 offset per
+    id) or format 2 (1.6.x, delta-encoded id/offset pairs)."""
+    data = Path(path).read_bytes()
+    (fmt,) = struct.unpack_from("<i", data, 0)
+    if fmt == 5:
+        pointer, _, count = struct.unpack_from("<iiI", data, 0x54)
+        if len(data) != 0x60 + 4 * count:
+            raise ValueError(f"{path}: size does not match its id count")
+        return {i: o for i, o in enumerate(struct.unpack_from(f"<{count}I", data, 0x60)) if o}
+    if fmt != 2:
+        raise ValueError(f"{path}: unsupported Address Library format {fmt}")
+    pos = 4 + 16
+    (name_len,) = struct.unpack_from("<i", data, pos)
+    pos += 4 + name_len
+    pointer, count = struct.unpack_from("<ii", data, pos)
+    pos += 8
+    widths = {2: "<B", 3: "<B", 4: "<H", 5: "<H", 6: "<H", 7: "<I"}
+    out = {}
+    prev_id = prev_off = 0
+    for _ in range(count):
+        tag = data[pos]
+        pos += 1
+        low, high = tag & 0xF, tag >> 4
+        if low == 0:
+            (ident,) = struct.unpack_from("<Q", data, pos)
+            pos += 8
+        elif low == 1:
+            ident = prev_id + 1
+        else:
+            (delta,) = struct.unpack_from(widths[low], data, pos)
+            pos += struct.calcsize(widths[low])
+            ident = {2: prev_id + delta, 3: prev_id - delta, 4: prev_id + delta, 5: prev_id - delta}.get(low, delta)
+        scaled = bool(high & 8)
+        base = prev_off // pointer if scaled else prev_off
+        kind = high & 7
+        if kind == 0:
+            (offset,) = struct.unpack_from("<Q", data, pos)
+            pos += 8
+        elif kind == 1:
+            offset = base + 1
+        else:
+            (delta,) = struct.unpack_from(widths[kind], data, pos)
+            pos += struct.calcsize(widths[kind])
+            offset = {2: base + delta, 3: base - delta, 4: base + delta, 5: base - delta}.get(kind, delta)
+        if scaled:
+            offset *= pointer
+        out[ident] = offset
+        prev_id, prev_off = ident, offset
+    return out
+
+
 class GameSymbols:
     """Names for game RVAs, best source first: CrashLogger PDB names, project names, sibling symbol
     alignment. Function starts come from the image's unwind table (sent by the plugin) and the PDB
-    boundary table."""
+    boundary table. All of these describe SYMBOLS_BUILD; with that build's Address Library table
+    (`addrlib`) a profile of another runtime is named through each frame's Address Library ID."""
 
-    def __init__(self, root=None):
+    def __init__(self, root=None, addrlib=None):
         self.root = Path(root) if root else None
+        self.build = SYMBOLS_BUILD
+        self.ids = read_address_library(addrlib) if addrlib else {}
         self.names = {}
         self.project = {}
         self.aligned = {}
@@ -69,6 +139,8 @@ class GameSymbols:
         self.loaded = []
         if self.root:
             self._load()
+        if self.ids:
+            self.loaded.append(f"address library ids {len(self.ids)}")
 
     def _load(self):
         pdb = self.root / "reconstruction" / "generated" / "crashlogger_pdb"
@@ -120,6 +192,24 @@ class GameSymbols:
             return name, f"symbols:{source}"
         return None
 
+    def resolve_by_id(self, ident, ident_offset, rva=None, start=None):
+        """(label, source, None) for a frame of another runtime: its Address Library ID is looked up in this
+        build's table and the name of the function there is used. Without a name the ID itself is the label;
+        RVAs of another runtime are never looked up in these tables."""
+        if ident is None or ident_offset is None or ident_offset >= 0x4000:
+            return None
+        if rva is not None and start is not None and rva - ident_offset < start:
+            # The nearest ID lies before the frame's function, so it names a neighbour.
+            return None
+        label = f"id:{ident}" + (f"+0x{ident_offset:x}" if ident_offset else "")
+        here = self.ids.get(ident)
+        if here is not None:
+            start = self.containing(here) or here
+            found = self.name_at(start)
+            if found:
+                return found[0], f"{found[1]}@id", None
+        return label, "addrlib", None
+
     def resolve(self, rva, start=None, ident=None, ident_offset=None):
         """(label, source, function start) for a game RVA."""
         starts = [s for s in (start, self.containing(rva)) if s is not None]
@@ -144,6 +234,8 @@ def module_kind(module):
         return "plugin"
     if name.startswith("skse64"):
         return "skse"
+    if SKSE_PLUGIN_RE.search(module.get("path", "")):
+        return "skse-plugin"
     if GPU_DRIVER_RE.match(name):
         return "gpu-driver"
     if name in {"ntdll.dll", "win32u.dll"}:
@@ -163,6 +255,9 @@ class Profile:
         self.raw = raw
         self.symbols = symbols or GameSymbols()
         self.modules = raw.get("modules", [])
+        # A profile without a build field predates multi-runtime support and is of the pinned build.
+        self.build = raw.get("build") or SYMBOLS_BUILD
+        self.foreign = self.build != self.symbols.build
         self.kinds = [module_kind(m) for m in self.modules]
         self.sources = Counter()
         self.functions = []      # (label, module name, kind)
@@ -179,7 +274,11 @@ class Profile:
         else:
             module = self.modules[frame["m"]]
             kind = self.kinds[frame["m"]]
-            if kind == "game":
+            if kind == "game" and self.foreign:
+                label, source, _ = (self.symbols.resolve_by_id(frame.get("id"), frame.get("idOff"), frame["rva"], frame.get("start")) or
+                                    (f"sub_{frame['start']:x}" if "start" in frame else f"game+0x{frame['rva']:x}",
+                                     "pdata" if "start" in frame else "none", None))
+            elif kind == "game":
                 label, source, _ = self.symbols.resolve(frame["rva"], frame.get("start"), frame.get("id"), frame.get("idOff"))
             else:
                 label, source = self._module_label(frame, module)
@@ -289,6 +388,7 @@ class Profile:
     def report(self, which="all", top=20, stacks=8):
         self_on, total_on, self_wait = Counter(), Counter(), Counter()
         modules = Counter()
+        dll_self, dll_total = Counter(), Counter()
         stack_weight = Counter()
         wait_stack_weight = Counter()
         on = off = 0
@@ -306,6 +406,9 @@ class Profile:
             for f in set(functions):
                 total_on[f] += weight
             modules[self.functions[functions[0]][2]] += weight
+            dll_self[self.functions[functions[0]][1]] += weight
+            for module in {self.functions[f][1] for f in functions}:
+                dll_total[module] += weight
             stack_weight[stack] += weight
 
         def row(index, count, base):
@@ -330,10 +433,20 @@ class Profile:
             "topTotal": [row(i, c, on) for i, c in total_on.most_common(top)],
             "hotStacks": stack_rows(stack_weight, on),
             "modules": {k: round(100.0 * v / on, 2) for k, v in modules.most_common()} if on else {},
+            # Per DLL: self is time in its own code, total is time with it anywhere on the stack, which is
+            # where a hook or callback of a mod shows even when it calls back into the game.
+            "dlls": [{"module": m, "kind": self.module_kind_of(m), "selfPct": round(100.0 * dll_self[m] / on, 2),
+                      "totalPct": round(100.0 * c / on, 2)} for m, c in dll_total.most_common(top)] if on else [],
             "topWaits": [row(i, c, off) for i, c in self_wait.most_common(min(top, 10))],
             "waitStacks": stack_rows(wait_stack_weight, off)[:4],
         }
         return result
+
+    def module_kind_of(self, name):
+        for module, kind in zip(self.modules, self.kinds):
+            if module["name"] == name:
+                return kind
+        return "unknown"
 
     def thread_table(self):
         rows = []
@@ -381,8 +494,12 @@ class Profile:
         return out
 
     def credits(self):
-        used = set(self.sources)
+        used = {source.removesuffix("@id") for source in self.sources}
         credits = []
+        if self.foreign:
+            bridged = sum(c for s, c in self.sources.items() if s.endswith("@id"))
+            credits.append(f"Profile of {self.build}; game names are those of {self.symbols.build} reached through "
+                           f"Address Library IDs ({bridged} frames); a name is a label, not proof of identity")
         if "crashlogger" in used:
             credits.append(f"Game function names: {CRASHLOGGER_CREDIT} (CrashLogger Contributors, Nexus mod 59818)")
         if "project" in used or "project-guess" in used:
@@ -711,6 +828,10 @@ def render_text(summary, top=10):
         lines.append("")
         lines.append(f"== {which} threads: on-CPU {report['onCpuMs']} ms, waiting {report['waitingMs']} ms")
         lines.append("modules: " + ", ".join(f"{k} {v}%" for k, v in report["modules"].items()))
+        if report.get("dlls"):
+            lines.append("by DLL (self / total incl. callees):")
+            for r in report["dlls"][:top]:
+                lines.append(f"  {r['selfPct']:6.2f}% / {r['totalPct']:6.2f}%  {r['module']} [{r['kind']}]")
         lines.append("top self (on-CPU):")
         for r in report["topSelf"][:top]:
             lines.append(f"  {r['pct']:6.2f}%  {r['function']}  [{r['module']}]")
@@ -811,7 +932,7 @@ async def record(args):
 
     config = json.loads(Path(args.config).read_text())
     manager = GameManager(config)
-    symbols = GameSymbols(research_root(args.symbols, config))
+    symbols = GameSymbols(research_root(args.symbols, config), address_library_path(args.addrlib, config))
     out = Path(args.out) if args.out else default_out()
     try:
         if args.attach:
@@ -885,10 +1006,12 @@ def main(argv=None):
     rec.add_argument("--headless", action="store_true")
     rec.add_argument("--keep", action="store_true", help="leave the game running")
     rec.add_argument("--attach", action="store_true", help=argparse.SUPPRESS)
+    rec.add_argument("--addrlib", default=None, help="versionlib-1-7-104-0.bin, to name profiles of other runtimes")
     rec.add_argument("--symbols", default=None, help="skyrim-research checkout with the symbol tables")
     rec.add_argument("--out", default=None, help="output directory (default .local/profiles/<stamp>)")
     rep = sub.add_parser("report", help="re-symbolise a saved profile and print or rewrite its report")
     rep.add_argument("profile", help="output directory or raw.json.gz")
+    rep.add_argument("--addrlib", default=None, help="versionlib-1-7-104-0.bin, to name profiles of other runtimes")
     rep.add_argument("--symbols", default=None)
     rep.add_argument("--config", type=Path, default=None)
     rep.add_argument("--rewrite", action="store_true", help="regenerate every output next to the raw file")
@@ -900,12 +1023,14 @@ def main(argv=None):
     exp.add_argument("--open", action="store_true", help="serve on 127.0.0.1 and open profiler.firefox.com on it "
                                                          "(nothing is uploaded; never press the site's Upload button)")
     exp.add_argument("--no-browser", action="store_true", help=argparse.SUPPRESS)
+    exp.add_argument("--addrlib", default=None, help="versionlib-1-7-104-0.bin, to name profiles of other runtimes")
     exp.add_argument("--symbols", default=None)
     exp.add_argument("--config", type=Path, default=None)
     dif = sub.add_parser("diff", help="compare two profiles (for example with and without a mod)")
     dif.add_argument("a")
     dif.add_argument("b")
     dif.add_argument("--threads", default="main", help="main or all")
+    dif.add_argument("--addrlib", default=None, help="versionlib-1-7-104-0.bin, to name profiles of other runtimes")
     dif.add_argument("--symbols", default=None)
     dif.add_argument("--config", type=Path, default=None)
     dif.add_argument("--json", action="store_true")
@@ -914,7 +1039,7 @@ def main(argv=None):
         asyncio.run(record(args))
         return 0
     config = json.loads(args.config.read_text()) if args.config else None
-    symbols = GameSymbols(research_root(args.symbols, config))
+    symbols = GameSymbols(research_root(args.symbols, config), address_library_path(args.addrlib, config))
     if args.command == "report":
         profile = Profile(load_raw(args.profile), symbols)
         if args.rewrite:

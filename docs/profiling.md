@@ -96,8 +96,11 @@ are listed in [protocol.md](protocol.md).
   Shares are of on-CPU samples of the selected threads.
 * **Waiting** samples are times the thread was not running (blocked on a lock, an event, I/O, or idle in
   `Sleep`/vsync). They are kept apart from on-CPU time; the wait flame graph shows where threads block.
-* **Modules**: `game` is SkyrimSE.exe; `plugin` this plugin; `skse` the SKSE loader; `gpu-driver` the
-  graphics driver and D3D runtime; `kernel` ntdll/win32u (system-call stubs); `system` other Windows DLLs.
+* **Modules**: `game` is SkyrimSE.exe; `plugin` this plugin; `skse` the SKSE loader; `skse-plugin` any other
+  DLL in `Data\SKSE\Plugins` (a mod); `gpu-driver` the graphics driver and D3D runtime; `kernel` ntdll/win32u
+  (system-call stubs); `system` other Windows DLLs.
+* **By DLL**: per module, self is time in its own code and total is time with it anywhere on the stack. A mod
+  that hooks a game function and calls back into the game shows a small self and a larger total.
 * **Names**: a game function shows its name when a symbol table knows it, a guessed name with `(guess)`,
   `id:N+0xOFF` when only the Address Library ID is known, and `sub_<rva>` (function start from `.pdata`)
   otherwise. A name is a label, not proof of what a function does. Other modules without debug symbols
@@ -127,8 +130,28 @@ Reports name their sources, for example `CRASHLOGGER_PDB(59818@2026.10.24)` for 
 DLLs are named with DbgHelp inside the game from their PDBs (next to the DLL or on `_NT_SYMBOL_PATH`) and
 their export tables. Without a checkout everything still works with IDs and `sub_` labels.
 
+### Other runtimes
+
+The plugin also loads on 1.6.1170 with SKSE 2.2.6 (each runtime is accepted only with its SKSE build and its
+executable hash, and reports its build in `Session.info` and in each profile). The symbol tables above
+describe 1.7.104, so a 1.6.1170 profile is named through Address Library IDs: each game frame carries the
+nearest ID at or below its address, the 1.7.104 table (`versionlib-1-7-104-0.bin`) maps that ID to its
+1.7.104 address, and the function there gives the name. Pass the table with `--addrlib PATH`,
+`SKYRIM_DEVTOOLS_ADDRLIB=PATH` or `"addressLibrary": "PATH"` in the host config. A 1.6.1170 address is never
+looked up in 1.7.104 tables directly. Functions without an ID shared by both builds stay `id:N` or `sub_`,
+and a bridged name is a label for code that may have changed between builds.
+
 Keep profiles local: they contain addresses and names of the game, so they belong in `.local/` or the test
 PC's scratch tree, not in commits, issues or PRs.
+
+## Profiling a mod manager setup
+
+With Mod Organizer 2 put SkyrimDevTools.dll in its own mod (`SKSE\Plugins\SkyrimDevTools.dll`), enable it in a
+copy of the profile rather than the profile you play, and start the game through MO2
+(`ModOrganizer.exe -p "<profile>" "moshortcut://:<executable title>"`) from a process that has the
+`SKYRIM_DEVTOOLS_*` variables set, with MO2 not already running so the game inherits them. Set
+`SKYRIM_DEVTOOLS_IMAGE` to the hash of the executable the profile runs. The plugin then works as in the
+pinned setup; mod DLLs appear as `skse-plugin` modules, named from the PDBs they ship.
 
 ## Limits
 
