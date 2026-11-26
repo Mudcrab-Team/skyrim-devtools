@@ -183,6 +183,27 @@ group `pos`, `rot` [heading, pitch], `speed`, `cell`, `world` (player); `cam {po
 mode, fov}` (camera); `running`, `sprinting`, `sneaking`, `swimming`, `midair`, `combat`,
 `driver`, `nav`, `stuck` (state); `input` (held control names); `frameMs` (perf).
 
+### Record and replay of play-throughs
+
+Separate from `Record.*` above (JSONL for diagnostics). A recording is a portable, versioned JSON file with its entry point;
+a replay restores the scene first. See [record-replay.md](record-replay.md).
+
+| Method | Thread | Params | Result and meaning |
+| --- | --- | --- | --- |
+| Recording.start | main | name?, intervalMs? (10-1800000, default 50), notes?, coupling? (`{tier?, anchorMs?, cellMs?}`), loadEpoch? | Pose and camera every `intervalMs`, cell changes, console commands, entry point. Refused while a replay runs. Replies `{name, samples, events, durationMs, distance, intervalMs, entry}`. Stops by itself at 60 000 samples or 30 min (`limitReached`). |
+| Recording.stop | main | | Writes `recordings/<name>.json`; `{name, path, samples, events, durationMs, distance, limitReached}` |
+| Recording.status | main | | `{recording, replay:{id, name, tier, phase (restore, settle, run, transit), step, cursor, samples}, lastReplay, lastRecording}` |
+| Recording.list | any | | `{dir, recordings:[{name, path, bytes, durationMs, entryKind, tier}]}` |
+| Recording.read | any | name or path? (newest when absent) | The recording document, from the recordings directory only |
+| Recording.replay | main | path? or name? (newest), restoreScene? (true), settleMs? (config, 3000), coupling? (`anchored`, `cell`, `worldspace`), cleanTransition?, cleanTransitionCell?, force?, stepEveryMs? (1000), replayCommands? (true), applyPov? (true), beforeRun? (up to 50 console commands) | Returns at once with `{id, phase, ...}`; poll `Recording.status` or watch `replay.*`. `beforeRun` commands run after the restore, before the run clock starts. |
+| Recording.stopReplay | main | | `{stopped, last}` |
+| Recording.replayTrace | main | | Observed poses of the last replay, `{name, columns:[tMs,x,y,z,cell], samples}` |
+| Recording.configure | main | recordHotkey?, recordHotkeyShift?, replayHotkey?, replayHotkeyShift?, replayPath?, replayRestoreScene?, recordIntervalMs?, autoRunPath?, autoRunRestoreScene?, loadSettleMs?, couplingAnchorMs?, couplingCellMs?, cleanTransition?, cleanTransitionCell? | Changes the settings (also read at start from `recording.json` in the run directory) and returns them. Hotkeys are Windows virtual-key codes. |
+
+Events: `record.started`, `record.stopped`, `replay.started` (after the scene was restored, when the run clock starts),
+`replay.step` (about every `stepEveryMs`) and `replay.finished` (drift, cell mismatches, `error` when it failed). Console
+commands typed by a person are seen through the console compiler's entry (capability `consoleTyped`).
+
 Navigation events carry the Nav.status fields: `navProgress` (once a second), `navStuck` (plus the
 recovery `attempt`), `navArrived` and `navFailed` (with `reason`). `navInterrupted {id, reason,
 details, action, pos}` and `navResumed {id, after}` bracket every interruption; `navStall {id, kind,

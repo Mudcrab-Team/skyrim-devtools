@@ -169,6 +169,21 @@ namespace
     }
 }
 
+namespace devtools
+{
+    std::string LastLoadedSave()
+    {
+        std::lock_guard lock(loadMutex);
+        return lastSave;
+    }
+
+    void NotePendingSave(const std::string& name)
+    {
+        std::lock_guard lock(loadMutex);
+        pendingSave = name;
+    }
+}
+
 DEVTOOLS_MODULE(Session)
 {
     events::Declare("loadGame", "A save finished loading: {success, name, loadEpoch}");

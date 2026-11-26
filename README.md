@@ -28,6 +28,11 @@ into tools Claude can call, the way browser-use does for a browser.
   blind camera, menu left open, low fps, crime, unreachable targets, stuck movement.
 - Game health (threads, memory, responsiveness) for long sessions; `perf_check`, `perf_hitches` and frame stats.
 
+**Record, replay and benchmarks**
+- `recording_start` / `recording_stop` capture a play-through (pose, camera, cell changes, console commands, entry point);
+  `replay` restores the scene and replays it deterministically; `bench_ab` compares two configurations over the same path
+  with frame-time deltas and run-to-run noise. See [docs/record-replay.md](docs/record-replay.md).
+
 **Video composer**
 - `capture_start` / `narrate` / `capture_stop` record footage and a timeline; `skyrim-devtools-video` composes
   footage beside an "agent view" panel with idle stretches sped up, chapter cards, insets and alert banners.
