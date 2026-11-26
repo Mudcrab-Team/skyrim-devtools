@@ -23,9 +23,15 @@ HIT_WINDOW_S = 4.5         # Nav.goto counts a hit taken this recently as combat
 ARRIVE_NEAR = 220.0        # already this close to a reference target: count it as reached
 LEVER_REACH = 2500.0       # levers this far from where a way ended are worth walking to
 PULLS_PER_CELL = 6
+PULLS_PER_LEVER = 2        # a second pull only when the first one left the blocker as it was
+UNLOCK_UP_TO = 2           # lock ranks (veryEasy=1, easy=2) explore opens itself when a hostile sits behind one
+UNLOCK_REACH = 1800.0      # locked doors this close to an unreachable hostile are tried
+UNLOCKS_PER_CELL = 6
+OPEN_STATES = ("open", "opening")
 SETTLE_S = 5.0             # gates and drawbridges animate for a few seconds after a pull
 LOOSE_WORDS = re.compile(r"torch|candle|lantern|lamp|brazier|sconce|chandelier|clutter|light", re.I)
 BLOCKED_REASON = re.compile(r"^(Dead end|stuck)", re.I)
+FORM_ID = re.compile(r"\b[0-9A-Fa-f]{8}\b")
 
 
 def dumps(value):
@@ -66,6 +72,9 @@ class Memory:
         self.blocked = set()      # target keys given up on
         self.killed = []          # names of hostiles seen to be gone
         self.pulled = set()       # lever-like activators already operated
+        self.levers = {}          # lever ref -> {"pulls", "blocker", "before", "after", "changed"} from its last pull
+        self.unlocked = set()     # doors explore unlocked
+        self.unreachable = {}     # target key -> why it was given up on
 
 
 def _ranked(model, candidates, key_room):
@@ -87,22 +96,99 @@ def _ranked(model, candidates, key_room):
     return sorted(candidates, key=score), unjoined
 
 
+def repull_allowed(memory, ref):
+    """A lever toggles, so pulling it again only makes sense when its last pull left the blocker unchanged."""
+    entry = memory.levers.get(ref)
+    return bool(entry) and entry["changed"] is False and entry["pulls"] < PULLS_PER_LEVER
+
+
 def lever_candidates(model, near, memory):
-    """Levers, chains and switches worth pulling when a way ahead is shut, nearest to `near` first.
+    """Levers, chains and switches worth pulling when a way ahead is shut: every untried one first, nearest to
+    `near` first, then levers whose earlier pull changed nothing.
 
     A torch or other loose fixture is an activator too, but taking it opens nothing, so it is never a candidate.
     Which lever belongs to which gate is not known from the map, so distance to the place the way ended decides."""
-    found = []
+    fresh, again = [], []
     for slot in model.contents.values():
         for a in slot["activators"]:
             name = a.get("name") or ""
-            if a["refID"] in memory.pulled or not rooms_module.LEVER_WORDS.search(name) or LOOSE_WORDS.search(name):
+            if not rooms_module.LEVER_WORDS.search(name) or LOOSE_WORDS.search(name):
+                continue
+            tried = a["refID"] in memory.pulled
+            if tried and not repull_allowed(memory, a["refID"]):
                 continue
             pos = a.get("pos")
             distance = rooms_module.dist3(pos, near) if pos and near else 0.0
             if distance <= LEVER_REACH:
-                found.append((distance, a))
-    return [a for _, a in sorted(found, key=lambda item: item[0])]
+                (again if tried else fresh).append((distance, a))
+    return [a for _, a in sorted(fresh, key=lambda item: item[0]) + sorted(again, key=lambda item: item[0])]
+
+
+def blocker_ref(blockers):
+    """The reference a dead end names as the likely cause (a gate, bridge or door), else the nearest shut one."""
+    if not blockers:
+        return None
+    match = FORM_ID.search(str(blockers.get("likely") or ""))
+    if match:
+        return match.group(0).upper()
+    for entry in blockers.get("refs") or []:
+        if entry.get("openState") not in OPEN_STATES and entry.get("refID"):
+            return entry["refID"]
+    return None
+
+
+def record_pull(memory, lever, blocker, before, after):
+    """Remember what a pull did to the blocker. changed is None when the blocker's state could not be read."""
+    entry = memory.levers.get(lever, {"pulls": 0})
+    known = blocker is not None and before is not None and after is not None
+    memory.levers[lever] = {"pulls": entry["pulls"] + 1, "blocker": blocker, "before": before, "after": after,
+                            "changed": (before != after) if known else None}
+    memory.pulled.add(lever)
+    return memory.levers[lever]
+
+
+def enemy_ref(result):
+    """The hostile that interrupted a walk, from Nav.status interruptions."""
+    recent = ((result.get("interruptions") or {}).get("recent")) or []
+    for event in reversed(recent):
+        enemy = (event.get("details") or {}).get("enemy") or {}
+        if enemy.get("refID"):
+            return enemy["refID"]
+    return None
+
+
+def door_candidates(model, near, memory, max_rank=UNLOCK_UP_TO):
+    """Locked doors near `near` that are easy enough to open (veryEasy, easy), nearest first."""
+    found = []
+    for slot in model.contents.values():
+        for d in slot["doors"]:
+            rank = rooms_module.LOCK_RANK.get(d.get("lockLevel"), 99)
+            if not d.get("locked") or d["refID"] in memory.unlocked or d.get("teleports") or rank > max_rank:
+                continue
+            pos = d.get("pos")
+            distance = rooms_module.dist3(pos, near) if pos and near else 0.0
+            if distance <= UNLOCK_REACH:
+                found.append((distance, d))
+    return [d for _, d in sorted(found, key=lambda item: item[0])]
+
+
+class StepLog:
+    """One line per decision, kept in memory and appended to a file as it happens so a crash or timeout loses nothing."""
+
+    def __init__(self, path=None):
+        self.path = path
+        self.lines = []
+        self.began = time.monotonic()
+
+    def __call__(self, text):
+        line = f"{time.monotonic() - self.began:7.1f}s {text}"
+        self.lines.append(line)
+        if self.path:
+            try:
+                with open(self.path, "a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+            except OSError:
+                self.path = None
 
 
 def blocked_by_gate(result):
@@ -291,23 +377,68 @@ def register(mcp, native, manager, is_busy):
         content = content[0] if isinstance(content, tuple) else content
         return json.loads(content[0].text)
 
-    async def pull_for(model, memory, near, pulls):
-        """Walk to the nearest untried lever and pull it. True when one was pulled."""
+    async def open_state(ref):
+        """open/closed/... of a gate, bridge or door, or None when it cannot be read."""
+        if not ref:
+            return None
+        try:
+            info = await native("World.inspect", refID=ref, nodes=False, graph=False)
+        except Exception:
+            return None
+        return info.get("openState")
+
+    async def pull_for(model, memory, near, pulls, log, blockers=None):
+        """Walk to the best lever and pull it, then re-read the blocker. True when the blocker changed or when a
+        lever whose effect is unknown was pulled (the caller retries the walk)."""
+        blocker = blocker_ref(blockers)
+        state = await open_state(blocker)
+        if state in OPEN_STATES:
+            log(f"blocker {blocker} is already {state}: no lever needed")
+            return False
         for lever in lever_candidates(model, near, memory)[:3]:
-            memory.pulled.add(lever["refID"])
-            await native("Nav.goto", goal={"refID": lever["refID"]}, activate=True, onCombat="ignore")
+            ref = lever["refID"]
+            first = ref not in memory.pulled
+            log(f"{'pull' if first else 'pull again'} lever {ref} ({lever.get('name')}) for blocker {blocker or 'unknown'} ({state})")
+            await native("Nav.goto", goal={"refID": ref}, activate=True, onCombat="ignore")
             result = await wait_nav(NAV_LEG_TIMEOUT_S)
-            pulls.append({"ref": lever["refID"], "name": lever.get("name"), "outcome": result.get("state"),
-                          "reason": result.get("reason")})
-            if result.get("state") == "arrived":
-                await asyncio.sleep(SETTLE_S)
-                return True
+            entry = {"ref": ref, "name": lever.get("name"), "outcome": result.get("state"), "reason": result.get("reason")}
+            pulls.append(entry)
+            if result.get("state") != "arrived":
+                memory.pulled.add(ref)
+                log(f"lever {ref}: could not reach it ({result.get('reason')})")
+                continue
+            await asyncio.sleep(SETTLE_S)
+            after = await open_state(blocker)
+            effect = record_pull(memory, ref, blocker, state, after)
+            entry.update(blocker=blocker, before=state, after=after, changed=effect["changed"])
+            log(f"lever {ref}: blocker {blocker} {state} -> {after}" + (" (changed)" if effect["changed"] else ""))
+            if effect["changed"] is False:
+                continue
+            return True
         return False
+
+    async def unlock_for(model, memory, near, log):
+        """Unlock the easy locked doors around an unreachable hostile. True when one was opened."""
+        did = False
+        for door in door_candidates(model, near, memory)[:2]:
+            if len(memory.unlocked) >= UNLOCKS_PER_CELL:
+                break
+            ref = door["refID"]
+            memory.unlocked.add(ref)
+            log(f"unlock door {ref} ({door.get('name')}, {door.get('lockLevel')}) near the unreachable hostile")
+            try:
+                await native("Console.execute", command=f"prid {ref}", target="none")
+                lines = await native("Console.execute", command="unlock", target="selected")
+                log(f"unlock {ref}: {' | '.join(str(x) for x in (lines or {}).get('lines', []))[:120] or 'done'}")
+                did = True
+            except Exception as error:
+                log(f"unlock {ref} failed: {error}")
+        return did
 
     @mcp.tool()
     async def explore(goal: str = "unvisited", fight: bool = False, invulnerable: bool = False,
                       rooms: int = 1, timeout_s: float = 300, activate: bool = False, style: str = "melee",
-                      stand_ground: bool = False) -> str:
+                      stand_ground: bool = False, unlock: bool = True) -> str:
         """Find the next thing to walk to in a cell with no quest marker, walk there, and report what was found.
         goal: "unvisited" (default: the nearest unvisited room), "clear" (the nearest living hostile, until none is
         left: "cell cleared"), "loot" (the nearest container or valuable item not yet walked up to), "exit" (the
@@ -318,7 +449,13 @@ def register(mcp, native, manager, is_busy):
         mode on for the walk. Without it, combat is handled by Nav.goto's default (run past). The reply has a
         status (budget: more to do; final: cleared, fully_explored, found, looted, at_exit, arrived_at_exit,
         left_cell, hostile_reached, not_found, no_exit, stuck, dead, outmatched), the legs walked with their outcome, hostiles seen to be
-        gone, levers pulled to open a shut way, and the map summary. Call again to continue; cell_map shows the picture."""
+        gone, levers pulled to open a shut way, and the map summary. Levers toggle, so each is pulled once and the
+        blocker's open state is read afterwards; a lever is pulled again only when it changed nothing. Hostiles that
+        stay unreachable (nav fails, "Interrupted by combat" with no way to them) are given up on after two failed
+        legs and exploring goes on; when only those are left the status is cleared_reachable and `unreachable` says
+        why for each. unlock=true opens doors locked at very easy or easy near such a hostile (console unlock, noted
+        in the log). Every decision is written to explore-<cell>.log in the recordings/cell maps folder and the last
+        lines are in the reply as `log`."""
         fight_on_contact = fight
         began = time.monotonic()
         legs = []
@@ -326,6 +463,8 @@ def register(mcp, native, manager, is_busy):
         failures_in_row = 0
         status = {"status": "budget", "why": "the leg budget for this call is used up"}
         god = False
+        log = StepLog()
+        log_ready = False
         memory = None
         cell_id = None
         pulls = []
@@ -335,17 +474,43 @@ def register(mcp, native, manager, is_busy):
                 model, cell_id, _ = await read_model(refresh_mesh=force_mesh)
                 force_mesh = False
                 memory = memories[cell_id]
+                if not log_ready:
+                    log_ready = True
+                    try:
+                        folder = save_dir()
+                        folder.mkdir(parents=True, exist_ok=True)
+                        name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str((model.cell or {}).get("name") or cell_id))
+                        log.path = str(folder / f"explore-{name}.log")
+                    except OSError:
+                        log.path = None
+                    log(f"explore goal={goal} fight={fight} rooms={rooms} in {cell_id}; {len(model.hostiles())} hostile(s), "
+                        f"{len(model.unvisited())} unvisited room(s)")
                 alive_before = {h["refID"]: h.get("name") for h in model.hostiles()}
                 if model.player_room:
                     memory.reached.add(model.player_room)
                 pick = choose_target(model, goal, memory)
                 if pick["status"] != "go":
-                    if pick["status"] in ("fully_explored", "stuck", "not_found") and len(memory.pulled) < PULLS_PER_CELL:
-                        # rooms or hostiles are left that nothing reaches: a lever may open the way
-                        if await pull_for(model, memory, model.player, pulls):
+                    if pick["status"] in ("fully_explored", "stuck", "not_found"):
+                        # rooms or hostiles are left that nothing reaches: an easy lock or a lever may open the way
+                        if unlock and pick.get("hostiles"):
+                            reopened = False
+                            for h in model.hostiles():
+                                if "ref:" + h["refID"] in memory.blocked and await unlock_for(model, memory, h.get("pos"), log):
+                                    reopened = True
+                                    memory.blocked.discard("ref:" + h["refID"])
+                                    memory.failures.pop("ref:" + h["refID"], None)
+                            if reopened:
+                                force_mesh = True
+                                continue
+                        if len(memory.pulled) < PULLS_PER_CELL and await pull_for(model, memory, model.player, pulls, log):
                             force_mesh = True
                             continue
                     status = pick
+                    if goal.strip() == "clear" and pick["status"] == "stuck" and pick.get("hostiles"):
+                        status = {"status": "cleared_reachable",
+                                  "why": f"every reachable hostile is dead; {len(pick['hostiles'])} could not be reached or killed",
+                                  "unreachable": [{**h, "why": memory.unreachable.get("ref:" + h["refID"])} for h in pick["hostiles"]]}
+                    log(f"final {status['status']}: {status.get('why')}")
                     break
                 if len(legs) >= max(1, rooms):
                     status = {"status": "budget", "why": f"{len(legs)} leg(s) walked; call explore again to continue",
@@ -360,6 +525,7 @@ def register(mcp, native, manager, is_busy):
                 goal_spec = {"refID": pick["ref"]} if pick["kind"] == "ref" else \
                     {"x": pick["pos"][0], "y": pick["pos"][1], "z": pick["pos"][2]}
                 leg_began = time.monotonic()
+                log(f"leg {len(legs) + 1}: {pick['why']} -> {pick.get('name') or pick['room']} ({pick['kind']})")
                 leg = {"to": pick.get("name") or pick["room"], "room": pick.get("room"), "why": pick["why"]}
                 nav_args = dict(goal=goal_spec, onCombat="stop" if fight_on_contact else None)
                 if pick["kind"] == "ref" and pick.get("kindOf") == "exit door" and activate:
@@ -385,6 +551,8 @@ def register(mcp, native, manager, is_busy):
                         break
                     await native("Nav.goto", **nav_args)
                     result = await wait_nav(NAV_LEG_TIMEOUT_S)
+                if result.get("leversPulled"):
+                    log(f"Nav.goto pulled {result['leversPulled']} lever(s) itself during this leg")
                 if fights and at_hostile and result.get("state") == "failed" and fights[-1]["outcome"] == "clear" and not status.get("status") in ("dead", "outmatched"):
                     # the interruption was the fight itself, and it was won: the leg did its job
                     result = {**result, "state": "arrived", "reason": "fought on arrival"}
@@ -393,6 +561,8 @@ def register(mcp, native, manager, is_busy):
                 if fights:
                     leg["fights"] = fights
                 legs.append(leg)
+                log(f"leg {len(legs)}: {leg['outcome']} ({leg.get('reason')}) in {leg['elapsedS']}s"
+                    + (f"; fights {[f['outcome'] for f in fights]}" if fights else ""))
                 arrived = result.get("state") == "arrived"
                 if arrived:
                     failures_in_row = 0
@@ -410,17 +580,31 @@ def register(mcp, native, manager, is_busy):
                                   "advice": "call combat_fight, or explore again with fight=true, to deal with it"}
                     elif pick.get("kindOf") in ("container", "item"):
                         status = {"status": "go", "arrivedAt": pick.get("name")}
+                elif unlock and pick.get("pos") and await unlock_for(model, memory, pick["pos"], log):
+                    # an easy lock may be what shuts the way: try the same target again without counting a failure
+                    leg["unlocked"] = True
+                    force_mesh = True
                 elif blocked_by_gate(result) and len(memory.pulled) < PULLS_PER_CELL and await pull_for(
-                        model, memory, ((result.get("blockers") or {}).get("stop")) or model.player, pulls):
+                        model, memory, ((result.get("blockers") or {}).get("stop")) or model.player, pulls, log,
+                        result.get("blockers")):
                     # the way was shut and something was operated: try the same target again without counting a failure
                     leg["pulledFor"] = True
                     force_mesh = True
                 else:
                     failures_in_row += 1
-                    memory.failures[pick["key"]] += 1
-                    if memory.failures[pick["key"]] >= GIVE_UP_AFTER:
-                        memory.blocked.add(pick["key"])
-                        leg["givenUp"] = True
+                    keys = [pick["key"]]
+                    enemy = enemy_ref(result) if str(result.get("reason") or "").startswith("Interrupted by combat") else None
+                    if enemy and "ref:" + enemy not in keys:
+                        keys.append("ref:" + enemy)
+                    for key in keys:
+                        memory.failures[key] += 1
+                        if memory.failures[key] >= GIVE_UP_AFTER and key not in memory.blocked:
+                            memory.blocked.add(key)
+                            memory.unreachable[key] = str(result.get("reason") or "no route")
+                            leg["givenUp"] = True
+                            log(f"unreachable: {key} after {memory.failures[key]} failed leg(s) ({memory.unreachable[key]}); moving on")
+                    if leg.get("givenUp"):
+                        failures_in_row = 0
                 if status.get("status") in ("dead", "outmatched", "found", "arrived_at_exit", "left_cell", "hostile_reached"):
                     break
                 if failures_in_row >= STUCK_AFTER:
@@ -437,7 +621,9 @@ def register(mcp, native, manager, is_busy):
                     memory.failures[pick["key"]] += 1
                     if memory.failures[pick["key"]] >= GIVE_UP_AFTER + 1:
                         memory.blocked.add(pick["key"])
+                        memory.unreachable[pick["key"]] = "still standing after fights"
                         leg["givenUp"] = True
+                        log(f"unreachable: {pick['key']} still standing after fights; moving on")
                 if status.get("status") == "go":
                     status = {"status": "budget", "why": "continuing"}
         finally:
@@ -454,7 +640,7 @@ def register(mcp, native, manager, is_busy):
                 status["why"] += "; " + (f"{summary['unvisited']} room(s) unvisited" if summary["unvisited"] else "every room was visited")
         except Exception as error:  # the cell may have changed under us
             summary = {"note": f"map unavailable: {error}"}
-        out = {**status, "goal": goal, "legs": legs, **({"pulls": pulls} if pulls else {}), "killed": dict(Counter(killed)),
+        out = {**status, "goal": goal, "legs": legs, "logFile": log.path, "log": log.lines[-60:], **({"pulls": pulls} if pulls else {}), "killed": dict(Counter(killed)),
                "elapsedS": round(time.monotonic() - began, 1), "map": summary}
         return dumps(out)
 

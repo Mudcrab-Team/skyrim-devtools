@@ -56,11 +56,13 @@ async def run(ctx, cell=CELL, tool=None):
         details.update(clearS=round(time.monotonic() - began, 1), status=result["status"], legs=len(result["legs"]),
                        killed=result["killed"], hostilesLeft=result["map"].get("hostilesAlive"),
                        failedLegs=[leg for leg in result["legs"] if leg.get("outcome") != "arrived"][:10])
-        if result["status"] == "stuck":
+        details.update(logFile=result.get("logFile"), pulls=result.get("pulls"), logTail=result.get("log", [])[-25:])
+        if result["status"] in ("stuck", "cleared_reachable"):
             details["why"] = result.get("why")
-            details["hostiles"] = result.get("hostiles")
+            details["hostiles"] = result.get("hostiles") or result.get("unreachable")
         checks["cleared"] = result["status"] == "cleared"
         checks["no hostile left"] = result["map"].get("hostilesAlive") == 0
+        checks["step log written"] = bool(result.get("logFile")) and Path(result["logFile"]).exists()
         details["finalMap"] = await tool("cell_map", plot=True)
     except Exception as error:
         details["error"] = repr(error)

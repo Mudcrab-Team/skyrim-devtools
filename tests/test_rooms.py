@@ -277,7 +277,7 @@ class HintTests(unittest.TestCase):
         self.assertIn("goal exit", explore.quest_hint(reply)["hint"])
 
 
-TOOL_METHODS = ["Cell.navmesh", "Cell.contents", "Cell.visited", "Nav.goto", "Nav.status", "Nav.cancel", "Console.execute", "Quest.targets"]
+TOOL_METHODS = ["Cell.navmesh", "Cell.contents", "Cell.visited", "Nav.goto", "Nav.status", "Nav.cancel", "Console.execute", "Quest.targets", "World.inspect"]
 
 
 class ToolTests(unittest.TestCase):
@@ -370,7 +370,8 @@ class ToolTests(unittest.TestCase):
             h, socket = await self.scenario(empty_contents(actors=[actor("A1", "Bandit", 2800, 500)]))
             socket.results["Nav.status"] = {"active": False, "last": {"state": "failed", "reason": "no route"}}
             reply = json.loads(await h.text("explore", goal="clear", rooms=9))
-            self.assertEqual(reply["status"], "stuck")
+            self.assertEqual(reply["status"], "cleared_reachable")
+            self.assertEqual([u["refID"] for u in reply["unreachable"]], ["A1"])
             self.assertTrue(reply["legs"][-1]["givenUp"])
             self.assertEqual(len(reply["legs"]), 2)
             await h.text("game_stop")
@@ -446,6 +447,129 @@ class ToolTests(unittest.TestCase):
             {"refID": "F1", "name": "Far Lever", "pos": [90000, 600, 0]}]), player=[600, 600, 0])
         picks = explore.lever_candidates(model, [600, 600, 0], explore.Memory())
         self.assertEqual([a["refID"] for a in picks], ["L1"])
+
+    def test_a_lever_is_pulled_again_only_when_it_changed_nothing(self):
+        model = rooms.build_model(two_rooms(), empty_contents(activators=[
+            {"refID": "L1", "name": "Lever", "pos": [800, 600, 0]},
+            {"refID": "L2", "name": "Lever", "pos": [900, 600, 0]}]), player=[600, 600, 0])
+        memory = explore.Memory()
+        near = [600, 600, 0]
+        explore.record_pull(memory, "L1", "B1", "closed", "closed")
+        self.assertEqual([a["refID"] for a in explore.lever_candidates(model, near, memory)], ["L2", "L1"])
+        explore.record_pull(memory, "L2", "B1", "closed", "open")
+        self.assertEqual([a["refID"] for a in explore.lever_candidates(model, near, memory)], ["L1"])
+        explore.record_pull(memory, "L1", "B1", "open", "open")
+        self.assertEqual(explore.lever_candidates(model, near, memory), [])
+        explore.record_pull(memory, "L3", None, None, None)
+        self.assertFalse(explore.repull_allowed(memory, "L3"))
+
+    def test_blocker_ref_prefers_the_named_cause_then_a_shut_ref(self):
+        named = {"likely": "closed activator 000b6c56 (NorRetractableBridge01.nif)", "refs": [{"refID": "X1", "openState": "closed"}]}
+        self.assertEqual(explore.blocker_ref(named), "000B6C56")
+        self.assertEqual(explore.blocker_ref({"likely": "navmesh ends", "refs": [{"refID": "A", "openState": "open"},
+                                                                                 {"refID": "B", "openState": "closed"}]}), "B")
+        self.assertIsNone(explore.blocker_ref(None))
+
+    def test_enemy_ref_reads_the_interrupting_hostile(self):
+        result = {"interruptions": {"recent": [{"details": {"enemy": {"refID": "E1"}}}, {"details": {"enemy": {"refID": "E2"}}}]}}
+        self.assertEqual(explore.enemy_ref(result), "E2")
+        self.assertIsNone(explore.enemy_ref({}))
+
+    def test_door_candidates_are_easy_locked_plain_doors_near_the_hostile(self):
+        model = rooms.build_model(two_rooms(), empty_contents(doors=[
+            {"refID": "D1", "name": "Door", "pos": [2000, 600, 0], "locked": True, "lockLevel": "veryEasy"},
+            {"refID": "D2", "name": "Door", "pos": [2100, 600, 0], "locked": True, "lockLevel": "hard"},
+            {"refID": "D3", "name": "Door", "pos": [2200, 600, 0], "locked": False},
+            {"refID": "D4", "name": "Door", "pos": [90000, 600, 0], "locked": True, "lockLevel": "easy"}]), player=[600, 600, 0])
+        picks = explore.door_candidates(model, [2000, 600, 0], explore.Memory())
+        self.assertEqual([d["refID"] for d in picks], ["D1"])
+
+    def test_explore_unlocks_an_easy_door_near_an_unreachable_hostile_and_retries(self):
+        async def go():
+            door = {"refID": "D1", "name": "Door", "pos": [2700, 500, 0], "locked": True, "lockLevel": "easy"}
+            h, socket = await self.scenario(empty_contents(actors=[actor("A1", "Bandit", 2800, 500)], doors=[door]))
+            failed = {"active": False, "last": {"state": "failed", "reason": "no route"}}
+            statuses = iter([failed])
+            real_send = socket.send
+
+            async def send(text):
+                if json.loads(text)["method"] == "Nav.goto":
+                    socket.results["Nav.status"] = next(statuses, {"active": False, "last": {"state": "arrived"}})
+                await real_send(text)
+            socket.send = send
+            reply = json.loads(await h.text("explore", goal="clear", rooms=3))
+            commands = [c[1]["command"] for c in socket.calls if c[0] == "Console.execute"]
+            self.assertEqual(commands, ["prid D1", "unlock"])
+            self.assertTrue(reply["legs"][0]["unlocked"])
+            self.assertEqual(reply["status"], "hostile_reached")
+            self.assertTrue(any("unlock door D1" in line for line in reply["log"]))
+            await h.text("game_stop")
+        run(go())
+
+    def test_explore_remembers_levers_across_legs_and_stops_when_the_blocker_opens(self):
+        async def go():
+            levers = [{"refID": "L1", "name": "Lever", "pos": [1000, 600, 0]},
+                      {"refID": "L2", "name": "Lever", "pos": [1100, 600, 0]}]
+            h, socket = await self.scenario(empty_contents(actors=[actor("A1", "Bandit", 2800, 500)], activators=levers))
+            dead_end = {"active": False, "last": {"state": "failed", "reason": "Dead end: shut",
+                                                  "blockers": {"stop": [900, 600, 0], "likely": "closed activator 000B6C56"}}}
+            statuses = iter([dead_end, {"active": False, "last": {"state": "arrived"}},
+                             {"active": False, "last": {"state": "arrived"}}])
+            inspected = iter(["closed", "closed", "open"])
+            real_send = socket.send
+
+            async def send(text):
+                request = json.loads(text)
+                if request["method"] == "Nav.goto":
+                    socket.results["Nav.status"] = next(statuses, {"active": False, "last": {"state": "arrived"}})
+                if request["method"] == "World.inspect":
+                    socket.results["World.inspect"] = {"openState": next(inspected, "open")}
+                await real_send(text)
+            socket.send = send
+            reply = json.loads(await h.text("explore", goal="clear", rooms=4))
+            self.assertEqual([(p["ref"], p["changed"]) for p in reply["pulls"]], [("L1", False), ("L2", True)])
+            pulled = [c[1]["goal"]["refID"] for c in socket.calls if c[0] == "Nav.goto" and c[1].get("activate")]
+            self.assertEqual(pulled, ["L1", "L2"])
+            await h.text("game_stop")
+        run(go())
+
+    def test_an_interrupting_enemy_that_cannot_be_reached_is_given_up_on_without_a_stuck_verdict(self):
+        async def go():
+            h, socket = await self.scenario(empty_contents(actors=[actor("A1", "Bandit", 2800, 500),
+                                                                   actor("A2", "Archer", 2700, 700)]))
+            contact = {"active": False, "last": {"state": "failed", "reason": "Interrupted by combat",
+                                                 "interruptions": {"recent": [{"details": {"enemy": {"refID": "A2"}}}]}}}
+            socket.results["Nav.status"] = contact
+
+            async def fake_fight(**kwargs):
+                return {"outcome": "unreachable", "rounds": 1, "hostilesLeft": 2}
+            real = h.server.call_tool
+
+            async def call_tool(name, args):
+                if name == "combat_fight":
+                    import mcp.types as types
+                    return [types.TextContent(type="text", text=json.dumps(await fake_fight()))]
+                return await real(name, args)
+            h.server.call_tool = call_tool
+            reply = json.loads(await h.text("explore", goal="clear", fight=True, rooms=20))
+            self.assertEqual(reply["status"], "cleared_reachable")
+            self.assertEqual({u["refID"] for u in reply["unreachable"]}, {"A1", "A2"})
+            await h.text("game_stop")
+        run(go())
+
+    def test_explore_writes_its_step_log_to_the_cell_maps_folder(self):
+        async def go():
+            import tempfile
+            from pathlib import Path
+            h, socket = await self.scenario(empty_contents(actors=[actor("A1", "Bandit", 2800, 500)]))
+            with tempfile.TemporaryDirectory() as folder:
+                h.manager.config["cellMapsDir"] = folder
+                reply = json.loads(await h.text("explore", goal="clear", rooms=1))
+                text = Path(reply["logFile"]).read_text(encoding="utf-8")
+                self.assertIn("leg 1:", text)
+                self.assertTrue(Path(reply["logFile"]).parent == Path(folder))
+            await h.text("game_stop")
+        run(go())
 
     def test_quest_targets_adds_the_explore_hint(self):
         async def go():
