@@ -147,3 +147,6 @@ module with `async def run(ctx)` or a standalone program whose last stdout line 
 `SKYRIM_LIVETEST_CONFIG`). Cases without a script are `manual`: the harness saves a screenshot for the Tester to judge.
 Per-case limit: 300 s, or `timeout_s` on the case. Use `--root` to point at the integration checkout whose `tests/live/`
 scripts should run.
+
+`setup` must be a real save name (or `scenario:<name>`) for session-style cases; for standalone scripts it is only a label,
+since the script loads its own save. The harness takes perf readings with `--perf-save NAME` loaded.
