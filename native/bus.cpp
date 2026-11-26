@@ -2,6 +2,7 @@
 // COMMUNITY(alandtse/CommonLibSSE-NG@7c27a75da3eb0db080c1f1f63f6df1b7cd733c2a, GPL-3.0-or-later)
 #include "bus.h"
 
+#include "deadline_timer.h"
 #include "game.h"
 #include "methods.h"
 #include "perf.h"
@@ -43,63 +44,9 @@ namespace devtools
         std::atomic<std::uint64_t> late = 0;
 
         // One thread owns every deadline so a slow game thread never holds a connection thread.
-        class Timer
+        DeadlineTimer& Deadlines()
         {
-        public:
-            void Add(std::chrono::steady_clock::time_point deadline, std::weak_ptr<Reply> reply, Json data)
-            {
-                {
-                    std::lock_guard lock(mutex_);
-                    entries_.emplace(deadline, Entry{ std::move(reply), std::move(data) });
-                    if (!thread_.joinable()) {
-                        thread_ = std::thread([this] { Run(); });
-                        thread_.detach();
-                    }
-                }
-                wake_.notify_one();
-            }
-
-        private:
-            struct Entry
-            {
-                std::weak_ptr<Reply> reply;
-                Json data;
-            };
-
-            void Run()
-            {
-                std::unique_lock lock(mutex_);
-                for (;;) {
-                    if (entries_.empty()) {
-                        wake_.wait(lock);
-                        continue;
-                    }
-                    const auto next = entries_.begin()->first;
-                    if (std::chrono::steady_clock::now() < next) {
-                        wake_.wait_until(lock, next);
-                        continue;
-                    }
-                    auto entry = std::move(entries_.begin()->second);
-                    entries_.erase(entries_.begin());
-                    lock.unlock();
-                    if (const auto reply = entry.reply.lock()) {
-                        if (reply->Fail(code::timeout, "Timed out waiting for the game", std::move(entry.data))) {
-                            ++timedOut;
-                        }
-                    }
-                    lock.lock();
-                }
-            }
-
-            std::mutex mutex_;
-            std::condition_variable wake_;
-            std::multimap<std::chrono::steady_clock::time_point, Entry> entries_;
-            std::thread thread_;
-        };
-
-        Timer& Deadlines()
-        {
-            static auto* timer = new Timer();  // never destroyed: its thread outlives static teardown
+            static auto* timer = new DeadlineTimer();  // never destroyed: SKSE plugins are not unloaded before process exit
             return *timer;
         }
 
@@ -276,9 +223,16 @@ namespace devtools
                 outbox->Push(body.dump(-1, ' ', false, Json::error_handler_t::replace));
             });
             if (method.spec.timeout.count() > 0) {
-                Deadlines().Add(std::chrono::steady_clock::now() + method.spec.timeout, reply,
-                    { { "method", name }, { "thread", ThreadName(method.spec.thread) },
-                        { "timeoutMs", method.spec.timeout.count() } });
+                Deadlines().Add(std::chrono::steady_clock::now() + method.spec.timeout,
+                    [weak = std::weak_ptr<Reply>(reply),
+                        data = Json{ { "method", name }, { "thread", ThreadName(method.spec.thread) },
+                            { "timeoutMs", method.spec.timeout.count() } }]() mutable {
+                        if (const auto live = weak.lock()) {
+                            if (live->Fail(code::timeout, "Timed out waiting for the game", std::move(data))) {
+                                ++timedOut;
+                            }
+                        }
+                    });
             }
             const auto tasks = SKSE::GetTaskInterface();
             const auto thread = method.spec.thread;
@@ -294,6 +248,14 @@ namespace devtools
                 Run(method, params, reply, name, thread, enqueuedAt);
                 break;
             }
+        }
+    }
+
+    namespace bus
+    {
+        void Shutdown()
+        {
+            Deadlines().Stop();
         }
     }
 }
