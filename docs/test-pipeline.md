@@ -155,14 +155,35 @@ since the script loads its own save. The harness takes perf readings with `--per
 
 ## Known friction
 
-- A game start right after a stop or crash can be refused, or can come up with a loading spinner that never closes: the
-  harness retries a refused start after 25 s; a case that fails only with `close_menu` timeouts on `LoadWaitSpinner`
-  right after a start should be rerun alone before it is blamed on the feature.
+- Game starts are guarded: a start first waits until the previous game's process and session lease are gone (host
+  `idle` action), and a launch that does not reach the main menu within 45 s (`menuTimeout` in the config) is stopped,
+  released and restarted once; the start result lists it under `startRetries`. A refused start is still retried by the
+  harness after 25 s. Read-only host calls (`status`, `evidence`, `crashes`, `active`, `idle`) retry with a short settle,
+  so a script that starts its own game right after the harness stopped one no longer fails on the first status call.
+  A case that still fails only with `close_menu` timeouts on `LoadWaitSpinner` should be rerun alone before it is blamed
+  on the feature.
+- A standalone script that crashes, times out or is interrupted no longer leaves its game running: the harness stops
+  whatever session holds the host lease (and kills the script) after every standalone script, on errors, on timeouts
+  and on Ctrl-C, even with `--keep`. Only a finished run keeps the game under `--keep`.
 - `pc-build --deploy --keep-lock` only works when `--name` matches the lock holder; use one name for the lock, the
   build and the deploy.
-- A script that crashes leaves the game it started running; the next harness start finds it. Stop the game between
-  groups or pass `--keep` deliberately.
 - Console commands on a placed reference must be ref-prefixed (`<ref>.setpos x 0`): the selection made by `prid`
-  does not carry over to the next `Console.execute` call.
-- Remote PowerShell sent through the host's login shell has its `$variables` expanded locally; send
-  `-EncodedCommand` for anything that uses them.
+  does not carry over to the next `Console.execute` call. Use `<ref>.cmd` by hand, or
+  `ctx.console_ref(ref, "setpos x 0")` / `Session.console_ref(ref, ...)`, which prefix the reference (an int or a hex
+  form id) and send it with `target: none`.
+- Every helper sends remote PowerShell as `-EncodedCommand` (UTF-16LE base64; `smoke.powershell_argv`, and the same
+  in `tools/pc-build`), so `$variables` are never expanded by the host's login shell. Do not hand-write
+  `ssh host powershell -Command "..."`; build the argv with `powershell_argv`.
+
+## Unit-test environment
+
+The unit tests need `websockets`, `mcp`, `pyyaml` and `Pillow`; a machine without them fails at import. Bootstrap once
+from the checkout (Python 3.13 or newer):
+
+~~~sh
+python3.13 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python -m unittest discover -s tests
+~~~
+
+On Windows use `py -3.13 -m venv .venv`, then `.venv\Scripts\pip install -r requirements.txt` and
+`.venv\Scripts\python -m unittest discover -s tests`.

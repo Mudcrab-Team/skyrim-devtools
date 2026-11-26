@@ -172,6 +172,9 @@ namespace devtools::nav
         const int start = g::Locate(graph, V(from), 400.0);
         const int goal = g::Locate(graph, V(to), 400.0);
         plan.goalOnMesh = goal >= 0;
+        // The level each end resolved to, so a caller can tell a bridge deck from the floor below it.
+        plan.startLevelZ = start >= 0 ? g::PlaneZ(graph.verts[start], V(from)) : std::numeric_limits<double>::quiet_NaN();
+        plan.goalLevelZ = goal >= 0 ? g::PlaneZ(graph.verts[goal], V(to)) : std::numeric_limits<double>::quiet_NaN();
         if (start < 0) {
             plan.note = "The start is not on a loaded navmesh";
         } else {
@@ -222,6 +225,8 @@ namespace devtools::nav
             }
         }
         return { { "found", plan.found }, { "complete", plan.complete }, { "goalOnMesh", plan.goalOnMesh },
+            { "startLevelZ", std::isnan(plan.startLevelZ) ? Json(nullptr) : Json(Round(plan.startLevelZ)) },
+            { "goalLevelZ", std::isnan(plan.goalLevelZ) ? Json(nullptr) : Json(Round(plan.goalLevelZ)) },
             { "points", std::move(points) }, { "length", Round(length) }, { "expanded", plan.expanded },
             { "triangles", plan.triangles }, { "meshes", plan.meshes }, { "ms", Round(plan.ms, 100.0) },
             { "note", plan.note.empty() ? Json(nullptr) : Json(plan.note) } };

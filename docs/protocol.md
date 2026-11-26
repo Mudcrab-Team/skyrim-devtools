@@ -131,6 +131,24 @@ logs `main thread has not run a queued task ... frames: module+offset ...` to th
 source=plugin`), at most six times per run.
 `host.ps1 stop <session> -Grace N` asks the game to quit and kills it after N seconds (default 12);
 state.json then carries `stopPath`: `graceful`, `killed-after-Ns` or `closing-crashed`.
+`host.ps1 reset` ends the `SkyrimDevTools` scheduled task and removes the `active` lease marker when no game
+process runs (with `-Force` it first kills a leftover game or loader). The Python host calls it after every stop,
+with `-Force` when the session never ended, and `host.ps1 start` runs the same cleanup itself for a lease older
+than 90 s, listing what it removed as `staleCleared` in its reply. `host.ps1 health` prints the game process as
+JSON (`threads`, `handles`, `privateBytes`, `workingSetBytes`, `cpuSeconds`, `cpuCores`, `responding`,
+`uptimeSeconds`), read from the operating system so it works while the main thread is hung.
+
+### Dialogue records and coverage
+
+| Method | Thread | Params | Result and meaning |
+| --- | --- | --- | --- |
+| Dialogue.topics | main | refID, includeGeneric? (false), onlyPassing? (false), plugins?, quest? (substring of editor ID or name), kinds? (`player`, `command`, `scene`, `combat`, `favors`, `detection`, `service`, `misc`), limit? (300), responses? (true) | Topics the actor could say or offer: `{speaker, topicTotal, infoTotal, passing, saidOnce, truncated, topics:[{formID, editorID, text, kind, subtype, plugin, quest:{formID, editorID, name, plugin, running}, offeredNow, infos:[{formID, plugin, passes, sayOnce, said, addressed, failing?, questFailing?, text?}]}]}`. Conditions are evaluated by the engine with the actor as subject and the player as target; `failing` lists the function indexes of false items. Lines whose info or quest conditions name another speaker are left out; `includeGeneric` adds lines with no speaker condition. |
+| Dialogue.offered | ui | | `{open, currentInfo, topics:[{index, text, neverSaid, topic, info, quest}]}`: the dialogue menu's list with record ids. |
+| Coverage.start | main | plugins? (plugin file names, case-insensitive) | Resets and starts a session; `{started, plugins, unknownPlugins, infosAlreadySaid, papyrusHooked}`. |
+| Coverage.report | main | limit? (100), stop? | `{active, plugins, durationS, stages:{hit, defined, covered, quests, missed}, infos:{said, defined, covered, missed}, scenes:{started, defined}, questsStarted, papyrus:{errors, errorCount, warnings, warningCount, scriptsLogging}}`, filtered to the plugins by the plugin that created each record. |
+
+Events: `dialogueInfo {info, topic, topicText, quest, questEditorID, plugin}` when an NPC begins a dialogue info
+and `papyrusError {severity, text, script, form}` for each Papyrus warning, error or fatal log line.
 
 ### Movement, camera, navigation and recording
 
@@ -147,7 +165,7 @@ would press, so animation, collision, stamina and encumbrance all apply.
 | Camera.state | main | | `{mode, stateId, pos, yawDeg, pitchDeg, worldFov, firstPersonFov, zoom, targetZoom, freeRotationDeg, player:{headingDeg, pitchDeg}}`; mode is `firstPerson`, `thirdPerson`, `free`, `furniture`, ... |
 | Camera.set | main | mode? (`first`, `third`), yawDeg?, pitchDeg?, zoom? (0-1, third person), fov? (5-150) | Applies the given fields in that order; read Camera.state a frame later for the result |
 | Camera.lookAt | main | refID or x, y, z | Turns the player's view at a reference (actors at chest height, other references at the centre of their world bound) or a point |
-| Nav.plan | main | refID or x, y, z; from?; route? (`local`, `global`) | Path over the loaded navmeshes, `{found, complete, goalOnMesh, points, triangles, meshes, expanded, ms}`; an incomplete path adds `blockers` (see Nav.status). With `route: "global"` it is the local path to the first gate plus `global {available, world, file, found, cost, length, expanded, startLinks, goalLinks, ms, note, points}` from the worldspace graph (see below). For debugging Nav.goto. |
+| Nav.plan | main | refID or x, y, z; from?; route? (`local`, `global`) | Path over the loaded navmeshes, `{found, complete, goalOnMesh, startLevelZ, goalLevelZ, points, triangles, meshes, expanded, ms}`; an incomplete path adds `blockers` (see Nav.status). With `route: "global"` it is the local path to the first gate plus `global {available, world, file, found, cost, length, expanded, startLinks, goalLinks, ms, note, points}` from the worldspace graph (see below). For debugging Nav.goto. |
 | Nav.goto | main | goal, mode? (`input`), timeoutS? (300), run? (true), sprint?, onCombat? (`flee`, `fight`, `stop`, `ignore`), onDialogue? (`close`, `stop`, `wait`), onMessageBox? (`firstButton`, `stop`, `wait`), onMenu? (`close`, `stop`, `wait`), invulnerable? (false), via? ([[x,y,z]...]), route? (`global`, `local` or a recording name), routeSpacing? (600), activate? (false), stuck? | Starts a background navigation and replies at once with `{id, mode, goal, goalPos, straightDistance, route, globalLength?, globalNote?}`. Goals: `{refID}`, `{x, y, z, worldspace?}`, `{cell}` (editor id), `{place}` (a location's displayed name or form id, see Nav.places) `{questTarget: <quest>}` (the reference Quest.targets reports for the quest; empty string takes any running quest) or `{near: refID, radius}`. `activate` walks up to activation reach (radius 90 unless given) and activates the goal reference on arrival. Loading screens do not count against `timeoutS`; Nav.status reports `loading` and `loadingS`. A door just arrived through is not taken back (Nav.status `lastDoor`), the way out of an interior is used when no door leads to the goal, and after a door into an exterior a far goal takes the global route. When a door, gate or web within 2500 units changes open/locked/disabled state, dead ends and traps are forgotten and the route is planned again (event `navReplan`, Nav.status `openStateResets`). With `activate` on a load door the trip ends `arrived` only after the destination cell has loaded (the activation is repeated up to 3 times, then it fails). When the loaded navmeshes end at a shut way (a dead end or a stuck verdict in `input` mode), up to 4 levers, chains, switches or activators linked to a nearby gate, portcullis or drawbridge are walked to and pulled, then the route is planned again (`navReplan` with `why: leverPulled`, Nav.status `leversPulled`); torches and other loose fixtures are never taken as blockers or levers. Fails with `-32009` while one runs. |
 | Nav.status | main | | `{active: true, nav:{id, state, mode, goal, elapsedS, distanceRemaining, etaS, waypoint, stuckCount, replans, travelled, combat, interruption, interruptions:{count, recent}, stalls:{count, totalS, offPathCount, offPathTotalS, offPathNow, recent}, ...}}`, or `{active: false, last}` whose `state` is the outcome (`arrived`, `failed`, `cancelled`) with a `reason`. A dead end also sets `blockers {stop, gap:{horizontal, vertical}, refs:[{refID, name, model, type, state, distance, fromStop, offLine, ...}], likely}`: doors, gates, webs, levers and other activators near the stop or between it and the goal, and a one-line guess at the cause (a heuristic; confirm with World.inspect). |
 | Nav.cancel | main | | Stops the navigation and releases controls |
@@ -254,6 +272,11 @@ failures, stuckS, pos}` when the player gets going again (250 units clear of a `
 window with no further detection for the other reasons). `skyrim-use` writes both into the timeline JSONL
 as `{"t":"event","type":...}`.
 
+**Plan levels.** `Nav.plan` reports `startLevelZ` and `goalLevelZ`, the height of the navmesh plane the start
+and goal resolved to at their x, y (null off the mesh): a goal on a bridge deck resolves to the deck, and one
+over a floor with no navmesh at its height resolves to the floor or nothing, never to the wrong level
+silently. `tests/live/nav_levels.py` checks this in Embershard Mine.
+
 **Stalls.** A stall is speed under 40 units/s over 0.5 s (ending above 80); off-path, in input
 mode, is more than 120 units from the planned segment (ending under 60). Each episode gets a
 cause guess: engine leg ended, recovering, replan latency, actor in the way, door, turning
@@ -284,6 +307,26 @@ call into the engine. The chosen target is remembered between calls.
 | Combat.block | main (deferred) | holdMs? (1500), face?, refID? | Holds the left-hand control. |
 | Combat.cast | main (deferred) | hand?, holdMs? (concentration 2000, otherwise 250), face?, refID? | Casts the spell in that hand; refuses a spell the magicka cannot pay for. |
 | Combat.drink | main | kind? (`health`, `magicka`, `stamina`) or name or formID | Drinks the weakest potion that covers the missing amount, else the strongest; skips poisons and food. |
+| Ranged.loadout | main | equip? (true), spell? | The best bow (or crossbow) and matching ammunition in the inventory, equipped unless `equip: false`: `{weapon, ready, missing[], bow{formID,name,speed,crossbow,damage,reach}, ammo{formID,name,kind,count,damage,projectile{speed,gravity,range}}, bowEquipped, ammoEquipped, equipQueued}`. With `spell: true` it describes the projectile spell in the right hand instead (`spell`, `projectile`, `concentration`, `cost`, `magicka`). |
+| Ranged.los | main | refID, part? (`torso`, `head`), from? [x,y,z], points? [[x,y,z]...] | Engine ray (collision layer LOS) from the player's eye, or `from`, to the target's torso or head: `{clear, hitDistance?, hitLayer?, hitPoint?, from, torso, head, target, distance, health, dead, points?:[{clear, hitDistance?, distance}]}`. An actor hit within the last tenth of the line counts as the target. `points` are candidate standing positions (feet; the eye height is added) tested against the same aim point. |
+| Ranged.aim | main | headingDeg, pitchDeg | Absolute aim: heading clockwise from north, pitch in degrees above the horizon (clamped to +-80). Replies with the attack and weapon state ints and the eye position. |
+| Ranged.arrows | main | | The player's own projectiles in the manager: `{arrows:[{refID, pos, velocity, distance, power, destroyed}]}` (velocity in units per second), for flight tracking and calibration. |
+| Ranged.state | main | | `{attackState, weaponState, drawn, eye, position, headingDeg, ammoLeft?}`. |
+
+### Alerts
+
+| Method | Thread | Params | Result |
+|---|---|---|---|
+| Alerts.state | any | history? (bool), limit? (history entries, default 50, max 200) | `{active[], history?[], cost, thresholds, disabled[]}`; an alert is `{kind, severity (info\|warn\|error), sinceMs, ageS, hint, detail}`; a history entry `{action: raised\|cleared, ms, kind, ...}`; `cost` is `{ticks, mainMeanUs, mainMaxUs, mainLastUs, pollerMeanUs, pollerMaxUs}` |
+| Alerts.configure | any | thresholds? (name to number), disable? / enable? (kind lists), reset? | Current `{thresholds, disabled}`. Names: pollMs, questStalledMin, combatStalemateS, deathCount, deathWindowMin, deathNearDist, fallDrop, fallTimeS, swimStallS, swimProgressDist, pitchLimitDeg, pitchBlindS, menuOpenS, notFocusedS, lowFpsBelow, lowFpsS, hitchMs, lowHealthPct, targetCheckS, questCheckS, healCheckS |
+| Alerts.dismiss | any | kind, forS? (default 300) | Clears the alert and suppresses re-raising it for that long |
+
+Events: `alertRaised {kind, severity, sinceMs, ageS, hint, detail}` and `alertCleared {kind, sinceMs, durationMs, why}`.
+Kinds the plugin raises: questStalled, combatStalemate, deathLoop, fellOrOutOfBounds, blindCamera (pitch),
+menuLeftOpen, paused, lowFps, overEncumbered, crime, targetDead, targetUnreachable, lowHealthNoHeal; the skyrim-use
+server adds actionLoop, a screenshot-based blindCamera and moveStuck (from `moveStuck`/`moveUnstuck`).
+`Screen.capture` replies also carry `meanLuma` (0-255) and `dominantShare` of the encoded frame. See
+docs/skyrim-use.md, Alerts.
 
 ## Errors
 

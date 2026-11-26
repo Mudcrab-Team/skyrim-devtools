@@ -5,12 +5,12 @@ session), is controlled through host.ps1, and its MP4 is fetched over scp when s
 """
 
 import asyncio
-import base64
 import json
 from pathlib import Path
 import re
 import subprocess
 
+from ..smoke import powershell_argv
 from .manager import GameError
 from .timeline import now_ms
 
@@ -27,10 +27,8 @@ class CaptureHost:
         if action not in {"capture-start", "capture-stop", "capture-status"} or not SESSION_RE.fullmatch(session_id):
             raise ValueError("Invalid capture operation")
         script = rf"& (Join-Path $env:USERPROFILE '.local\skyrim-devtools\host.ps1') {action} -Session {session_id} {extra}"
-        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
         process = await asyncio.create_subprocess_exec(
-            *self.host.ssh, "-T", self.host.destination, "powershell", "-NoProfile", "-NonInteractive",
-            "-ExecutionPolicy", "RemoteSigned", "-EncodedCommand", encoded,
+            *self.host.ssh, "-T", self.host.destination, *powershell_argv(script),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             async with asyncio.timeout(timeout):

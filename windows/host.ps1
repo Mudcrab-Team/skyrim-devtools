@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('install-task', 'start', 'run', 'status', 'stop', 'evidence', 'crashes',
-                 'install-capture-task', 'capture-start', 'capture-run', 'capture-stop', 'capture-status')]
+    [ValidateSet('install-task', 'start', 'run', 'status', 'stop', 'evidence', 'crashes', 'active', 'idle',
+                 'install-capture-task', 'capture-start', 'capture-run', 'capture-stop', 'capture-status',
+                 'health', 'reset')]
     [string] $Action,
     [ValidatePattern('^[a-f0-9]{32}$')]
     [string] $Session,
@@ -12,7 +13,8 @@ param(
     [ValidateRange(320, 3840)]
     [int] $Width = 1920,
     [ValidateRange(1, 120)]
-    [int] $Grace = 12
+    [int] $Grace = 12,
+    [switch] $Force
 )
 $ErrorActionPreference = 'Stop'
 $taskName = 'SkyrimDevTools'
@@ -396,7 +398,7 @@ function Preflight($Config, $Headless) {
     }
     # The crash logger is the one diagnostic plugin allowed next to the test plugin.
     $dlls = @(Get-ChildItem -LiteralPath $plugins -File -Filter '*.dll' | ForEach-Object Name)
-    if ($dlls -notcontains 'SkyrimDevTools.dll' -or @($dlls | Where-Object { $_ -notin @('SkyrimDevTools.dll', 'CrashLogger.dll', 'msdia140.dll') }).Count) {
+    if ($dlls -notcontains 'SkyrimDevTools.dll' -or @($dlls | Where-Object { $_ -notin @('SkyrimDevTools.dll', 'CrashLogger.dll', 'msdia140.dll', 'SkyrimDevToolsAdlx.dll') }).Count) {
         throw 'The test plugin and the crash logger (with its symbol reader) must be the only SKSE plugin DLLs'
     }
     Stage-Saves
@@ -538,6 +540,38 @@ function Run-Game {
 }
 
 function Now-Ms { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+
+# Leftovers of a hung or killed game keep the next start from working: the scheduled task stays "Running"
+# (start then refuses with "Interactive task is busy") and the lease file blocks a new lease. Nothing is touched
+# while a game process exists, unless -KillGame says the session being reset is ours and must go.
+# MinAgeSeconds keeps a lease that was written moments ago (a launch still coming up) from being taken for stale.
+function Reset-StaleHost([switch] $KillGame, [int] $MinAgeSeconds = 0) {
+    $cleared = @()
+    $games = @(Get-Process SkyrimSE, skse64_loader -ErrorAction SilentlyContinue)
+    if ($games.Count -and $KillGame) {
+        $games | Stop-Process -Force -ErrorAction SilentlyContinue
+        $until = [DateTime]::UtcNow.AddSeconds(10)
+        while ((Get-Process SkyrimSE, skse64_loader -ErrorAction SilentlyContinue) -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 250 }
+        $cleared += 'game-killed'
+        $games = @(Get-Process SkyrimSE, skse64_loader -ErrorAction SilentlyContinue)
+    }
+    if ($games.Count) { return @{ gameRunning = $true; cleared = $cleared } }
+    $leaseFile = Get-Item -LiteralPath $lease -ErrorAction SilentlyContinue
+    $young = $leaseFile -and ([DateTime]::UtcNow - $leaseFile.LastWriteTimeUtc).TotalSeconds -lt $MinAgeSeconds
+    if ($young) { return @{ gameRunning = $false; cleared = $cleared } }
+    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($task -and $task.State -ne 'Ready') {
+        Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        $until = [DateTime]::UtcNow.AddSeconds(10)
+        while ((Get-ScheduledTask -TaskName $taskName).State -ne 'Ready' -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 250 }
+        $cleared += 'task-stopped'
+    }
+    if ($leaseFile) {
+        Remove-Item -LiteralPath $lease -ErrorAction SilentlyContinue
+        $cleared += 'lease-removed'
+    }
+    return @{ gameRunning = $false; cleared = $cleared }
+}
 
 function Find-Ffmpeg {
     $found = Get-Command ffmpeg -ErrorAction SilentlyContinue
@@ -698,6 +732,7 @@ switch ($Action) {
         try { $random.GetBytes($bytes) } finally { $random.Dispose() }
         $token = [BitConverter]::ToString($bytes).Replace('-', '').ToLowerInvariant()
         $config = Read-Json (Join-Path $root 'config.json')
+        $stale = Reset-StaleHost -MinAgeSeconds 90
         if ((Get-ScheduledTask -TaskName $taskName).State -ne 'Ready') { throw 'Interactive task is busy' }
         # Never start next to somebody else's game or capture: refusing is the only action taken.
         if (Get-Process SkyrimSE, skse64_loader -ErrorAction SilentlyContinue) { throw 'A game or loader process is already running; start refused' }
@@ -723,7 +758,34 @@ switch ($Action) {
             Remove-Item -LiteralPath $lease
             throw
         }
-        @{ sessionId = $Session; port = $config.port; token = $token } | ConvertTo-Json -Compress
+        $started = @{ sessionId = $Session; port = $config.port; token = $token }
+        if ($stale.cleared.Count) { $started.staleCleared = @($stale.cleared) }
+        $started | ConvertTo-Json -Compress
+    }
+    'health' {
+        # Read from outside the game on purpose: a hung main thread cannot answer a plugin call, and the thread
+        # count is the lead on the slow degradation of long sessions.
+        $game = Get-Process SkyrimSE -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (!$game) {
+            '{"running":false}'
+        } else {
+            $before = $game.TotalProcessorTime.TotalSeconds
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            Start-Sleep -Milliseconds 500
+            $game.Refresh()
+            $seconds = [Math]::Max($clock.Elapsed.TotalSeconds, 0.001)
+            @{
+                running = $true; threads = $game.Threads.Count; handles = $game.HandleCount
+                privateBytes = $game.PrivateMemorySize64; workingSetBytes = $game.WorkingSet64
+                cpuSeconds = [Math]::Round($game.TotalProcessorTime.TotalSeconds, 1)
+                cpuCores = [Math]::Round(($game.TotalProcessorTime.TotalSeconds - $before) / $seconds, 2)
+                responding = [bool]$game.Responding
+                uptimeSeconds = [int]([DateTime]::Now - $game.StartTime).TotalSeconds
+            } | ConvertTo-Json -Compress
+        }
+    }
+    'reset' {
+        (Reset-StaleHost -KillGame:$Force) | ConvertTo-Json -Compress
     }
     'run' { Run-Game }
     'install-capture-task' {
@@ -776,6 +838,21 @@ switch ($Action) {
     'crashes' {
         # The latest crash logs of the isolated profile, newest first (read-only, safe during a run).
         ConvertTo-Json -InputObject @(Get-CrashLogs $null 5) -Compress -Depth 5
+    }
+    'active' {
+        # The session holding the lease, so a caller whose own program died can still stop that game.
+        $id = $null
+        if (Test-Path -LiteralPath $lease) {
+            $text = [IO.File]::ReadAllText($lease)
+            if ($text -match '^[a-f0-9]{32}$') { $id = $text }
+        }
+        @{ sessionId = $id } | ConvertTo-Json -Compress
+    }
+    'idle' {
+        # Idle means the lease is released and no game or loader process is left holding files.
+        $count = @(Get-Process SkyrimSE, skse64_loader -ErrorAction SilentlyContinue).Count
+        $leased = Test-Path -LiteralPath $lease
+        @{ idle = (!$leased -and $count -eq 0); lease = [bool]$leased; processes = $count } | ConvertTo-Json -Compress
     }
     'status' {
         if (!$Session) { throw 'Session id is required' }

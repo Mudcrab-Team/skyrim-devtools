@@ -113,11 +113,20 @@ class FakeHost:
         self.stop_result = {"phase": "stopped", "exitCode": 0, "reason": ""}
         self.crash_logs = []
         self.grace = None
+        self.health = {"running": False}
+        self.stale = []
 
-    async def command(self, action, session_id="", mode="", grace=None):
+    async def command(self, action, session_id="", mode="", grace=None, force=False):
         self.commands.append((action, mode))
         if action == "start":
-            return {"sessionId": SESSION, "token": TOKEN, "port": 4000}
+            started = {"sessionId": SESSION, "token": TOKEN, "port": 4000}
+            if self.stale:
+                started["staleCleared"] = list(self.stale)
+            return started
+        if action == "health":
+            if isinstance(self.health, Exception):
+                raise self.health
+            return dict(self.health)
         if action == "crashes":
             return list(self.crash_logs)
         if action == "evidence":

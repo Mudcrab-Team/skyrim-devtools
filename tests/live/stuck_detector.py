@@ -161,7 +161,10 @@ async def phases(s, names, start):
 
 async def doorloop(s, start):
     nearby = await s.call("World.nearby", radius=3500, types=["door"], limit=60)
-    door = next((r for r in nearby["refs"] if (r.get("destination") or {}).get("interior") and r["destination"].get("doorRefID")), None)
+    candidates = [r for r in nearby["refs"] if (r.get("destination") or {}).get("interior") and r["destination"].get("doorRefID")]
+    out(phase="doorloop", candidates=[{k: r.get(k) for k in ("refID", "name", "locked", "distance", "destination")} for r in candidates[:8]])
+    # a locked house door cannot be entered, so the trip would fail for a reason unrelated to the loop detector
+    door = next((r for r in candidates if not r.get("locked")), None)
     if not door:
         out(phase="doorloop", skipped="no interior door nearby")
         return
