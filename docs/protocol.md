@@ -266,6 +266,34 @@ episodes on the plot, and `--route` overlays a saved Nav.plan reply or navRoute 
 navigation times scale with it; `etaS` and `elapsedS` are real seconds. Values above about 4
 make collisions and streaming less reliable. `set timescale to <n>` only changes the game clock.
 
+### Introspection: Scaleform, Papyrus, forms, idles, camera, map
+
+Scaleform values of an open menu are read, written and called by dotted path (UI.getVariable, UI.dump,
+UI.setVariable, UI.invoke, see above); paths start at `_root` or at `_global` / `_levelN`, and a number indexes an
+array (`_root.list.entries.2.text`). Reads are depth limited (UI.getVariable default 1, UI.dump default 3, at
+most 10) and bounded in node count, with `truncated` set when something was cut. UI.find locates the path of a
+value known only by its label.
+
+| Method | Thread | Params | Result and meaning |
+| --- | --- | --- | --- |
+| UI.find | ui | menu, name? (member-name substring), text? (label substring), path? (`_root`), depth? (6, max 12), limit? (50, max 500) | `{count, visited, truncated, hits:[{path, value, text?}]}`; give name or text. Text fields match on their `text`. For mod menus (a SkyUI MCM page) open the menu, find a setting by its label, then use the path with UI.getVariable / UI.setVariable / UI.invoke. |
+| Papyrus.classes | main | filter? (substring), prefix?, offset?, limit? (100, max 500), detail? | `{total, offset, classes}` of script classes loaded in the VM, sorted by name; `detail` gives `{name, parent, globalFunctions, memberFunctions, linked}`. A script loads on first use. |
+| Papyrus.functions | main | class, filter?, kind? (`all`, `global`, `member`), offset?, limit? | `{class, total, functions:[{name, global, native, returns, params:[{name, type}], declaredIn}]}`, including inherited functions |
+| Papyrus.call | main (deferred) | function, class? , args? ([...], up to 16), form? (hex id or editor id), alias? ({quest, id or name}), timeoutMs? (10000, max 120000) | Dispatches through the VM and answers with `{class, function, global, returns, value}` once the function returns, so latent functions are waited for. A global call needs `class` and no target. A member call takes `form` (class defaults to Actor, ObjectReference, Quest or Form by type; name a script for an attached one) or `alias`. Arguments are coerced to the declared parameter types; a form argument is a hex id or editor id. Object results are `{script, formID, type, name, editorID}`. A wrong argument count or type is -32602 with the signature; a call still running at the deadline is -32008 and keeps running. |
+| Forms.find | main | type?, editorID? (substring), name? (substring), plugin? (substring), offset?, limit? (50, max 200) | `{total, offset, forms:[{formID, type, name, editorID, plugin}]}` sorted by form id; at least one filter. `type` is the engine's form type name (Weapon, NPC, Quest, Keyword, Idle, Cell, ...). Editor IDs are present only for record types the engine keeps them for. |
+| Forms.info | main | formID or editorID | Brief fields plus `localID`, `dynamic`, `plugins` (defining plugin first, then overriders), `keywords:[{formID, editorID}]`; references add `base`, `pos`, `cell`. |
+| Idles.list | main | ref (an actor loaded in the world), filter? (editor id or event substring), plugin?, playable? (true: conditions pass for the actor), offset?, limit? (50, max 300) | `{actor, total, conditionsChecked, idles:[{formID, editorID, event, file, plugin, parent?}]}` |
+| Idles.play | main (deferred) | ref, idle (form id or editor id) | Calls the script entry point Actor.PlayIdle; `{actor, idle, accepted}` where accepted is the function's return value |
+| Idles.stop | main | ref | Sends the default-idle graph event; `{actor, sent}` |
+| Camera.pose | main | | Camera.state plus `free`, `pov` (`first`, `third`, `other`) and `autoVanityAllowed` |
+| Camera.mode | main | mode (`first`, `third`, `vanity`, `free`), freezeTime? | Switches the point of view, including the idle orbit camera (`vanity`); returns the pose |
+| Camera.free | main | on, pos? [x, y, z], yawDeg?, pitchDeg? (-89..89), fov?, freezeTime? | `on: true` enters the free camera once and applies the pose (heading clockwise from north, pitch positive down, the Camera.state convention); calling again while it is on moves it. If the state switch is not visible yet the reply has `pending: true`; repeat the call. `on: false` returns to the previous view. |
+| Camera.autoVanity | main | allow? | Sets whether the idle orbit camera may start; `allow: false` also leaves it. Returns `{allow, mode}`. |
+| Map.getWaypoint | main | | `{set, pos, refID, world, distance}` of the custom waypoint |
+| Map.setWaypoint | main | x, y, z? | Places the waypoint through the open MapMenu (open it with UI.openMenu and let it load; -32004 otherwise), the same path a click takes; returns the waypoint read back and `requested` |
+| Map.clearWaypoint | main | | Removes the waypoint; `{set: false, cleared}` |
+| Map.markers | main | contains?, visible?, canTravel?, offset?, limit? (50, max 500) | Locations with a map marker and what the map shows: `{total, markers:[{name, location, marker, pos, world, visible, canTravel, type, distance}]}`; Nav.places lists the same places without the discovery state |
+
 ### Combat
 
 Actions go through the same controls a keyboard presses (`Right Attack/Block`, `Left Attack/Block`),
