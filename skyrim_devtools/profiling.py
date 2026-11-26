@@ -44,6 +44,8 @@ PLUGIN_NAME = "skyrimdevtools.dll"
 # Address Library IDs, which name the same function in every AE build.
 SYMBOLS_BUILD = "sse-steam-1-7-104"
 CHUNK_TIMEOUT = 60
+BUILD_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+CREDIT_RE = re.compile(r"CRASHLOGGER_PDB\(\d+@[^)\s]+\)")
 
 
 # ---- symbols ------------------------------------------------------------------------------------
@@ -127,9 +129,12 @@ class GameSymbols:
     boundary table. All of these describe SYMBOLS_BUILD; with that build's Address Library table
     (`addrlib`) a profile of another runtime is named through each frame's Address Library ID."""
 
-    def __init__(self, root=None, addrlib=None):
+    def __init__(self, root=None, addrlib=None, build=None, tables=None):
         self.root = Path(root) if root else None
-        self.build = SYMBOLS_BUILD
+        self.build = build or SYMBOLS_BUILD
+        self.credit = CRASHLOGGER_CREDIT
+        # Tables of a non-pinned build live outside the committed tree, in the checkout's ignored .local.
+        self.tables = Path(tables) if tables else None
         self.ids = read_address_library(addrlib) if addrlib else {}
         self.names = {}
         self.project = {}
@@ -137,13 +142,18 @@ class GameSymbols:
         self.bound_starts = []
         self.bound_sizes = []
         self.loaded = []
-        if self.root:
+        if self.tables:
+            self._load_pdb(self.tables)
+        elif self.root:
             self._load()
         if self.ids:
             self.loaded.append(f"address library ids {len(self.ids)}")
 
     def _load(self):
-        pdb = self.root / "reconstruction" / "generated" / "crashlogger_pdb"
+        self._load_pdb(self.root / "reconstruction" / "generated" / "crashlogger_pdb")
+        self._load_project()
+
+    def _load_pdb(self, pdb):
         for path in sorted((pdb / "names").glob("*.tsv")):
             for line in path.read_text(encoding="utf-8").splitlines():
                 if line and not line.startswith("#"):
@@ -160,6 +170,13 @@ class GameSymbols:
         self.bound_sizes = [b[1] for b in bounds]
         if self.names or bounds:
             self.loaded.append(f"crashlogger names {len(self.names)}, boundaries {len(bounds)}")
+        readme = pdb / "README.md"
+        if readme.exists():
+            found = CREDIT_RE.search(readme.read_text(encoding="utf-8"))
+            if found:
+                self.credit = found.group(0)
+
+    def _load_project(self):
         progress = self.root / "data" / "progress.json"
         if progress.exists():
             for item in json.loads(progress.read_text(encoding="utf-8")).get("functions", []):
@@ -172,6 +189,16 @@ class GameSymbols:
                 if item.get("name"):
                     self.aligned[int(rva, 16)] = (item["name"], item.get("source", "symbols"))
             self.loaded.append(f"aligned symbols {len(self.aligned)}")
+
+    def for_build(self, build):
+        """The symbols to use for a profile of `build`: these when it is their build, a table set generated
+        from that build's own PDB when one exists, otherwise these (named through Address Library IDs)."""
+        if build == self.build or not self.root or not BUILD_RE.fullmatch(build or ""):
+            return self
+        tables = self.root / ".local" / "crashlogger_pdb" / build
+        if not (tables / "names").is_dir():
+            return self
+        return GameSymbols(self.root, build=build, tables=tables)
 
     def containing(self, rva):
         index = bisect.bisect_right(self.bound_starts, rva) - 1
@@ -253,10 +280,12 @@ class Profile:
 
     def __init__(self, raw, symbols=None):
         self.raw = raw
-        self.symbols = symbols or GameSymbols()
         self.modules = raw.get("modules", [])
         # A profile without a build field predates multi-runtime support and is of the pinned build.
         self.build = raw.get("build") or SYMBOLS_BUILD
+        # No flag needed: a build with its own generated tables is named from them, never through another
+        # build's RVAs.
+        self.symbols = (symbols or GameSymbols()).for_build(self.build)
         self.foreign = self.build != self.symbols.build
         self.kinds = [module_kind(m) for m in self.modules]
         self.sources = Counter()
@@ -501,7 +530,7 @@ class Profile:
             credits.append(f"Profile of {self.build}; game names are those of {self.symbols.build} reached through "
                            f"Address Library IDs ({bridged} frames); a name is a label, not proof of identity")
         if "crashlogger" in used:
-            credits.append(f"Game function names: {CRASHLOGGER_CREDIT} (CrashLogger Contributors, Nexus mod 59818)")
+            credits.append(f"Game function names: {self.symbols.credit} (CrashLogger Contributors, Nexus mod 59818)")
         if "project" in used or "project-guess" in used:
             credits.append("Project names from skyrim-research data/progress.json (names marked (guess) are unverified)")
         for source in sorted(s for s in used if s.startswith("symbols:")):

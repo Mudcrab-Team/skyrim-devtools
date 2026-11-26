@@ -141,6 +141,13 @@ nearest ID at or below its address, the 1.7.104 table (`versionlib-1-7-104-0.bin
 looked up in 1.7.104 tables directly. Functions without an ID shared by both builds stay `id:N` or `sub_`,
 and a bridged name is a label for code that may have changed between builds.
 
+When tables generated from a runtime's own CrashLogger PDB exist in the research checkout at
+`.local/crashlogger_pdb/<build id>/` (for 1.6.1170: `sse-steam-1-6-1170`; write them with
+`python3.13 tools/pdb_types.py generate <SkyrimSE.pdb> --build sse-steam-1-6-1170`), a profile of that build
+is named from them directly by RVA, with no flag and no Address Library table; reports credit the version of
+those tables. The PDB and the tables stay in ignored `.local/` folders. A build without tables keeps the
+bridging described above.
+
 Keep profiles local: they contain addresses and names of the game, so they belong in `.local/` or the test
 PC's scratch tree, not in commits, issues or PRs.
 
