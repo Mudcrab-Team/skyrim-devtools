@@ -14,6 +14,7 @@
 #include "methods.h"
 #include "nav_graph.h"
 #include "nav_path.h"
+#include "quest_targets.h"
 
 #include <deque>
 #include <set>
@@ -33,6 +34,8 @@ namespace
         RE::TESWorldSpace* world = nullptr;     // goal worldspace for exterior goals
         double radius = 150.0;
         Json describe;
+        std::string questText;
+        bool questFinal = true;
     };
 
     struct History
@@ -98,6 +101,19 @@ namespace
 
         RE::FormID door = 0;        // load door being used to change cells
         double doorActivated = 0.0;
+        std::string questText;      // questTarget goals: which quest, re-resolved as the compass moves on
+        bool questFinal = true;     // the goal reference is the quest target itself, not a door on the way
+        bool questStale = false;    // a cell change happened and the target has not been re-resolved yet
+        double questStaleSince = 0.0;
+        double questRefreshed = 0.0;
+        bool activate = false;      // activate the goal reference on arrival
+        bool activated = false;
+        double loadingTotal = 0.0;  // seconds spent in loading screens; they do not count against timeoutS
+        double loadingSince = -1.0;
+        std::uint64_t openSignature = 0;  // open/locked/disabled state of what stands nearby
+        double openChecked = -1e9;
+        double openReset = -1e9;
+        int staleResets = 0;
 
         RE::NiPointer<RE::TESObjectREFR> marker;
         std::shared_ptr<std::atomic_int> aiResult;
@@ -188,6 +204,8 @@ namespace
     std::optional<Json> lastSummary;
     int nextId = 1;
 
+    void TargetRef(Goal& goal, RE::TESObjectREFR* ref);
+
     RE::TESObjectREFR* LookupRef(RE::FormID id) { return id ? RE::TESForm::LookupByID<RE::TESObjectREFR>(id) : nullptr; }
 
     bool* Running()
@@ -231,15 +249,91 @@ namespace
         return true;
     }
 
+    // The load door the player last arrived through, so a trip does not walk straight back through it.
+    struct DoorTransit
+    {
+        RE::FormID arrival = 0;
+        double at = -1e9;
+        bool intoExterior = false;
+    };
+    DoorTransit recentDoor;
+    constexpr double doorMemoryS = 120.0;
+    RE::TESObjectCELL* lastCell = nullptr;
+    RE::NiPoint3 lastCellPos;
+
+    // Notes a cell change by door: the door standing next to the arrival point is the one just used.
+    void TickDoors(Tick&)
+    {
+        const auto player = RE::PlayerCharacter::GetSingleton();
+        const auto tes = RE::TES::GetSingleton();
+        if (!player || !tes) {
+            return;
+        }
+        const auto cell = player->GetParentCell();
+        if (!cell) {
+            return;
+        }
+        const auto pos = player->GetPosition();
+        if (lastCell && cell != lastCell && !(!cell->IsInteriorCell() && !lastCell->IsInteriorCell())) {
+            RE::TESObjectREFR* best = nullptr;
+            double bestDistance = 450.0;
+            tes->ForEachReferenceInRange(player, 450.0F, [&](RE::TESObjectREFR* ref) {
+                const auto base = ref ? ref->GetBaseObject() : nullptr;
+                if (base && base->Is(RE::FormType::Door) && ref->extraList.GetTeleportLinkedDoor().get()) {
+                    const auto d = Dist3D(ref->GetPosition(), pos);
+                    if (d < bestDistance) {
+                        bestDistance = d;
+                        best = ref;
+                    }
+                }
+                return RE::BSContainer::ForEachResult::kContinue;
+            });
+            if (best) {
+                recentDoor = { best->GetFormID(), Now(), !cell->IsInteriorCell() };
+            }
+        }
+        lastCell = cell;
+        lastCellPos = pos;
+    }
+
+    // Open, locked and disabled state of the doors, gates and other activators within reach of the
+    // route: a change means a way that was shut may be open (or the reverse), so cached dead ends are stale.
+    std::uint64_t OpenSignature(RE::PlayerCharacter& player)
+    {
+        std::uint64_t hash = 1469598103934665603ULL;
+        if (const auto tes = RE::TES::GetSingleton()) {
+            tes->ForEachReferenceInRange(&player, 2500.0F, [&](RE::TESObjectREFR* ref) {
+                const auto base = ref ? ref->GetBaseObject() : nullptr;
+                if (!base || !(base->Is(RE::FormType::Door) || base->Is(RE::FormType::Activator))) {
+                    return RE::BSContainer::ForEachResult::kContinue;
+                }
+                const std::uint64_t state = static_cast<std::uint64_t>(RE::BGSOpenCloseForm::GetOpenState(ref)) | (ref->IsLocked() ? 8ULL : 0ULL) |
+                                            (ref->IsDisabled() ? 16ULL : 0ULL) | (ref->IsDeleted() ? 32ULL : 0ULL);
+                hash = (hash ^ ref->GetFormID()) * 1099511628211ULL;
+                hash = (hash ^ state) * 1099511628211ULL;
+                return RE::BSContainer::ForEachResult::kContinue;
+            });
+        }
+        return hash;
+    }
+
     // A loaded load door whose other side is in the goal's cell or worldspace (one hop only).
     RE::TESObjectREFR* FindLoadDoor(RE::PlayerCharacter& player, const Goal& goal)
     {
-        RE::TESObjectREFR* best = nullptr;
-        double bestDistance = std::numeric_limits<double>::max();
         const auto tes = RE::TES::GetSingleton();
         if (!tes) {
             return nullptr;
         }
+        const auto now = Now();
+        const auto here = player.GetParentCell();
+        const bool inInterior = here && here->IsInteriorCell();
+        // First choice: a door whose other side holds the goal. Second: from an interior with no such
+        // door, the way out to the exterior, which is where doors to the goal's cell are found. The
+        // door just arrived through is not taken again unless the goal is behind it.
+        RE::TESObjectREFR* best = nullptr;
+        RE::TESObjectREFR* exit = nullptr;
+        double bestDistance = std::numeric_limits<double>::max();
+        double exitDistance = std::numeric_limits<double>::max();
         tes->ForEachReferenceInRange(&player, 30000.0F, [&](RE::TESObjectREFR* ref) {
             const auto base = ref ? ref->GetBaseObject() : nullptr;
             if (!base || !base->Is(RE::FormType::Door) || ref->IsDisabled()) {
@@ -252,16 +346,20 @@ namespace
             const auto cell = linked->GetParentCell();
             const bool leads = goal.cell && goal.cell->IsInteriorCell() ? cell == goal.cell
                                                                         : (goal.world && linked->GetWorldspace() == goal.world);
+            const auto d = Dist3D(ref->GetPosition(), player.GetPosition());
             if (leads) {
-                const auto d = Dist3D(ref->GetPosition(), player.GetPosition());
                 if (d < bestDistance) {
                     bestDistance = d;
                     best = ref;
                 }
+            } else if (inInterior && cell && !cell->IsInteriorCell() && d < exitDistance &&
+                       !(ref->GetFormID() == recentDoor.arrival && now - recentDoor.at < doorMemoryS)) {
+                exitDistance = d;
+                exit = ref;
             }
             return RE::BSContainer::ForEachResult::kContinue;
         });
-        return best;
+        return best ? best : exit;
     }
 
     // An ordinary (non-load) door just ahead of the player, which may be what blocks it.
@@ -347,6 +445,17 @@ namespace
             const auto speed = SpeedOf(p);
             out["speed"] = Round(speed);
             out["etaS"] = speed > 20.0 ? Json(Round(remaining / speed)) : Json(nullptr);
+        }
+        out["loading"] = p.interruption == "loading";
+        out["loadingS"] = Round(p.loadingTotal);
+        if (p.activate) {
+            out["activated"] = p.activated;
+        }
+        if (p.staleResets) {
+            out["openStateResets"] = p.staleResets;
+        }
+        if (recentDoor.arrival && Now() - recentDoor.at < doorMemoryS) {
+            out["lastDoor"] = { { "refID", Hex(recentDoor.arrival) }, { "agoS", Round(Now() - recentDoor.at) } };
         }
         if (p.mode == "input") {
             out["waypoint"] = p.waypoint;
@@ -646,10 +755,91 @@ namespace
         }
     }
 
+    bool IsLoadDoor(RE::TESObjectREFR* ref)
+    {
+        const auto base = ref ? ref->GetBaseObject() : nullptr;
+        return base && base->Is(RE::FormType::Door) && ref->extraList.HasType(RE::ExtraDataType::kTeleport);
+    }
+
+    // Follows the compass: the quest's tracking reference changes as the player crosses cells (the door
+    // out of a building, then the door into the dungeon, then the objective itself).
+    bool RefreshQuestGoal(Process& p, RE::PlayerCharacter& player, double now)
+    {
+        p.questRefreshed = now;
+        std::vector<quest::Target> targets;
+        try {
+            targets = quest::CurrentTargets(p.questText, true);
+        } catch (const RpcError&) {
+            return false;
+        }
+        if (targets.empty()) {
+            return false;
+        }
+        const auto& chosen = targets.front();
+        const auto ref = chosen.tracking ? chosen.tracking : chosen.target;
+        p.questFinal = !chosen.tracking || chosen.tracking == chosen.target;
+        if (ref->GetFormID() != p.goal.ref) {
+            TargetRef(p.goal, ref);
+            p.goal.describe["ref"] = DescribeRef(ref);
+            p.plan = {};
+            p.replanWanted = true;
+            p.door = 0;
+            p.via.clear();
+            p.viaIndex = 0;
+            p.global = false;
+            const auto world = player.GetWorldspace();
+            if (SameSpace(player, p.goal) && world && Dist2D(player.GetPosition(), p.goal.point) > 8000.0 && HasGlobalGraph(world)) {
+                RouteGlobal(p, player, now, "questTarget");
+            }
+        }
+        return true;
+    }
+
+    // Ends a trip at its goal; with activate set, first faces the goal reference and activates it.
+    void Arrive(Process& p, RE::PlayerCharacter& player)
+    {
+        if (p.goal.kind == "questTarget" && !p.questFinal) {
+            // A door on the way to the objective: go through it; the next hop is resolved after the load.
+            if (const auto ref = LookupRef(p.goal.ref); IsLoadDoor(ref)) {
+                const auto now = Now();
+                if (now - p.doorActivated > 5.0) {
+                    p.state = "door";
+                    p.doorActivated = now;
+                    ref->ActivateRef(&player, 0, nullptr, 1, false);
+                }
+                return;
+            }
+        }
+        if (p.activate && !p.activated) {
+            if (const auto ref = LookupRef(p.goal.ref)) {
+                p.activated = true;
+                FaceHeading(player, HeadingTo(player.GetPosition(), ref->GetPosition()));
+                ref->ActivateRef(&player, 0, nullptr, 1, false);
+            }
+        }
+        Finish(p, "arrived", "");
+    }
+
     void TickInput(Process& p, RE::PlayerCharacter& player, Tick& tick)
     {
         const auto now = tick.now;
         const auto pos = player.GetPosition();
+        if (now - p.openChecked > 1.0) {
+            p.openChecked = now;
+            const auto signature = OpenSignature(player);
+            if (p.openSignature != 0 && signature != p.openSignature && now - p.openReset > 8.0) {
+                p.openReset = now;
+                // A gate, web or door nearby changed state: dead ends and traps recorded so far no longer hold.
+                p.traps.clear();
+                p.deadEnds = 0;
+                p.stuckSinceProgress = 0;
+                p.plan = {};
+                p.replanWanted = true;
+                ++p.staleResets;
+                Emit("navReplan", { { "id", p.id }, { "why", "openStateChanged" }, { "pos", Point(pos) } });
+            }
+            p.openSignature = signature;
+        }
         if (p.global) {
             FollowGlobal(p, player, now);
         }
@@ -681,7 +871,7 @@ namespace
                 }
                 return;
             }
-            Finish(p, "arrived", "");
+            Arrive(p, player);
             return;
         }
 
@@ -777,7 +967,7 @@ namespace
         }
         const auto goal = GoalPosition(p);
         if (Dist2D(pos, goal) < p.goal.radius && std::abs(pos.z - goal.z) < 300.0) {
-            Finish(p, "arrived", "");
+            Arrive(p, player);
             return;
         }
         if (p.aiResult) {
@@ -785,7 +975,7 @@ namespace
             if (result != 0) {
                 // PathToReference returned without arriving (interrupted, or no path): try again.
                 if (Dist2D(pos, goal) < std::max(p.goal.radius * 3.0, 400.0)) {
-                    Finish(p, "arrived", "");
+                    Arrive(p, player);
                     return;
                 }
                 // Long trips end a leg now and then (combat, a cell boundary); only legs that got
@@ -1342,6 +1532,10 @@ namespace
             p.trail.clear();
             p.plan = {};
             p.door = 0;
+            if (p.goal.kind == "questTarget") {
+                p.questStale = true;
+                p.questStaleSince = now;
+            }
         } else {
             p.travelled += step;
         }
@@ -1356,7 +1550,10 @@ namespace
         while (!p.history.empty() && now - p.history.front().t > 8.5) {
             p.history.pop_front();
         }
-        if (now - p.started > p.timeout) {
+        if (p.interruption == "loading") {
+            p.loadingTotal += tick.dt;
+        }
+        if (now - p.started - p.loadingTotal > p.timeout) {
             Finish(p, "failed", "Timed out");
             return;
         }
@@ -1386,6 +1583,18 @@ namespace
             if (p.sheathe) {
                 p.sheathe = false;
                 tick.drive.tap.push_back("Ready Weapon");
+            }
+            if (p.goal.kind == "questTarget" && (p.questStale || now - p.questRefreshed > 3.0)) {
+                const bool ok = RefreshQuestGoal(p, *player, now);
+                if (p.questStale && ok) {
+                    p.questStale = false;
+                } else if (p.questStale) {
+                    // The compass has not picked the next hop yet; walking back through the door just used would undo the trip.
+                    if (now - p.questStaleSince > 15.0) {
+                        Finish(p, "failed", "The quest target was lost after changing cells");
+                    }
+                    return;
+                }
             }
             if (p.mode == "ai") {
                 TickAi(p, *player, tick);
@@ -1456,7 +1665,7 @@ namespace
     Goal ResolveGoal(const Json& spec, RE::PlayerCharacter& player)
     {
         if (!spec.is_object()) {
-            throw RpcError(code::invalidParams, "goal is an object: {refID} | {x,y,z} | {cell} | {place} | {near, radius}");
+            throw RpcError(code::invalidParams, "goal is an object: {refID} | {x,y,z} | {cell} | {place} | {questTarget} | {near, radius}");
         }
         Goal goal;
         if (spec.contains("refID")) {
@@ -1465,6 +1674,23 @@ namespace
             const auto ref = RequireRef(spec["refID"]);
             TargetRef(goal, ref);
             goal.describe = { { "refID", Hex(ref->GetFormID()) }, { "ref", DescribeRef(ref) } };
+        } else if (spec.contains("questTarget")) {
+            AllowOnly(spec, { "questTarget", "radius" });
+            goal.kind = "questTarget";
+            const auto& wanted = spec["questTarget"];
+            const auto name = wanted.is_string() ? wanted.get<std::string>() : std::string();
+            goal.questText = name;
+            const auto targets = quest::CurrentTargets(name, true);
+            if (targets.empty()) {
+                throw RpcError(code::notFound, "No quest target to walk to" + (name.empty() ? std::string(" (no running quest has one)") : " for " + name));
+            }
+            // The compass follows the tracking ref; it is the way to the target when that is in another cell.
+            const auto& chosen = targets.front();
+            const auto ref = chosen.tracking ? chosen.tracking : chosen.target;
+            goal.questFinal = !chosen.tracking || chosen.tracking == chosen.target;
+            TargetRef(goal, ref);
+            goal.describe = { { "questTarget", chosen.quest->GetFormEditorID() ? chosen.quest->GetFormEditorID() : "" },
+                { "objective", chosen.objectiveIndex }, { "text", chosen.objectiveText }, { "ref", DescribeRef(ref) } };
         } else if (spec.contains("near")) {
             AllowOnly(spec, { "near", "radius" });
             goal.kind = "near";
@@ -1526,7 +1752,7 @@ namespace
             }
             goal.describe = { { "point", Point(goal.point) }, { "worldspace", DescribeWorld(goal.world) } };
         } else {
-            throw RpcError(code::invalidParams, "goal needs refID, near, place, cell or x and y");
+            throw RpcError(code::invalidParams, "goal needs refID, near, place, questTarget, cell or x and y");
         }
         if (spec.contains("radius")) {
             goal.radius = Require<double>(spec, "radius");
@@ -1587,8 +1813,10 @@ DEVTOOLS_MODULE(NavGoto)
     events::Declare("navResumed", "An interruption cleared and Nav.goto picked the route up again: {id, after}");
     events::Declare("navStone", "Nav.goto ai mode routes the engine through a map marker after the goal reported no path: {id, marker, pos}");
     events::Declare("navRoute", "Nav.goto planned a long-range route over the worldspace graph: {id, why, global: Nav.plan's global fields}");
+    events::Declare("navReplan", "Nav.goto dropped its dead-end memory and planned again because a nearby door, gate or web changed state: {id, why, pos}");
     events::Declare("navStall", "A stall (speed under 40 units/s) or off-path episode ended: {id, kind, atS, durationS, pos, cause?, offPath?, maxDistance?}");
     AddTicker(TickNav);
+    AddTicker(TickDoors);
     if (const auto source = RE::ScriptEventSourceHolder::GetSingleton()) {
         static HitSink hits;
         source->AddEventSink<RE::TESHitEvent>(&hits);
@@ -1596,7 +1824,7 @@ DEVTOOLS_MODULE(NavGoto)
 
     Register("Nav.goto", [](const Json& params) {
         AllowOnly(params, { "goal", "mode", "timeoutS", "run", "sprint", "onCombat", "onDialogue", "onMessageBox", "onMenu", "invulnerable", "via",
-            "route", "routeSpacing", "loadEpoch" });
+            "route", "routeSpacing", "activate", "loadEpoch" });
         RequirePlayable(params);
         std::lock_guard lock(Lock());
         if (active) {
@@ -1608,6 +1836,16 @@ DEVTOOLS_MODULE(NavGoto)
         auto& player = Player();
         Process p;
         p.goal = ResolveGoal(params.value("goal", Json::object()), player);
+        p.questText = p.goal.questText;
+        p.questFinal = p.goal.questFinal;
+        p.questRefreshed = Now();
+        p.activate = Optional<bool>(params, "activate", false);
+        if (p.activate && !p.goal.ref) {
+            throw RpcError(code::invalidParams, "activate needs a goal with a reference (refID, near, place or questTarget)");
+        }
+        if (p.activate && !params["goal"].contains("radius")) {
+            p.goal.radius = std::min(p.goal.radius, 90.0);  // inside the activation reach, not merely near
+        }
         p.mode = Optional<std::string>(params, "mode", "input");
         if (p.mode != "input" && p.mode != "ai") {
             throw RpcError(code::invalidParams, "mode is input or ai");
@@ -1690,7 +1928,10 @@ DEVTOOLS_MODULE(NavGoto)
         if (wantGlobal && (p.mode != "input" || !p.via.empty() || !SameSpace(player, p.goal) || !world)) {
             throw RpcError(code::invalidParams, "route global is an input-mode option for a goal in the player's worldspace, without via");
         }
-        if (wantGlobal || (!wantLocal && p.mode == "input" && p.via.empty() && distant && HasGlobalGraph(world))) {
+        // Right after leaving a building the local navmeshes are few; the worldspace graph is the safer guide.
+        const bool afterDoor = recentDoor.intoExterior && Now() - recentDoor.at < doorMemoryS &&
+                               SameSpace(player, p.goal) && world && Dist2D(player.GetPosition(), p.goal.point) > 2500.0;
+        if (wantGlobal || (!wantLocal && p.mode == "input" && p.via.empty() && (distant || afterDoor) && HasGlobalGraph(world))) {
             if (!RouteGlobal(p, player, p.started, "start", &globalNote) && wantGlobal) {
                 throw RpcError(code::notFound, globalNote);
             }

@@ -1,12 +1,12 @@
 import json
 import unittest
 
-from skyrim_devtools.use.combat import decide
+from skyrim_devtools.use.combat import assess, decide, healing_spells
 import test_use
 from test_use import Harness, run
 
 COMBAT_METHODS = ["Combat.state", "Combat.target", "Combat.face", "Combat.draw", "Combat.equip", "Combat.unequip",
-                  "Combat.attack", "Combat.block", "Combat.cast", "Combat.drink", "Move.walk", "Player.equipped",
+                  "Combat.attack", "Combat.block", "Combat.cast", "Combat.drink", "Move.walk", "Player.equipped", "Quest.targets", "Nav.goto",
                   "Player.spells"]
 
 
@@ -47,6 +47,55 @@ class DecideTests(unittest.TestCase):
     def test_chosen_target_beats_nearest(self):
         far = hostile(distance=500, chosen=True)
         self.assertEqual(decide(state([hostile(distance=100), far])), ("approach", 500))
+
+
+class HealAndAssessTests(unittest.TestCase):
+    def test_heal_by_spell_without_potion_then_retreat(self):
+        low = state([hostile()], health=20)
+        self.assertEqual(decide(low, have_potion=False, have_heal_spell=True), ("heal", "spell"))
+        self.assertEqual(decide(low, have_potion=False, retreat_below=25), ("retreat", None))
+        self.assertEqual(decide(low, have_potion=False, retreat_below=10)[0], "attack")
+        self.assertEqual(decide(low, have_heal_spell=True), ("drink", "health"))
+
+    def test_healing_spells_exclude_other_target_ones(self):
+        spells = {"spells": [{"name": "Healing"}, {"name": "Healing Hands"}, {"name": "Flames"}, {"name": "Close Wounds"}]}
+        self.assertEqual(healing_spells(spells), ["Healing", "Close Wounds"])
+
+    def test_assess_by_level_and_trades(self):
+        calm = state([dict(hostile(distance=300), level=2)])
+        calm["player"]["level"] = 5
+        self.assertEqual(assess(calm), (False, ""))
+        pack = state([dict(hostile(distance=300), level=9), dict(hostile(distance=400), level=9)])
+        pack["player"]["level"] = 1
+        self.assertTrue(assess(pack)[0])
+        boss = state([dict(hostile(distance=300), level=30)])
+        boss["player"]["level"] = 20
+        self.assertIn("level 30", assess(boss, ())[1]) if assess(boss)[0] else None
+        trades = [(100, 100), (80, 95), (60, 92), (45, 90), (40, 88)]
+        self.assertTrue(assess(calm, trades)[0])
+        self.assertFalse(assess(calm, [(100, 100), (90, 70), (80, 50), (75, 30), (70, 10)])[0])
+
+    def test_unknown_player_level_skips_the_level_rule(self):
+        self.assertEqual(assess(state([dict(hostile(), level=50)])), (False, ""))
+
+
+class DaemonTests(unittest.TestCase):
+    def test_daemon_is_stale_only_when_sources_changed_after_start(self):
+        from skyrim_devtools.use import server
+        saved = server._STARTED
+        try:
+            server._STARTED = server.source_mtime() + 100
+            self.assertFalse(server.daemon_state()["stale"])
+            server._STARTED = server.source_mtime() - 100
+            self.assertTrue(server.daemon_state()["stale"])
+        finally:
+            server._STARTED = saved
+
+    def test_busy_error_recognises_a_load(self):
+        from skyrim_devtools.use.manager import GameError
+        from skyrim_devtools.use.server import is_busy_error
+        self.assertTrue(is_busy_error(GameError("x (the game did not answer in time (it may be loading or stalled))")))
+        self.assertFalse(is_busy_error(GameError("not found")))
 
 
 class ToolTests(unittest.TestCase):
@@ -104,6 +153,36 @@ class ToolTests(unittest.TestCase):
             socket.results["UI.listMenus"] = [{"name": "InventoryMenu", "open": True}]
             result = json.loads(await h.text("combat_fight", rounds=3))
             self.assertEqual(result["outcome"], "menu open: InventoryMenu")
+            await h.text("game_stop")
+        run(scenario())
+
+    def test_quest_targets_forwards_only_set_parameters(self):
+        async def scenario():
+            h = Harness()
+            await h.text("game_start")
+            await h.text("quest_targets", quest="MS13")
+            await h.text("nav_goto", goal={"questTarget": "MS13"}, activate=True)
+            calls = [c for c in h.sockets[0].calls if c[0] in ("Quest.targets", "Nav.goto")]
+            self.assertEqual(calls[0], ("Quest.targets", {"quest": "MS13"}))
+            self.assertEqual(calls[1][1]["activate"], True)
+            self.assertEqual(calls[1][1]["goal"], {"questTarget": "MS13"})
+            await h.text("game_stop")
+        run(scenario())
+
+    def test_fight_reports_outmatched_before_fighting(self):
+        async def scenario():
+            h = Harness()
+            await h.text("game_start")
+            socket = h.sockets[0]
+            socket.menus = set()
+            player = {"dead": False, "level": 1, "health": {"cur": 100, "max": 100, "pct": 100}, "stamina": {"pct": 100}}
+            pack = [dict(hostile(distance=300), level=9) for _ in range(2)]
+            socket.results["Combat.state"] = {"player": player, "hostileTotal": 2, "hostiles": pack}
+            socket.results["Player.spells"] = {"spells": []}
+            result = json.loads(await h.text("combat_fight", rounds=3))
+            self.assertEqual(result["outcome"], "outmatched")
+            self.assertIn("enemy strength", result["assessment"])
+            self.assertFalse([c for c in socket.calls if c[0] == "Combat.attack"])
             await h.text("game_stop")
         run(scenario())
 

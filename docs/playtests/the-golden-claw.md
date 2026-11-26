@@ -192,3 +192,7 @@ the narration markers with `--highlights`.
 * Also found: the visible profile used exclusive fullscreen, which drew the game in a corner of the monitor and
   made desktop capture black; visible runs are now borderless-windowed (`Window.info` confirms 2560x1440
   windowed on a 2560x1440 monitor). Resolution made no difference to the hitches in the runs above.
+**Follow-up (improvements 2, 3, 4, 5, 7, 10, 12, 14 implemented).** `quest_targets`, `Nav.goto {questTarget}`
+and `activate`, door memory, loads not counting towards timeouts, open-state replans, `combat_fight` heal /
+retreat / outmatched, weapon restored on draw, stale-daemon warning in `game_status`, and `tools/pc-build hold`
+(automatic lock heartbeat). Inventory navigation: use `press_control`, now stated in the tool docs.

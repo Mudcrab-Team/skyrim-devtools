@@ -6,6 +6,10 @@
   tools/pc-build --config mac.json commonlib         (re)build the shared CommonLibSSE-NG once
   tools/pc-build --config mac.json lock|unlock       hold agent.lock around a live run
   tools/pc-build --config mac.json lock --refresh    heartbeat: agent.lock goes stale 25 min after its last refresh
+  tools/pc-build --config mac.json hold --lock-wait 1200 -- CMD ARGS...
+                                                     take the lock (queued), run CMD with a background heartbeat
+                                                     every 4 min, release the lock when CMD ends; CMD is stopped
+                                                     after --max-minutes (default 20) so one hold stays bounded
 
 With --lock-wait, waiting agents queue by ticket next to agent.lock and are served oldest first.
 """
@@ -124,9 +128,60 @@ def run_remote(host, args):
     return host.run(command, stream=True)
 
 
+HEARTBEAT_SECONDS = 240
+
+
+def hold(host, options, argv):
+    """Own agent.lock around a long command: refresh it in the background, always release it."""
+    import threading
+
+    name = options.name
+    wait = f"-Action lock -Agent {name} -LockWait {options.lock_wait}"
+    code = run_remote(host, wait)
+    if code:
+        fail(f"could not take agent.lock (exit {code}); it is held by another agent", code)
+    stop = threading.Event()
+    lost = threading.Event()
+
+    def beat():
+        while not stop.wait(HEARTBEAT_SECONDS):
+            result = host.run(rf"powershell -NoProfile -ExecutionPolicy Bypass -File {REMOTE_ROOT}\pc_build_remote.ps1 "
+                              f"-Action lock -Agent {name} -LockWait 0 -Refresh", check=False)
+            if result.returncode:
+                lost.set()
+                print("pc-build: agent.lock refresh failed; the lock is no longer ours", file=sys.stderr)
+
+    thread = threading.Thread(target=beat, daemon=True)
+    thread.start()
+    status = 1
+    try:
+        child = subprocess.Popen(argv)
+        try:
+            status = child.wait(timeout=options.max_minutes * 60)
+        except subprocess.TimeoutExpired:
+            child.terminate()
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                child.kill()
+            print(f"pc-build: stopped the command after {options.max_minutes} min (lock hold limit)", file=sys.stderr)
+            status = 124
+    finally:
+        stop.set()
+        run_remote(host, f"-Action unlock -Agent {name} -LockWait 0")
+    if lost.is_set() and status == 0:
+        status = 125
+    return status
+
+
 def main():
+    argv = sys.argv[1:]
+    rest = []
+    if "--" in argv:
+        split = argv.index("--")
+        argv, rest = argv[:split], argv[split + 1:]
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", nargs="?", default="build", choices=["build", "commonlib", "lock", "unlock"])
+    parser.add_argument("command", nargs="?", default="build", choices=["build", "commonlib", "lock", "unlock", "hold"])
     parser.add_argument("--config", type=Path, default=os.environ.get("SKYRIM_DEVTOOLS_CONFIG"))
     parser.add_argument("--name", default=REPO.name, help="build directory and agent name (default: worktree name)")
     parser.add_argument("--deploy", action="store_true", help="copy the DLL into the game while holding agent.lock")
@@ -134,16 +189,22 @@ def main():
     parser.add_argument("--lock-wait", type=int, default=0, metavar="SECONDS", help="wait this long for agent.lock")
     parser.add_argument("--refresh", action="store_true",
                         help="with lock: touch agent.lock if this agent holds it (non-zero exit if not); long holders call it every few minutes")
+    parser.add_argument("--max-minutes", type=float, default=20, help="with hold: stop the command after this long")
     parser.add_argument("--full", action="store_true", help="resend every source file")
     parser.add_argument("--reconfigure", action="store_true", help="delete the build directory first")
     parser.add_argument("--no-prebuilt", action="store_true", help="compile CommonLib inside the build directory")
-    options = parser.parse_args()
+    options = parser.parse_args(argv)
     if not options.config:
         fail("pass --config or set SKYRIM_DEVTOOLS_CONFIG")
     if not NAME_RE.fullmatch(options.name):
         fail("name must be letters, digits, dot, dash or underscore")
     host = Host(json.loads(options.config.read_text()))
     started = time.monotonic()
+
+    if options.command == "hold":
+        if not rest:
+            fail("hold needs a command after --")
+        sys.exit(hold(host, options, rest))
 
     if options.command in {"lock", "unlock"}:
         refresh = " -Refresh" if options.refresh and options.command == "lock" else ""

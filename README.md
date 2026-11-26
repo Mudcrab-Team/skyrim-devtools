@@ -71,6 +71,7 @@ tools/pc-build                    # incremental build, prints timings
 tools/pc-build --deploy --lock-wait 900   # build, then copy the DLL while holding agent.lock
 tools/pc-build lock --lock-wait 900       # hold agent.lock for a live run, release with: tools/pc-build unlock
 tools/pc-build lock --refresh             # heartbeat while holding it (non-zero exit if the lock is no longer yours)
+tools/pc-build hold --lock-wait 900 -- CMD...  # lock, run CMD with an automatic heartbeat every 4 min, unlock; stops CMD after 20 min
 ~~~
 
 `agent.lock` counts as stale 25 minutes after its last write when no game is running, and the next waiter
