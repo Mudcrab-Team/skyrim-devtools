@@ -34,10 +34,11 @@ namespace devtools::profiler
         constexpr int maxSamples = 32;
         constexpr int baselineFrames = 60;
 
-        // A default set that answers "what is the GPU busy with" on RDNA; names missing on a device are skipped.
+        // A default set that answers "what is the GPU busy with" on RDNA; names missing on a device are skipped
+        // with a warning. ScalarCacheHit and InstCacheHit are left out because RDNA4 does not offer them.
         const std::vector<std::string> defaultCounters{ "GPUTime", "GPUBusy", "VsGsBusy", "PSBusy", "CSBusy", "TexUnitBusy",
             "DepthStencilTestBusy", "PrimitiveAssemblyBusy", "PAStalledOnRasterizer", "PSExportStalls", "L0CacheHit", "L2CacheHit",
-            "ScalarCacheHit", "InstCacheHit", "FetchSize", "WriteSize", "MemUnitBusy", "MemUnitStalled", "CulledPrims",
+            "FetchSize", "WriteSize", "MemUnitBusy", "MemUnitStalled", "CulledPrims",
             "PrimitivesIn", "PSPixelsOut", "HiZQuadsCulled", "PreZQuadsCulled" };
 
         enum class Kind
@@ -199,6 +200,7 @@ namespace devtools::profiler
 
         void Close()
         {
+            commandList = nullptr;
             if (session) {
                 gpa.GpaDeleteSession(session);
                 session = nullptr;
@@ -296,6 +298,15 @@ namespace devtools::profiler
             return passes;
         }
 
+        Json Skipped()
+        {
+            auto warnings = Json::array();
+            for (const auto& name : missingNames) {
+                warnings.push_back("counter " + name + " is not offered by this device; skipped");
+            }
+            return warnings;
+        }
+
         void ServeList()
         {
             if (std::string error = Open(); !error.empty()) {
@@ -365,6 +376,12 @@ namespace devtools::profiler
 
         void BeginPassFrame()
         {
+            if (inFrame) {
+                return;
+            }
+            // GpaBeginCommandList reads its out-parameter first and refuses ("Command List Already Started") when
+            // it still names an existing list, so the previous pass's id must not be passed back in.
+            commandList = nullptr;
             if (!Check(gpa.GpaBeginCommandList(session, pass, GPA_NULL_COMMAND_LIST, kGpaCommandListNone, &commandList), "GpaBeginCommandList")) {
                 return;
             }
@@ -394,6 +411,7 @@ namespace devtools::profiler
                 !Check(gpa.GpaEndCommandList(commandList), "GpaEndCommandList")) {
                 return;
             }
+            commandList = nullptr;
             if (pass == 0) {
                 sampleCount = sampleIndex + 1;
             }
@@ -451,6 +469,7 @@ namespace devtools::profiler
             result["samples"] = sampleLabels;
             result["counters"] = std::move(counters);
             result["missingCounters"] = missingNames;
+            result["warnings"] = Skipped();
             result["mismatchedFrames"] = mismatchedFrames;
             result["paddedSamples"] = paddedSamples;
             result["mergedClears"] = mergedClears;
@@ -577,6 +596,7 @@ namespace devtools::profiler
             if (inFrame) {
                 gpa.GpaEndSample(commandList);
                 gpa.GpaEndCommandList(commandList);
+                commandList = nullptr;
                 inFrame = false;
             }
             Fail("no result after " + std::to_string(job->maxFrames) + " frames (" + std::to_string(pass) + " of " +

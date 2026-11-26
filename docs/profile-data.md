@@ -61,6 +61,13 @@ zero-length mark is an instant marker), and with GPU timing `GpuFrame` per timed
 GPU tracks: `gpu_frame_ms` (span per frame) and `gpu_util_pct`. Counters (`counters[]`) use the
 `display` block of current profiler versions and store values as deltas.
 
+With AMD board metrics in the raw profile (`gpuMetrics.source` set), each metric that has at least one value
+becomes its own counter track in the `GPU` category, named after the raw metric (`gpu_util_pct`,
+`gpu_clock_mhz`, `gpu_board_power_w`, `gpu_temp_c`, `gpu_hotspot_c`, `gpu_fan_rpm`, `gpu_vram_mb`,
+`gpu_vram_clock_mhz`, `gpu_voltage_mv`) with its unit, about one sample a second. A track whose name is
+already taken is not added again. GPUPerfAPI results (`gpaCounters`) are not tracks: the capture runs after
+the CPU profile window and each value covers several frames, so there is no time series to draw.
+
 `skyrim_devtools.profile_firefox.Export` builds it; `add_markers` and `add_counter` add marker sets and
 counter tracks, and `profiling.profile_firefox_data(profile)` is the one place that assembles a profile's
 export, so new data sources extend it there. `profile_firefox.check(data)` validates the tables.

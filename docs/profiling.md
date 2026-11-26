@@ -214,8 +214,8 @@ is present (`-DADLX_SDK=<checkout>/SDK`, or `deps\adlx` for `tools/pc-build`) an
 The driver reports which of these the card supports; the others are absent rather than zero. When ADLX gives
 `gpu_util_pct`, the PDH utilisation is dropped; when it gives `gpu_vram_mb`, the PDH value is kept as
 `gpu_process_vram_mb` (the game's own share). The report prints one `== GPU board` line with mean and max,
-`top` shows a `GPU board` line, the timeline draws one row per metric, and the raw profile keeps them as
-`gpuMetrics`. One read costs well under a millisecond on a background thread (`sampleUs` in the raw data).
+`top` shows a `GPU board` line, the timeline draws one row per metric, `profile.json.gz` has one counter
+track per metric, and the raw profile keeps them as `gpuMetrics`. One read costs well under a millisecond on a background thread (`sampleUs` in the raw data).
 
 ### AMD hardware counters (GPUPerfAPI)
 
@@ -240,11 +240,14 @@ are summed over the samples, percentages are averaged weighted by each sample's 
 samples are listed with their busy and cache numbers. `gpu-counters.json` holds every per-sample value, and
 the SQLite export has them in `GpaCounters`/`GpaCountersV`.
 
-Default set (missing names are skipped and listed): `GPUTime`, `GPUBusy`, `VsGsBusy`, `PSBusy`, `CSBusy`,
-`TexUnitBusy`, `DepthStencilTestBusy`, `PrimitiveAssemblyBusy`, `PAStalledOnRasterizer`, `PSExportStalls`,
-`L0CacheHit`, `L2CacheHit`, `ScalarCacheHit`, `InstCacheHit`, `FetchSize`, `WriteSize`, `MemUnitBusy`,
-`MemUnitStalled`, `CulledPrims`, `PrimitivesIn`, `PSPixelsOut`, `HiZQuadsCulled`, `PreZQuadsCulled`. Pick
-others with `--gpa-counters`; `profile_gpu_counters {action: "list"}` prints what the device offers.
+Default set: `GPUTime`, `GPUBusy`, `VsGsBusy`, `PSBusy`, `CSBusy`, `TexUnitBusy`, `DepthStencilTestBusy`,
+`PrimitiveAssemblyBusy`, `PAStalledOnRasterizer`, `PSExportStalls`, `L0CacheHit`, `L2CacheHit`, `FetchSize`,
+`WriteSize`, `MemUnitBusy`, `MemUnitStalled`, `CulledPrims`, `PrimitivesIn`, `PSPixelsOut`, `HiZQuadsCulled`,
+`PreZQuadsCulled`. Pick others with `--gpa-counters`; `profile_gpu_counters {action: "list"}` prints what the
+device offers. A requested counter the device does not offer is skipped, not an error: the capture runs with
+the rest and lists the skipped names in `missingCounters` and `warnings` (the report prints them as "not
+offered on this GPU"). `ScalarCacheHit` and `InstCacheHit` are not in the default set because RDNA4 (gfx12)
+does not offer them.
 
 Counters GPA 4.4 offers for D3D11 on RDNA4 (gfx12, for example the RX 9070 XT), from the release's
 `graphics_counter_tables_gfx12.html`. All of these work in the discrete per-sample mode used here except the
@@ -261,7 +264,7 @@ two last groups, which GPA lists for streaming mode only:
 | TextureUnit | `TexTriFilteringPct`, `TexTriFilteringCount`, `NoTexTriFilteringCount`, `TexVolFilteringPct`, `TexVolFilteringCount`, `NoTexVolFilteringCount`, `TexAveAnisotropy` |
 | DepthAndStencil | `HiZQuadsCulled`, `HiZQuadsCulledCount`, `HiZQuadsAcceptedCount`, `PreZQuadsCulled`, `PreZQuadsCulledCount`, `PreZQuadsSurvivingCount`, `PostZQuads`, `PostZQuadCount`, `PreZSamplesPassing`, `PreZSamplesFailingS`, `PreZSamplesFailingZ`, `PostZSamplesPassing`, `PostZSamplesFailingS`, `PostZSamplesFailingZ`, `ZUnitStalled`, `ZUnitStalledCycles` |
 | ColorBuffer | `CBMemRead`, `CBMemWritten` |
-| MemoryCache | `L0CacheHit`, `ScalarCacheHit`, `InstCacheHit`, `L2CacheHit`, `L2CacheMiss`, each with `...RequestCount`, `...HitCount`, `...MissCount`; `L0TagConflictReadStalledCycles`, `L0TagConflictWriteStalledCycles`, `L0TagConflictAtomicStalledCycles` |
+| MemoryCache | `L0CacheHit`, `L2CacheHit`, `L2CacheMiss`, each with `...RequestCount`, `...HitCount`, `...MissCount`; `L0TagConflictReadStalledCycles`, `L0TagConflictWriteStalledCycles`, `L0TagConflictAtomicStalledCycles` |
 | GlobalMemory | `FetchSize`, `WriteSize`, `MemUnitBusy`, `MemUnitStalled`, `WriteUnitStalled` (each also `...Cycles`), `LocalVidMemBytes`, `PcieBytes` |
 | RayTracing | `RayTriTests`, `RayBoxTests`, `TotalRayTests`, `RayTestsPerWave` |
 | WaveDistribution (streaming only) | `WaveOccupancyPct` |

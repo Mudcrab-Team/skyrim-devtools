@@ -735,6 +735,44 @@ class AmdTests(unittest.TestCase):
         self.assertTrue(Path(paths["gpuCounters"]).is_file())
         self.assertTrue(report["gpuCounters"]["ok"])
 
+    def test_board_tracks_in_firefox_export(self):
+        from skyrim_devtools import profile_firefox
+
+        data = profiling.profile_firefox_data(self.profile)
+        self.assertEqual(profile_firefox.check(data), [])
+        tracks = {c["name"]: c for c in data["counters"]}
+        for name in ("gpu_util_pct", "gpu_clock_mhz", "gpu_vram_mb"):
+            self.assertIn(name, tracks)
+        self.assertNotIn("gpu_fan_rpm", tracks)  # never reported, so no track
+        clock = tracks["gpu_clock_mhz"]
+        self.assertEqual(clock["display"]["unit"], "MHz")
+        running, levels = 0.0, []
+        for delta in clock["samples"]["count"]:
+            running += delta
+            levels.append(running)
+        self.assertEqual(levels, [0.0, 2500.0, 2400.0])
+        self.assertIn("adlx", clock["description"])
+
+    def test_board_tracks_not_duplicated(self):
+        from skyrim_devtools.profile_gpu import firefox_board_tracks
+
+        export = self.profile.firefox()
+        export.add_counter("gpu_util_pct", "GPU utilisation", [0.0], [50.0], unit="percent")
+        added = firefox_board_tracks(export, self.profile.raw)
+        self.assertNotIn("gpu_util_pct", added)
+        self.assertEqual([c["name"] for c in export.counters].count("gpu_util_pct"), 1)
+        raw = gpu_raw()
+        raw["gpuMetrics"] = {"source": None, "reason": "no AMD driver"}
+        self.assertEqual(firefox_board_tracks(profiling.Profile(raw, profiling.GameSymbols(self.root)).firefox(), raw), [])
+
+    def test_gpa_skipped_counters_are_warnings(self):
+        from skyrim_devtools.profile_gpa import summarize
+
+        result = dict(self.profile.raw["gpaCounters"], warnings=["counter VALUUtilization is not offered by this device; skipped"])
+        summary = summarize(result)
+        self.assertTrue(summary["ok"])
+        self.assertEqual(summary["warnings"], result["warnings"])
+
     def test_timeline_counter_rows(self):
         data = profile_views.timeline_data(self.profile)
         names = [c[0] for c in data["counters"]]

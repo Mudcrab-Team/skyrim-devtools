@@ -211,6 +211,43 @@ def board_summary(raw):
             "metrics": {name: {"mean": round(sum(v) / len(v), 2), "max": round(max(v), 2)} for name, v in values.items()}}
 
 
+# AMD board metric -> (track label, unit, colour) in the Firefox export.
+BOARD_TRACKS = {
+    "gpu_util_pct": ("GPU utilisation (ADLX)", "percent", "orange"),
+    "gpu_clock_mhz": ("GPU clock", "MHz", "blue"),
+    "gpu_vram_clock_mhz": ("VRAM clock", "MHz", "lightblue"),
+    "gpu_board_power_w": ("GPU board power", "W", "red"),
+    "gpu_temp_c": ("GPU temperature", "C", "yellow"),
+    "gpu_hotspot_c": ("GPU hotspot", "C", "yellow"),
+    "gpu_fan_rpm": ("GPU fan", "rpm", "grey"),
+    "gpu_vram_mb": ("VRAM used (card)", "MB", "purple"),
+    "gpu_voltage_mv": ("GPU voltage", "mV", "green"),
+}
+
+
+def firefox_board_tracks(export, raw):
+    """Adds one Firefox Profiler track per ADLX board metric. A track another layer already added under the same
+    name is kept as it is, so the board value never appears twice."""
+    metrics = raw.get("gpuMetrics") or {}
+    if not metrics.get("source"):
+        return []
+    series = {}
+    for at, name, value in board_series(raw):
+        times, values = series.setdefault(name, ([], []))
+        times.append(at)
+        values.append(value)
+    present = {c["name"] for c in export.counters}
+    added = []
+    for name, (times, values) in series.items():
+        if name in present:
+            continue
+        label, unit, color = BOARD_TRACKS.get(name, (name, "", "grey"))
+        export.add_counter(name, label, times, values, unit=unit, color=color,
+                           description=f"{label} from {metrics['source']} ({metrics.get('gpu') or 'GPU'}), about 1 Hz")
+        added.append(name)
+    return added
+
+
 def counter_series(raw):
     """Counters as [(ms, name, value)]: rates per second between 250 ms samples, levels as they were."""
     out = []

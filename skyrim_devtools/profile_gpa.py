@@ -78,6 +78,7 @@ def summarize(result, top=8):
     return {"ok": True, "device": result.get("device"), "passCount": result.get("passCount"),
             "framesUsed": result.get("framesUsed"), "sampleCount": result.get("sampleCount"),
             "counters": rows, "heaviestSamples": heavy, "missingCounters": result.get("missingCounters") or [],
+            "warnings": result.get("warnings") or [],
             "mismatchedFrames": result.get("mismatchedFrames"), "paddedSamples": result.get("paddedSamples"),
             "mergedClears": result.get("mergedClears"), "overhead": result.get("overhead") or {}}
 

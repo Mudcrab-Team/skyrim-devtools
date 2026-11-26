@@ -987,6 +987,10 @@ def profile_firefox_data(profile):
 
     export = profile.firefox()
     firefox_tracks(export, profile)
+    # AMD board metrics (ADLX) as counter tracks; added last so GPU-timing tracks keep their own names.
+    from .profile_gpu import firefox_board_tracks
+
+    firefox_board_tracks(export, profile.raw)
     return export.build()
 
 

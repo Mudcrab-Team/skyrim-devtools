@@ -127,7 +127,8 @@ async def gpacapture_case(manager, symbols, seconds, gpa_dir, out):
     return {"pass": not failed, "failed": failed, "seconds": took, "report": profile_gpa.render(summary),
             "device": summary.get("device"), "passCount": summary.get("passCount"),
             "framesUsed": summary.get("framesUsed"), "sampleCount": summary.get("sampleCount"),
-            "missingCounters": summary.get("missingCounters"), "mismatchedFrames": summary.get("mismatchedFrames"),
+            "missingCounters": summary.get("missingCounters"), "warnings": summary.get("warnings"),
+            "mismatchedFrames": summary.get("mismatchedFrames"),
             "paddedSamples": summary.get("paddedSamples"), "mergedClears": summary.get("mergedClears"),
             "overhead": overhead}
 
