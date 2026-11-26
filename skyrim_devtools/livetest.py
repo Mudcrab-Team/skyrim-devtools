@@ -28,6 +28,9 @@ from .use.server import perf_verdict
 
 PERF_INTERVAL = 15 * 60
 CASE_TIMEOUT = 300.0
+START_SETTLE = 8.0
+START_RETRIES = 2
+START_RETRY_WAIT = 25.0
 CRASH_MARKERS = ("game is gone", "no game is running", "connection lost")
 
 
@@ -190,7 +193,7 @@ async def run_script(ctx, script, root, timeout):
     if not path.is_file():
         raise FileNotFoundError(f"script {name} not found under {root}")
     module = None
-    if not args:
+    if not args and "async def run(" in path.read_text(encoding="utf-8", errors="replace"):
         spec = importlib.util.spec_from_file_location(f"livetest_{path.stem}", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -203,15 +206,22 @@ async def run_script(ctx, script, root, timeout):
     # a standalone program launches and stops its own game, so the shared session must be closed first
     if ctx.manager.alive:
         await ctx.manager.stop()
+        await asyncio.sleep(START_SETTLE)
     env = {**os.environ, "SKYRIM_LIVETEST_CONFIG": str(ctx.config_path or "")}
-    process = await asyncio.create_subprocess_exec(
-        sys.executable, str(path), *args, env=env, cwd=str(root), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    try:
-        data, _ = await asyncio.wait_for(process.communicate(), timeout)
-    except asyncio.TimeoutError:
-        process.kill()
-        raise
-    text = data.decode("utf-8", "replace")
+    for attempt in range(START_RETRIES + 1):
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, str(path), *args, env=env, cwd=str(root), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        try:
+            data, _ = await asyncio.wait_for(process.communicate(), timeout)
+        except asyncio.TimeoutError:
+            process.kill()
+            raise
+        text = data.decode("utf-8", "replace")
+        # the host refuses a start while the previous game is still shutting down
+        if "Windows host start failed" not in text or attempt == START_RETRIES:
+            break
+        ctx.mark(f"host start failed; retrying after {START_RETRY_WAIT:g} s")
+        await asyncio.sleep(START_RETRY_WAIT)
     ctx.artifacts.mkdir(parents=True, exist_ok=True)
     log = ctx.artifacts / f"{ctx.request_id}-{path.stem}.log"
     log.write_text(text, encoding="utf-8")
