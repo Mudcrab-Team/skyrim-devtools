@@ -27,7 +27,7 @@ finishes later, its result is dropped. Server notifications have no `id`:
 | Session.listSaves | any | | `[{name, bytes}]` in the isolated Saves directory |
 | Session.loadSave | main | name, wait? | Loads any save in Saves, in game or from the main menu. Increments `loadEpoch`. With `wait`, replies after the load finishes. |
 | Session.reload | main | wait? | Loads the last loaded save again |
-| Events.snapshot | ui | | `{seq, loadEpoch, dataLoaded, loadCompleted, loadSucceeded, playable, menus:[{name, ready}], foreground, headless, lastSave}` |
+| Events.snapshot | any (deferred) | | `{seq, loadEpoch, dataLoaded, loadCompleted, loadSucceeded, playable, menus:[{name, ready}], foreground, headless, lastSave, uiBusy}`. The UI thread answers; if it runs no tasks for 1.5 s (a long load, a paused window) the connection thread replies with the last known `menus` and `playable` and `uiBusy: true`. |
 | Events.list | any | | Declared event types with descriptions |
 | Events.subscribe / unsubscribe | any | types (`"*"` for all) | Selects pushed event types. Resets on every connection. |
 | UI.openMenu / closeMenu | ui | name, wait?, anyState?, loadEpoch? | Any registered menu. `wait` replies once the menu actually opens or closes. Unless `anyState` is set, the world must be playable. |
@@ -39,13 +39,16 @@ finishes later, its result is dropped. Server notifications have no `id`:
 | UI.showMessageBox | ui | text, buttons? (1-4) | Raises a message box. `UI.messageBox` then reports `lastAnswer`. |
 | UI.messageBox | ui | | `{open, text, buttons:[{index, text}], cancelIndex, cancellable}`, or `{open:false, lastAnswer}` |
 | UI.messageBoxSelect | ui | index or text | Presses a button (text matches exactly ignoring case, else a unique substring) |
-| UI.listItems | ui | menu | `{count, selectedIndex, items:[{index, name, count, equipped, equipState, category, favorited, formId, value, weight, owner?}]}` for InventoryMenu, ContainerMenu, BarterMenu, FavoritesMenu. The list is the menu's own cached one: after an equip it shows the old state until the menu is reopened. |
-| UI.selectItem | ui | menu, index or text, action?, count? | `equip`/`use`/`unequip`/`drop` (Inventory, default `equip`), `take`/`transfer` (Container, Barter), through the game's equip and inventory APIs |
+| UI.listItems | ui | menu | `{count, selectedIndex, items:[{index, name, count, equipped, equipState, category, favorited, formId, value, weight, owner?}]}` for InventoryMenu, ContainerMenu, BarterMenu, FavoritesMenu. `UI.selectItem` replies after the menu rebuilt its list, so a following `UI.listItems` is current. |
+| UI.selectItem | ui (deferred) | menu, index or text, action?, count? | `equip`/`use`/`unequip`/`drop` (Inventory, default `equip`), `take`/`transfer` (Container, Barter), through the game's equip and inventory APIs. After a change it sends the menu's own inventory-update message and waits (up to 1.5 s) for the list to change; the reply adds `after` (the entry's new state, null when gone) and `listUpdated`. |
 | UI.list / UI.select | ui | menu, index or text, path?, press? | Entries of other list menus and picking one |
 | UI.notifications / subtitles | any / ui | since? | Recent HUD notifications `{seq, text}`; subtitles on screen now |
-| Dialogue.state | ui | | `{open, speaker:{refId, name}, greeting, waitingToAdvance, topics:[{index, text, neverSaid}], subtitles}` |
-| Dialogue.select | ui | index or text | Picks a topic through the dialogue menu's own `TopicClicked` handler |
-| Dialogue.start | main | refID?, loadEpoch? | Activates an NPC (default the nearest living actor) |
+| Dialogue.state | ui | debug? | `{open, phase, selectable, speaker:{refId, name}, greeting, waitingToAdvance, canSkip, topics:[{index, text, neverSaid}], lastLine, cursor, subtitles, submenu?}`. `phase` is `closed`, `npc-speaking` (an NPC talks but the menu is not up), `speaking` (a line plays, topics still show the previous list or a lone "..."), `advancing` (between lines), `topics` (selectable) or `submenu`. Also valid for conversations the NPC started. |
+| Dialogue.select | ui | index or text, force? | Picks a topic through the dialogue menu's own `TopicClicked` handler. Fails with busy (-32009) while a line is spoken unless `force`. Returns `cursor`. |
+| Dialogue.waitIdle | any (deferred) | timeoutMs? (30000, max 120000), skip?, since?, openGraceMs? | Returns when the topics are selectable again (`status: topics`, or `idle` without topics), the menu closed (`closed`), another menu opened over the dialogue (`submenu`, with its name in `submenu`) or the time ran out (`timeout`). Also `lines:[{seq, speaker, role: player\|npc, text}]` spoken since the last select/start/wait (or `since`), `waitedMs`, `cursor` and the fields of `Dialogue.state`. `skip` skips every line once it was captured. |
+| Dialogue.advance | ui | | Skips the spoken line (the menu's `SkipText` handler, what a click during speech does). `{skipped}` |
+| Dialogue.close | any (deferred) | timeoutMs? | Leaves the conversation through the menu's own exit handler, closing a menu opened from it first. `status: closed`; idempotent. |
+| Dialogue.start | main (deferred) | refID?, loadEpoch?, wait? (true) | Activates an NPC (default the nearest living actor); with `wait` replies once the dialogue menu is open (`opened`). |
 | Console.execute | main | command, target?, loadEpoch? | Runs any console command. `target` is `selected` (default), `player` or `none`. Returns `{command, lines}`, every line printed while it ran. |
 | Console.history | any | since? | Recent console lines from any source, `{lastSeq, lines:[{line, lineSeq}]}` |
 | Input.key | any | key, phase?, holdMs? | DirectInput scancode (1-255) or name (`Tab`, `E`, `Grave`, `F1` ...). `phase` is `tap` (default), `down` or `up`. |

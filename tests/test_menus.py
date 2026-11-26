@@ -47,6 +47,18 @@ class MenuHelpers(unittest.IsolatedAsyncioTestCase):
             ("Dialogue.state", {}),
         ])
 
+    async def test_dialogue_flow_calls(self):
+        await self.session.dialogue_wait(timeout_ms=5000, skip=True)
+        await self.session.dialogue_wait()
+        await self.session.dialogue_advance()
+        await self.session.dialogue_close()
+        self.assertEqual(self.socket.requests, [
+            ("Dialogue.waitIdle", {"timeoutMs": 5000, "skip": True}),
+            ("Dialogue.waitIdle", {}),
+            ("Dialogue.advance", {}),
+            ("Dialogue.close", {}),
+        ])
+
     async def test_zero_values_are_kept(self):
         await self.session.select_item("ContainerMenu", index=0, action="take", count=0)
         self.assertEqual(self.socket.requests[-1][1],

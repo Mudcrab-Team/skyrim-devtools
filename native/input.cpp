@@ -371,6 +371,24 @@ namespace
     float Radians(double degrees) { return static_cast<float>(degrees * std::numbers::pi / 180.0); }
 }
 
+namespace devtools
+{
+    bool TapControl(const std::string& control)
+    {
+        try {
+            Request request;
+            request.control = control;
+            request.phase = Phase::Tap;
+            request.hold = 60ms;
+            request.reply = std::make_shared<Reply>([](Json) {});
+            Submit(std::move(request));
+            return true;
+        } catch (const RpcError&) {
+            return false;
+        }
+    }
+}
+
 DEVTOOLS_MODULE(Input)
 {
     hooked = InstallHook();

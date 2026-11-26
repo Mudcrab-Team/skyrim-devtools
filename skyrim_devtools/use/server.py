@@ -357,13 +357,38 @@ def build_server(manager):
 
     @mcp.tool()
     async def dialogue_state() -> str:
-        """Current conversation: speaker, spoken line and selectable options (Dialogue.state)."""
+        """Current conversation (Dialogue.state): phase (closed, npc-speaking, speaking, advancing, topics,
+        submenu), selectable, speaker, topics with 0-based index, the last spoken line and a cursor. Works for
+        conversations the NPC started too."""
         return dumps(await native("Dialogue.state"))
 
     @mcp.tool()
     async def dialogue_select(index: int | None = None, text: str | None = None) -> str:
-        """Choose a dialogue option by 0-based index from dialogue_state, or by its text (Dialogue.select)."""
+        """Choose a dialogue topic by 0-based index from dialogue_state, or by its text (Dialogue.select).
+        Refused while a line is still being spoken; call dialogue_wait first. Then call dialogue_wait to
+        collect the NPC's reply and the next topics."""
         return dumps(await native("Dialogue.select", index=index, text=text))
+
+    @mcp.tool()
+    async def dialogue_wait(timeout_ms: int | None = None, skip: bool | None = None, since: int | None = None) -> str:
+        """Wait until the conversation is ready again (Dialogue.waitIdle). Returns status topics (pick one
+        with dialogue_select), idle (open, no topics), submenu (a training/barter/gift menu opened over the
+        dialogue: use that menu, close it, then wait again), closed, or timeout, together with the lines
+        spoken meanwhile [{speaker, role, text}] and the current state. skip=true skips each line as soon as
+        it is captured (fast, and what to use when audio is muted). timeout_ms 100-120000 (default 30000)."""
+        return dumps(await native("Dialogue.waitIdle", timeoutMs=timeout_ms, skip=skip, since=since))
+
+    @mcp.tool()
+    async def dialogue_advance() -> str:
+        """Skip the line being spoken, like a click during speech (Dialogue.advance). The next line or the
+        topic list follows; use dialogue_wait to collect it."""
+        return dumps(await native("Dialogue.advance"))
+
+    @mcp.tool()
+    async def dialogue_close() -> str:
+        """Leave the conversation like the player's exit button (Dialogue.close); closes a menu opened from it
+        first. Idempotent: already closed answers status closed."""
+        return dumps(await native("Dialogue.close"))
 
     @mcp.tool()
     async def ui_list_items(menu: str) -> str:
@@ -406,7 +431,8 @@ def build_server(manager):
 
     @mcp.tool()
     async def dialogue_start(ref_id: str | None = None) -> str:
-        """Start a conversation by activating an NPC (Dialogue.start); ref_id is hex, default the nearest living actor."""
+        """Start a conversation by activating an NPC (Dialogue.start); ref_id is hex, default the nearest living
+        actor. Returns once the dialogue menu is open (opened true); then call dialogue_wait for the greeting."""
         return dumps(await native("Dialogue.start", refID=ref_id))
 
     @mcp.tool()

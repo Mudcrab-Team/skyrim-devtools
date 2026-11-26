@@ -40,7 +40,7 @@ server speaks plain stdio. When the client exits the server stops the game, so a
 | Observe | `snapshot`, `list_menus {open_only}`, `events_list`, `events_subscribe`, `events_drain {types?, limit}`, `wait_for` |
 | Act | `open_menu`, `close_menu`, `console {command, target}`, `press_key`, `press_control`, `mouse`, `release_all_input`, `look {yaw_deg, pitch_deg}` |
 | Saves and world | `list_saves`, `load_save`, `reload`, `center_on_cell` |
-| State (newer plugin builds) | `player_state`, `player_inventory`, `world_nearby`, `world_crosshair`, `quest_get`, `quest_active`, `message_box`, `message_box_select`, `dialogue_state`, `dialogue_select`, `ui_list_items`, `ui_select_item`, `ui_dump`, `ui_get`, `ui_set`, `ui_invoke`, `ui_list`, `dialogue_start`, `screenshot` (image), `perf_frame_stats`, `papyrus_log` |
+| State (newer plugin builds) | `player_state`, `player_inventory`, `world_nearby`, `world_crosshair`, `quest_get`, `quest_active`, `message_box`, `message_box_select`, `dialogue_state`, `dialogue_select`, `dialogue_wait`, `dialogue_advance`, `dialogue_close`, `ui_list_items`, `ui_select_item`, `ui_dump`, `ui_get`, `ui_set`, `ui_invoke`, `ui_list`, `dialogue_start`, `screenshot` (image), `perf_frame_stats`, `papyrus_log` |
 | Generic | `rpc_methods`, `rpc_call {method, params}` |
 
 The state tools wrap native methods that older plugin builds lack. They answer "method X is not available in
@@ -52,6 +52,15 @@ for example `method=Player.state path=location.cell equals=WhiterunBanneredMare`
 
 `events_drain` returns compact `{type, seq, epoch, data}` records since the previous drain. After
 `game_start` every declared event is buffered except `console` (the `console` tool already returns its lines).
+
+## Dialogue
+
+A topic click starts spoken lines (voice takes real time) and the new topic list appears only after the last
+one. Loop: `dialogue_start` -> `dialogue_wait` (greeting and topics) -> `dialogue_select` -> `dialogue_wait` ->
+... -> `dialogue_close`. `dialogue_wait skip=true` skips each line as soon as its text was captured and is the
+fast path (and the one that works with muted audio). A trainer, merchant or gift topic opens another menu over
+the dialogue; `dialogue_wait` then answers `submenu` and the conversation stays frozen until that menu is closed
+so act in it first and leave it with the exit key (`press_control Cancel`) or `dialogue_close`; hiding a training menu with `close_menu` was followed by a frozen game within two minutes in two of two runs. Muted (headless) audio does not stall a conversation, but every line still lasts as long as its voice, so use `skip`. The plugin turns dialogue subtitles on so NPC lines can be read.
 
 ## Example transcript
 
