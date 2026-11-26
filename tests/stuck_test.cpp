@@ -63,15 +63,26 @@ int main()
         Check(v.step == Step::none, "running is not stuck");
     }
     {
-        // Backing off and returning to the same wall is still one episode, and getting clear ends it.
+        // Backing off and running back into the same wall is one episode: it must not count as getting free.
+        Detector d;
+        double now = 0.0;
+        auto wall = [](double) { return std::pair{ 0.0, 0.0 }; };
+        auto v = Run(d, now, 5.0, wall);
+        Check(v.step == Step::back, "episode starts");
+        now += 0.7;
+        v = Run(d, now, 5.0, [&](double t) { return std::pair{ std::fmod(t, 4.0) < 1.0 ? -150.0 * std::fmod(t, 4.0) : 0.0, 0.0 }; });
+        Check(!v.unstuck && v.step == Step::jump && v.failures == 2, "returning to the wall continues the episode");
+    }
+    {
+        // Genuinely free for a quiet spell: the episode ends.
         Detector d;
         double now = 0.0;
         auto v = Run(d, now, 5.0, [](double) { return std::pair{ 0.0, 0.0 }; });
-        Check(v.step == Step::back, "episode starts");
+        Check(v.step == Step::back, "episode starts again");
         now += 0.7;
         const double t0 = now;
-        v = Run(d, now, 10.0, [&](double t) { return std::pair{ (t - t0) * 200.0, 0.0 }; });
-        Check(v.unstuck && v.failures == 1, "moving away ends the episode");
+        v = Run(d, now, 12.0, [&](double t) { return std::pair{ (t - t0) * 200.0, 0.0 }; });
+        Check(v.unstuck && v.failures == 1, "a quiet spell ends the episode");
     }
     {
         // Zigzag along a wall: moves plenty but gains no distance to the goal.

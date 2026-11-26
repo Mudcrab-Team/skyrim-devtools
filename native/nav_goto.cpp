@@ -1591,7 +1591,7 @@ namespace
     {
         const auto now = tick.now;
         const auto pos = player.GetPosition();
-        if (stuck::Paused() || p.state == "door" || p.state == "waiting" || p.state == "planning") {
+        if (stuck::Paused() || p.state == "door" || p.state == "planning") {
             p.det.Reset(now);
             return;
         }

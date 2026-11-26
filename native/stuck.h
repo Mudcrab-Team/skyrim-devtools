@@ -205,11 +205,8 @@ namespace devtools::nav::stuck
                 }
                 return verdict;
             }
-            if (failures_ == 0 || (found == Reason::stuck && reason_ == Reason::stuck && std::hypot(x - anchorX_, y - anchorY_) > kRelease)) {
-                failures_ = 0;
+            if (failures_ == 0) {
                 episodeAt_ = now - (found == Reason::stuck ? cfg_.windowS : 0.0);
-                anchorX_ = x;
-                anchorY_ = y;
             }
             ++failures_;
             reason_ = found;
@@ -248,8 +245,6 @@ namespace devtools::nav::stuck
         {
             double t, x, y, walked;
         };
-
-        static constexpr double kRelease = 250.0;
 
         void Sample(double now, double x, double y)
         {
@@ -321,14 +316,16 @@ namespace devtools::nav::stuck
             return false;
         }
 
-        // An episode ends well when the player got well clear of where it began, or (for the
-        // goal-based reasons) a whole window passed without another detection.
-        bool Released(double now, double x, double y) const
+        // An episode ends well when a whole quiet spell passes without another detection: long enough for
+        // a step back and the run back to the same wall to be flagged again. Distance from the first spot
+        // is no test, because the recovery itself moves the player that far.
+        bool Released(double now, double, double) const
         {
-            if (reason_ == Reason::stuck) {
-                return !Recovering(now) && std::hypot(x - anchorX_, y - anchorY_) > kRelease;
+            if (Recovering(now)) {
+                return false;
             }
-            return now - lastDetectAt_ > std::max(cfg_.progressWindowS, cfg_.oscWindowS);
+            const double quiet = reason_ == Reason::stuck ? 2.0 * cfg_.windowS + 1.0 : std::max(cfg_.progressWindowS, cfg_.oscWindowS);
+            return now - lastDetectAt_ > quiet;
         }
 
         Config cfg_;
@@ -344,8 +341,6 @@ namespace devtools::nav::stuck
         double recoverUntil_ = 0.0;
         double episodeAt_ = 0.0;
         double lastDetectAt_ = 0.0;
-        double anchorX_ = 0.0;
-        double anchorY_ = 0.0;
         bool jumped_ = false;
         double lastJump_ = 0.0;
     };
