@@ -482,6 +482,7 @@ class ModuleLabelTests(unittest.TestCase):
         data = profile.firefox().build()
         names = [data["threads"][0]["stringArray"][n] for n in data["threads"][0]["funcTable"]["name"]]
         self.assertIn("[amdxx64.dll]", names)
+        self.assertEqual(len(profile.function_meta), len(profile.functions))
 
     def test_overhead_reports_throttling_and_other_threads(self):
         raw = raw_profile(RUNS)

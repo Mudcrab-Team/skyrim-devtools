@@ -362,6 +362,7 @@ class Profile:
                 if key not in self.function_index:
                     self.function_index[key] = len(self.functions)
                     self.functions.append(key)
+                    self.function_meta.append({"rva": None, "source": "collapsed"})
                 out.append(self.function_index[key])
             else:
                 out.append(functions[i])
@@ -1150,6 +1151,8 @@ def main(argv=None):
     exp.add_argument("--addrlib", default=None, help="versionlib-1-7-104-0.bin, to name profiles of other runtimes")
     exp.add_argument("--no-build-tables", action="store_true",
                     help="name other builds through --addrlib even when tables generated from their PDB exist")
+    exp.add_argument("--sqlite", default=None, help="also (or only) write the profile as a SQLite database")
+    exp.add_argument("--recorder", default=None, help="skyrim-use timeline .jsonl whose tool calls and narration to add as markers")
     exp.add_argument("--symbols", default=None)
     exp.add_argument("--config", type=Path, default=None)
     dif = sub.add_parser("diff", help="compare two profiles (for example with and without a mod)")
@@ -1181,12 +1184,6 @@ def main(argv=None):
     tl.add_argument("--recorder", default=None, help="skyrim-use timeline .jsonl whose tool calls and narration to overlay")
     tl.add_argument("--symbols", default=None)
     tl.add_argument("--config", type=Path, default=None)
-    ex = sub.add_parser("export", help="write a saved profile as a SQLite database")
-    ex.add_argument("profile", help="output directory or raw.json.gz")
-    ex.add_argument("--sqlite", required=True, help="database file to write")
-    ex.add_argument("--recorder", default=None, help="skyrim-use timeline .jsonl whose tool calls and narration to add as markers")
-    ex.add_argument("--symbols", default=None)
-    ex.add_argument("--config", type=Path, default=None)
     qu = sub.add_parser("query", help="run one read-only SQL statement against an exported profile")
     qu.add_argument("database", help="profile.sqlite, or an output directory that holds one")
     qu.add_argument("sql")
@@ -1225,16 +1222,6 @@ def main(argv=None):
     config = json.loads(args.config.read_text()) if args.config else None
     symbols = GameSymbols(research_root(args.symbols, config), address_library_path(args.addrlib, config),
                           build_tables=not args.no_build_tables)
-    if args.command == "export":
-        from .profile_sqlite import export_sqlite
-        from .profile_views import recorder_marks
-
-        raw = load_raw(args.profile)
-        if args.recorder and raw.get("startEpochMs"):
-            raw.setdefault("marks", []).extend(recorder_marks(args.recorder, raw["startEpochMs"], raw.get("durationS", 0) * 1000.0))
-        counts = export_sqlite(Profile(raw, symbols), args.sqlite)
-        print(json.dumps({"sqlite": str(args.sqlite), "rows": counts}))
-        return 0
     if args.command == "timeline":
         from .profile_views import recorder_marks, timeline_html
 
