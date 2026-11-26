@@ -68,5 +68,6 @@ DEVTOOLS_MODULE(World)
         const auto stopped = view::ClearPlayerCombat(view::RequirePlayer());
         const auto lines = console::Run("coc " + cell, nullptr);
         return Json{ { "cell", cell }, { "lines", lines }, { "combatCleared", stopped } };
-    }, { .thread = Thread::Main, .timeout = 30s });
+    // coc runs synchronously and a cell load on a heavy modlist takes over 30 s; answering earlier reports a failure for a load that succeeds
+    }, { .thread = Thread::Main, .timeout = 180s });
 }

@@ -145,7 +145,13 @@ DEVTOOLS_MODULE(UI)
         auto menus = Json::array();
         for (const auto& item : ui.menuMap) {
             const auto name = std::string(item.first.c_str());
-            menus.push_back({ { "name", name }, { "open", ui.IsMenuOpen(name) } });
+            Json entry{ { "name", name }, { "open", ui.IsMenuOpen(name) } };
+            // the flags tell a menu that stops the game or takes input from a HUD widget, which mods add by the dozen
+            if (const auto* menu = item.second.menu.get()) {
+                entry["pausesGame"] = menu->PausesGame();
+                entry["usesMenuContext"] = menu->UsesMenuContext();
+            }
+            menus.push_back(std::move(entry));
         }
         std::sort(menus.begin(), menus.end(), [](const Json& a, const Json& b) { return a["name"] < b["name"]; });
         return menus;

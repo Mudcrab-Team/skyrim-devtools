@@ -156,6 +156,17 @@ class ToolTests(unittest.TestCase):
             await h.text("game_stop")
         run(scenario())
 
+    def test_only_menus_that_pause_or_take_input_block_play(self):
+        from skyrim_devtools.use.combat import blocks_play
+        hud_widget = {"name": "TrueHUD", "open": True, "pausesGame": False, "usesMenuContext": False}
+        self.assertFalse(blocks_play(hud_widget))
+        self.assertTrue(blocks_play({"name": "InventoryMenu", "open": True, "pausesGame": True, "usesMenuContext": True}))
+        self.assertTrue(blocks_play({"name": "Mod Dialog", "open": True, "pausesGame": False, "usesMenuContext": True}))
+        self.assertFalse(blocks_play({"name": "InventoryMenu", "open": False, "pausesGame": True}))
+        # an older plugin sends no flags
+        self.assertFalse(blocks_play({"name": "HUD Menu", "open": True}))
+        self.assertTrue(blocks_play({"name": "InventoryMenu", "open": True}))
+
     def test_quest_targets_forwards_only_set_parameters(self):
         async def scenario():
             h = Harness()
