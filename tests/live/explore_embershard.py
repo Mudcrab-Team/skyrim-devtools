@@ -1,89 +1,101 @@
 #!/usr/bin/env python3.13
 """Live check of cell_map and explore in Embershard Mine (SPDX-License-Identifier: GPL-3.0-or-later).
 
-  python3.13 tests/live/explore_embershard.py --config mac.json [--cell EmbershardMine01] [--save Fixture] [--out DIR]
+Run by skyrim-devtools-livetest on the shared game session (setup: the Fixture save). The script enters the
+cell with `coc`, checks that cell_map finds sensible rooms, hostiles and an exit, then runs explore goal=clear
+with fight and invulnerable until it reports cleared, and checks that no hostile is left.
 
-Loads the save, enters the cell, checks that cell_map finds sensible rooms and an exit, then runs explore
-goal=clear with fight and invulnerable until the cell is cleared. Prints {"pass": bool, "details": {...}}.
-The caller holds the PC lock; this script never takes it.
+  python3.13 tests/live/explore_embershard.py --dry-run     # exercises the script against a fake game
 """
-import argparse
 import asyncio
 import json
 import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 
-from skyrim_devtools.use.manager import GameManager  # noqa: E402
 from skyrim_devtools.use.server import build_server  # noqa: E402
 
+CELL = "EmbershardMine01"
 
-async def main(options):
-    config = json.loads(Path(options.config).expanduser().read_text())
-    out = Path(options.out)
-    out.mkdir(parents=True, exist_ok=True)
-    config["cellMapsDir"] = str(out)
-    manager = GameManager(config)
-    server = build_server(manager)
+
+async def run(ctx, cell=CELL, tool=None):
+    manager = ctx.manager
     details, checks = {}, {}
+    if tool is None:
+        server = build_server(manager)
 
-    async def tool(name, **args):
-        res = await server.call_tool(name, args)
-        res = res[0] if isinstance(res, tuple) else res
-        return res[0].text
+        async def tool(name, **args):
+            res = await server.call_tool(name, args)
+            res = res[0] if isinstance(res, tuple) else res
+            return res[0].text
 
+    out = Path(ctx.artifacts) if getattr(ctx, "artifacts", None) else Path(".local/explore-live")
+    out.mkdir(parents=True, exist_ok=True)
+    manager.config["cellMapsDir"] = str(out)
     try:
-        await tool("game_start", headless=False, save=options.save)
-        await tool("console", command=f"coc {options.cell}", target="none")
+        await tool("console", command=f"coc {cell}", target="none")
         for _ in range(40):
             await asyncio.sleep(2)
             try:
-                if (await manager.call("Player.state")).get("cell") and (await manager.call("Cell.navmesh"))["triangles"]:
+                if (await manager.call("Cell.navmesh"))["triangles"]:
                     break
             except Exception:
                 pass
-        nav = await manager.call("Cell.navmesh")
-        contents = await manager.call("Cell.contents")
-        json.dump(nav, open(out / "navmesh.json", "w"))
-        json.dump(contents, open(out / "contents.json", "w"))
         began = time.monotonic()
         summary = json.loads(await tool("cell_map", format="json", plot=True))
-        details["cellMapS"] = round(time.monotonic() - began, 2)
-        details["rooms"] = summary["rooms"]
-        details["hostilesAtStart"] = summary["hostilesAlive"]
-        details["exit"] = summary["exit"]
-        details["plot"] = summary.get("plot")
+        details.update(cellMapS=round(time.monotonic() - began, 2), rooms=summary["rooms"], hostilesAtStart=summary["hostilesAlive"],
+                       exit=summary["exit"], plot=summary.get("plot"))
         checks["rooms 5..40"] = 5 <= summary["rooms"] <= 40
         checks["exit identified"] = bool(summary["exit"])
         checks["hostiles listed"] = summary["hostilesAlive"] > 0
         began = time.monotonic()
         result = json.loads(await tool("explore", goal="clear", fight=True, invulnerable=True, rooms=80, timeout_s=1200))
-        details["clearS"] = round(time.monotonic() - began, 1)
-        details["status"] = result["status"]
-        details["legs"] = len(result["legs"])
-        details["killed"] = result["killed"]
-        details["failedLegs"] = [leg for leg in result["legs"] if leg.get("outcome") != "arrived"][:10]
-        details["hostilesLeft"] = result["map"].get("hostilesAlive")
+        details.update(clearS=round(time.monotonic() - began, 1), status=result["status"], legs=len(result["legs"]),
+                       killed=result["killed"], hostilesLeft=result["map"].get("hostilesAlive"),
+                       failedLegs=[leg for leg in result["legs"] if leg.get("outcome") != "arrived"][:10])
+        if result["status"] == "stuck":
+            details["why"] = result.get("why")
+            details["hostiles"] = result.get("hostiles")
         checks["cleared"] = result["status"] == "cleared"
         checks["no hostile left"] = result["map"].get("hostilesAlive") == 0
         details["finalMap"] = await tool("cell_map", plot=True)
     except Exception as error:
         details["error"] = repr(error)
-    finally:
-        try:
-            await tool("game_stop")
-        except Exception:
-            pass
     details["checks"] = checks
-    print(json.dumps({"pass": bool(checks) and all(checks.values()) and "error" not in details, "details": details}))
+    return {"pass": bool(checks) and all(checks.values()) and "error" not in details, "details": details}
+
+
+def dry_run():
+    sys.path.insert(0, str(ROOT / "tests"))
+    import test_rooms
+    import test_use
+
+    class Ctx:
+        artifacts = ROOT / ".local" / "explore-dry"
+
+    async def go():
+        test_use.METHODS.extend(test_rooms.TOOL_METHODS)
+        h = test_use.Harness()
+        await h.text("game_start")
+        socket = h.sockets[0]
+        socket.results["Cell.navmesh"] = test_rooms.two_rooms()
+        socket.results["Cell.contents"] = test_rooms.empty_contents(actors=[])
+        socket.results["Cell.visited"] = {"points": [[600, 600, 0]]}
+        socket.results["Nav.status"] = {"active": False, "last": {"state": "arrived"}}
+        ctx = Ctx()
+        ctx.manager = h.manager
+        result = await run(ctx, tool=lambda name, **a: h.text(name, **a))
+        await h.text("game_stop")
+        return result
+
+    return asyncio.run(go())
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True)
-    parser.add_argument("--cell", default="EmbershardMine01")
-    parser.add_argument("--save", default="Fixture")
-    parser.add_argument("--out", default=".local/explore-live")
-    asyncio.run(main(parser.parse_args()))
+    if "--dry-run" in sys.argv:
+        print(json.dumps(dry_run()))
+    else:
+        raise SystemExit("run this script through skyrim-devtools-livetest")

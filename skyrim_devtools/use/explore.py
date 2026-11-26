@@ -70,14 +70,15 @@ def _ranked(model, candidates, key_room):
 
     def score(item):
         room = key_room(item)
-        far = path.get(room, 1e9) if here else 0.0
+        # rooms the navmesh does not join to ours (doors, gates, streamed sections) still get a try, after the joined ones
+        far = path.get(room, 1e8) if here else 0.0
         pos = item.get("pos") if isinstance(item, dict) else None
         if pos is None and room in model.rooms:
             pos = model.rooms[room].anchor
         return far, rooms_module.dist3(pos, player) if pos else 1e9
 
-    reachable = [c for c in candidates if not here or key_room(c) in path]
-    return sorted(reachable, key=score), len(candidates) - len(reachable)
+    unjoined = sum(1 for c in candidates if here and key_room(c) not in path)
+    return sorted(candidates, key=score), unjoined
 
 
 def ref_target(entry, kind, why):
@@ -109,13 +110,17 @@ def choose_target(model, goal, memory):
         return None, unreachable
 
     if goal == "clear":
-        hostiles = [h for h in model.hostiles() if "ref:" + h["refID"] not in skip]
+        alive = model.hostiles()
+        hostiles = [h for h in alive if "ref:" + h["refID"] not in skip]
+        if alive and not hostiles:
+            return {"status": "stuck", "why": f"{len(alive)} hostile(s) left that could not be reached or killed",
+                    "hostiles": [{"refID": h["refID"], "name": h.get("name"), "room": h.get("room")} for h in alive]}
         if not hostiles:
             return {"status": "cleared", "why": "no living hostile is left in the cell",
                     "unvisitedRooms": len(model.unvisited())}
         ranked, unreachable = _ranked(model, hostiles, lambda h: h.get("room"))
         if not ranked:
-            return {"status": "stuck", "why": f"{len(hostiles)} hostile(s) left but none is reachable over the navmesh from here"}
+            return {"status": "stuck", "why": f"{len(hostiles)} hostile(s) left but none could be ranked"}
         nearest = ranked[0]
         return ref_target(nearest, "hostile", f"nearest hostile ({nearest.get('name')}, level {nearest.get('level')})")
 
@@ -330,6 +335,9 @@ def register(mcp, native, manager, is_busy):
                         break
                     await native("Nav.goto", **nav_args)
                     result = await wait_nav(NAV_LEG_TIMEOUT_S)
+                if fights and at_hostile and result.get("state") == "failed" and fights[-1]["outcome"] == "clear" and not status.get("status") in ("dead", "outmatched"):
+                    # the interruption was the fight itself, and it was won: the leg did its job
+                    result = {**result, "state": "arrived", "reason": "fought on arrival"}
                 leg.update({"outcome": result.get("state"), "reason": result.get("reason"),
                             "elapsedS": round(time.monotonic() - leg_began, 1)})
                 if fights:

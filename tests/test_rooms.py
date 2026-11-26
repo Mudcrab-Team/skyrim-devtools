@@ -226,7 +226,7 @@ class PolicyTests(unittest.TestCase):
         model = self.model(actors=[actor("A1", "Bandit", 2800, 500)])
         memory = explore.Memory()
         memory.blocked.add("ref:A1")
-        self.assertEqual(explore.choose_target(model, "clear", memory)["status"], "cleared")
+        self.assertEqual(explore.choose_target(model, "clear", memory)["status"], "stuck")
 
     def test_loot_visits_each_container_once(self):
         model = self.model(containers=[{"refID": "C1", "name": "Chest", "pos": [2800, 900, 0], "size": 70},
@@ -367,7 +367,7 @@ class ToolTests(unittest.TestCase):
             h, socket = await self.scenario(empty_contents(actors=[actor("A1", "Bandit", 2800, 500)]))
             socket.results["Nav.status"] = {"active": False, "last": {"state": "failed", "reason": "no route"}}
             reply = json.loads(await h.text("explore", goal="clear", rooms=9))
-            self.assertEqual(reply["status"], "cleared")
+            self.assertEqual(reply["status"], "stuck")
             self.assertTrue(reply["legs"][-1]["givenUp"])
             self.assertEqual(len(reply["legs"]), 2)
             await h.text("game_stop")
