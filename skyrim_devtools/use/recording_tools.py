@@ -10,7 +10,7 @@ import time
 from .. import bench, recording
 
 POLL_S = 0.5
-REPLAY_SLACK_S = 300.0
+REPLAY_MARGIN_S = 300.0
 
 
 def dumps(value):
@@ -41,7 +41,7 @@ async def replay_and_compare(call, path, wait=True, timeout_s=None, sleep=asynci
         return started
     doc = await call("Recording.read", path=path)
     recording.validate(doc)
-    budget = timeout_s or recording.duration_ms(doc) / 1000.0 + REPLAY_SLACK_S
+    budget = timeout_s or recording.duration_ms(doc) / 1000.0 + REPLAY_MARGIN_S
     last = await wait_replay(call, started["id"], budget, sleep=sleep, clock=clock)
     result = {"replay": last}
     if last.get("finished"):
