@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // COMMUNITY(alandtse/CommonLibSSE-NG@7c27a75da3eb0db080c1f1f63f6df1b7cd733c2a, GPL-3.0-or-later)
-// Sampling CPU profiler. A sampler thread suspends each target thread, reads its context, walks its
-// stack with the modules' own unwind tables and resumes it. While a thread is suspended the sampler
-// takes no lock and allocates nothing: the target may own the heap or loader lock. A thread whose
+// Sampling CPU profiler. A sampler thread suspends each target thread, reads its context, copies the
+// live part of its stack and resumes it, then walks the copy with the modules' own unwind tables.
+// While a thread is suspended the sampler takes no lock and allocates nothing: the target may own the
+// heap or loader lock. A thread whose
 // cycle counter has not moved since its last sample is not suspended at all; its previous stack is
 // recorded again as waiting, which keeps sampling all threads cheap and marks off-CPU time.
 // Addresses are resolved only when a profile is read: module, RVA, the unwind-table function start,
@@ -25,6 +26,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <optional>
@@ -177,18 +179,64 @@ namespace
 
     // ---- the stack walk ----------------------------------------------------------------------
 
+    // Bytes of a suspended thread's stack copied per sample. Deeper stacks are cut where the copy ends.
+    constexpr std::size_t stackCopyMax = 256 * 1024;
+
     struct Stack
     {
         std::uint64_t pc[maxDepth];
         int depth = 0;
+        alignas(16) std::uint8_t copy[stackCopyMax];
+        std::size_t copied = 0;
     };
+
+    // Runs while the target is suspended, so it only copies: the walk happens after the thread resumes,
+    // which keeps the suspension to a context read and one memcpy of the live part of the stack.
+    bool CopyStack(const CONTEXT& context, std::uintptr_t stackHigh, Stack& out)
+    {
+        out.copied = 0;
+        if (context.Rsp >= stackHigh || context.Rsp & 7) {
+            return false;
+        }
+        const std::size_t size = std::min<std::size_t>(stackHigh - context.Rsp, stackCopyMax);
+        __try {
+            std::memcpy(out.copy, reinterpret_cast<const void*>(context.Rsp), size);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+        out.copied = size;
+        return true;
+    }
+
+    // Moves every register and stack word that points into the original stack range onto the copy, so
+    // frame pointers saved in the stack and restored by the unwinder land in the copy too.
+    void RebaseOntoCopy(CONTEXT& context, Stack& stack)
+    {
+        const std::uintptr_t low = context.Rsp;
+        const std::uintptr_t high = low + stack.copied;
+        const auto delta = reinterpret_cast<std::uintptr_t>(stack.copy) - low;
+        const auto rebase = [&](DWORD64& value) {
+            if (value >= low && value < high) {
+                value += delta;
+            }
+        };
+        for (DWORD64* reg = &context.Rax; reg <= &context.R15; ++reg) {
+            rebase(*reg);
+        }
+        auto* words = reinterpret_cast<DWORD64*>(stack.copy);
+        for (std::size_t i = 0; i < stack.copied / 8; ++i) {
+            rebase(words[i]);
+        }
+    }
 
     // No destructors here so the structured handler may wrap it: a torn stack ends the walk.
     // Caller frames are stored as return address minus one so they resolve inside the call.
-    void Walk(CONTEXT& context, std::uintptr_t stackHigh, Stack& out)
+    // The context has been rebased onto the stack copy, so every read stays inside the copy.
+    void Walk(CONTEXT& context, Stack& out)
     {
         out.depth = 0;
-        const std::uintptr_t stackLow = context.Rsp;
+        const auto stackLow = reinterpret_cast<std::uintptr_t>(out.copy);
+        const std::uintptr_t stackHigh = stackLow + out.copied;
         __try {
             while (out.depth < maxDepth && context.Rip) {
                 out.pc[out.depth] = out.depth == 0 ? context.Rip : context.Rip - 1;
@@ -563,12 +611,14 @@ namespace
         }
         CONTEXT context{};
         context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
-        const bool ok = GetThreadContext(target.handle, &context) != FALSE;
-        if (ok) {
-            Walk(context, target.stackHigh, scratch);
-        }
+        bool ok = GetThreadContext(target.handle, &context) != FALSE && CopyStack(context, target.stackHigh, scratch);
         ResumeThread(target.handle);
         target.suspendedSeconds += perf::Now() - before;
+        scratch.depth = 0;
+        if (ok) {
+            RebaseOntoCopy(context, scratch);
+            Walk(context, scratch);
+        }
         // The cycle count is read again after the walk so the next sample compares like with like.
         QueryThreadCycleTime(target.handle, &cycles);
         target.lastCycles = cycles;
