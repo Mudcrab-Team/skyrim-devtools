@@ -1,6 +1,7 @@
 import importlib.machinery
 import importlib.util
 import os
+import signal
 from pathlib import Path
 import sys
 import time
@@ -121,6 +122,61 @@ class LeaseTests(unittest.TestCase):
         self.assertEqual(status, 125)
 
 
+class QueuedHoldTests(unittest.TestCase):
+    def run_hold(self, wait):
+        calls = []
+        scripts = []
+
+        class Host:
+            def run_powershell(self, script, **kwargs):
+                scripts.append(script)
+                # a queued agent has no lock to refresh, so the remote answers 4 until the wait ends
+                return types.SimpleNamespace(returncode=0 if waited else 4, stderr="")
+
+        waited = []
+
+        def remote(host, args):
+            calls.append(args)
+            code = wait(args)
+            if "-Action lock" in args:
+                waited.append(True)
+            return code
+
+        with mock.patch.object(pc_build, "run_remote", remote), mock.patch.object(pc_build, "HEARTBEAT_SECONDS", 0.01), \
+                mock.patch.object(pc_build, "RETRY_DELAY", 0):
+            try:
+                status = pc_build.hold(Host(), options(1), [sys.executable, "-c", "pass"])
+            except SystemExit as exit_:
+                status = exit_.code
+        return status, calls, scripts
+
+    def test_queue_ticket_is_pinged_while_waiting_and_not_mistaken_for_a_lost_lock(self):
+        def wait(args):
+            if "-Action lock" in args:
+                time.sleep(0.2)
+            return 0
+
+        status, _, scripts = self.run_hold(wait)
+        self.assertEqual(status, 0)
+        self.assertTrue(scripts and all("-Refresh" in s for s in scripts))
+
+    def test_killed_while_queued_still_releases_so_the_ticket_is_removed(self):
+        def wait(args):
+            if "-Action lock" in args:
+                os.kill(os.getpid(), signal.SIGTERM)
+                time.sleep(1)
+            return 0
+
+        status, calls, _ = self.run_hold(wait)
+        self.assertEqual(status, 128 + signal.SIGTERM)
+        self.assertEqual(len([c for c in calls if "-Action unlock" in c]), 1)
+
+    def test_failed_wait_also_releases(self):
+        status, calls, _ = self.run_hold(lambda args: 4 if "-Action lock" in args else 0)
+        self.assertEqual(status, 4)
+        self.assertEqual(len([c for c in calls if "-Action unlock" in c]), 1)
+
+
 class RemoteScriptTests(unittest.TestCase):
     """The lock logic is PowerShell and cannot run on the Mac; these pin the rules the Mac side relies on."""
 
@@ -140,6 +196,25 @@ class RemoteScriptTests(unittest.TestCase):
 
     def test_orphaned_waiter_gives_up(self):
         self.assertIn("Test-ParentAlive", self.script)
+
+    def test_orphan_check_watches_the_whole_session_chain(self):
+        self.assertIn("function Get-ParentChain", self.script)
+        self.assertIn("foreach ($entry in $chain)", self.script)
+
+    def test_leased_waiter_does_not_refresh_its_own_ticket(self):
+        self.assertIn("if (-not $Lease) { (Get-Item $ticket).LastWriteTime = Get-Date }", self.script)
+        self.assertIn("if ($Lease -and $queued -and (-not $mine", self.script)
+        self.assertIn("-gt $pingGraceSeconds", self.script)
+
+    def test_refresh_pings_a_queued_ticket_and_unlock_removes_it(self):
+        self.assertIn("'ticket refreshed'", self.script)
+        unlock = self.script[self.script.index("if ($Action -eq 'unlock')"):]
+        self.assertLess(unlock.index('.ticket'), unlock.index("Remove-Lock"))
+
+    def test_queued_waiter_takes_over_a_stale_lock_itself(self):
+        loop = self.script[self.script.index("function Acquire-Lock"):]
+        self.assertLess(loop.index("while ($true)"), loop.index("Test-LockStale"))
+        self.assertLess(loop.index("Test-LockStale"), loop.index("Start-Sleep"))
 
 
 if __name__ == "__main__":

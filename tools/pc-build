@@ -211,23 +211,24 @@ def hold(host, options, argv):
     # takes it under its own name and hands that name to nested pc-build calls (a --deploy inside the command).
     name = f"{options.name}.{os.getpid()}"
     wait = f"-Action lock -Agent {name} -LockWait {options.lock_wait} -Lease{LOCK_ARGS}"
-    code = run_remote(host, wait)
-    if code:
-        fail(f"could not take agent.lock (exit {code}); it is held by another agent", code)
     stop = threading.Event()
     lost = threading.Event()
+    holding = threading.Event()
 
     def beat():
+        # While queued the same call keeps our ticket alive: the PC-side waiter outlives a killed ssh client,
+        # so only these pings tell it the client is still there, and it gives up once they stop.
         while not stop.wait(HEARTBEAT_SECONDS):
             result = host.run_powershell(remote_script(f"-Action lock -Agent {name} -LockWait 0 -Refresh{LOCK_ARGS}"), check=False)
-            if result.returncode == 4:
+            if result.returncode == 4 and holding.is_set():
                 # the remote says another agent owns it now (our lease lapsed); other failures are network trouble
                 lost.set()
                 print("pc-build: agent.lock refresh failed; the lock is no longer ours", file=sys.stderr)
-            elif result.returncode:
+            elif result.returncode and result.returncode != 4:
                 print(f"pc-build: agent.lock refresh could not reach the PC (exit {result.returncode}); retrying", file=sys.stderr)
 
-    # a terminate or hangup of pc-build itself must still run the release below
+    # a terminate or hangup of pc-build itself must still run the release below, also while still queued:
+    # the release removes our ticket so the remote waiter cannot take the lock afterwards
     previous = {}
     for sig in (signal.SIGTERM, signal.SIGHUP):
         previous[sig] = signal.signal(sig, lambda number, frame: sys.exit(128 + number))
@@ -235,6 +236,10 @@ def hold(host, options, argv):
     thread.start()
     status = 1
     try:
+        code = run_remote(host, wait)
+        if code:
+            fail(f"could not take agent.lock (exit {code}); it is held by another agent", code)
+        holding.set()
         status = supervise(argv, options.max_minutes * 60, dict(os.environ, **{HELD_ENV: name}))
     finally:
         stop.set()

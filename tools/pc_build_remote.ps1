@@ -73,6 +73,8 @@ function Remove-Lock {
 # is still created atomically, so the queue only decides who may try.
 $queuePath = Join-Path $root $(if ($LockFile -eq 'agent.lock') { 'agent.queue' } else { "$LockFile.queue" })
 $ticketTtlSeconds = $leaseSeconds
+# Pings come every 20 s; a leased waiter whose last ping is older than this stops, well before its ticket expires.
+$pingGraceSeconds = 60
 
 function Get-Queue {
     if (-not (Test-Path $queuePath)) { return @() }
@@ -91,25 +93,48 @@ function Get-Queue {
 
 # When the SSH session that started this script dies, the script may outlive it; a waiter must not go on
 # queueing (and then take the lock) for a client that is gone.
-function Get-ParentId {
-    try { (Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction Stop).ParentProcessId } catch { $null }
+# The direct parent is only the login shell, which stays alive while its child runs, so the whole chain up to the
+# sshd session is watched; a process is matched by start time too, so a reused id does not look alive.
+function Get-ParentChain {
+    $chain = @()
+    $id = $PID
+    try {
+        for ($depth = 0; $depth -lt 4; $depth++) {
+            $info = Get-CimInstance Win32_Process -Filter "ProcessId=$id" -ErrorAction Stop
+            $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$($info.ParentProcessId)" -ErrorAction Stop
+            if (-not $parent -or $parent.Name -notmatch '^(powershell|pwsh|cmd|sshd|sshd-session)(\.exe)?$') { break }
+            $chain += [pscustomobject]@{ Id = $parent.ProcessId; Started = $parent.CreationDate }
+            $id = $parent.ProcessId
+        }
+    } catch { }
+    return $chain
 }
 
-function Test-ParentAlive($parentId) {
-    if (-not $parentId) { return $true }
-    return [bool](Get-Process -Id $parentId -ErrorAction SilentlyContinue)
+function Test-ParentAlive($chain) {
+    foreach ($entry in $chain) {
+        $process = Get-Process -Id $entry.Id -ErrorAction SilentlyContinue
+        if (-not $process) { return $false }
+        try { if ([math]::Abs(($process.StartTime - $entry.Started).TotalSeconds) -gt 2) { return $false } } catch { }
+    }
+    return $true
 }
 
 function Acquire-Lock([string]$who, [int]$waitSeconds) {
-    $parentId = Get-ParentId
+    $parentId = Get-ParentChain
     $deadline = (Get-Date).AddSeconds($waitSeconds)
     $ticket = $null
+    $queued = $false
     try {
         while ($true) {
             if ((Get-LockOwner) -eq $who) { return $true }
             if (-not (Test-ParentAlive $parentId)) { Write-Host "client session of $who is gone; giving up"; return $false }
             $queue = @(Get-Queue)
             $mine = $queue | Where-Object { $_.Agent -eq $who } | Select-Object -First 1
+            # A leased waiter's ticket is touched only by its client's pings, never by this loop: a ticket that
+            # lapsed or was removed means the client is gone, and this process must not take the lock for it.
+            if ($Lease -and $queued -and (-not $mine -or ((Get-Date) - (Get-Item $mine.Path).LastWriteTime).TotalSeconds -gt $pingGraceSeconds)) {
+                Write-Host "client of $who stopped pinging; giving up"; return $false
+            }
             $ahead = @($queue | Where-Object { $_.Agent -ne $who -and (-not $mine -or $_.Name -lt $mine.Name) })
             if ($ahead.Count -eq 0) {
                 if (Test-LockStale) {
@@ -128,10 +153,11 @@ function Acquire-Lock([string]$who, [int]$waitSeconds) {
             }
             if ((Get-Date) -ge $deadline) { return $false }
             New-Item -ItemType Directory -Force $queuePath | Out-Null
-            if ($mine) { $ticket = $mine.Path; (Get-Item $ticket).LastWriteTime = Get-Date }
+            if ($mine) { $ticket = $mine.Path; if (-not $Lease) { (Get-Item $ticket).LastWriteTime = Get-Date } }
             else {
                 $ticket = Join-Path $queuePath ('{0:D19}_{1}.ticket' -f [DateTime]::UtcNow.Ticks, $who)
                 Set-Content $ticket $who
+                $queued = $true
                 Write-Host "queued as $who behind $($ahead.Count) waiting agent(s); lock held by '$(Get-LockOwner)'"
             }
             Start-Sleep -Seconds 5
@@ -148,6 +174,9 @@ if ($Action -eq 'lock' -and $Refresh) {
     # touches it to keep the lock (a leased hold must do so within $leaseSeconds). A holder that already lost it learns so from the exit code.
     if (-not $Agent) { Write-Output 'lock --refresh needs an agent name'; exit 2 }
     if ((Get-LockOwner) -eq $Agent) { (Get-Item $lockPath).LastWriteTime = Get-Date; Write-Output 'lock refreshed'; exit 0 }
+    # still queued: the ping keeps this agent's ticket (and its waiting process) alive
+    $waiting = @(Get-ChildItem $queuePath -Filter "*_$Agent.ticket" -ErrorAction SilentlyContinue)
+    if ($waiting.Count) { foreach ($file in $waiting) { $file.LastWriteTime = Get-Date }; Write-Output 'ticket refreshed'; exit 0 }
     Write-Output "agent.lock is held by '$(Get-LockOwner)', not '$Agent'; refresh failed"
     exit 4
 }
@@ -160,6 +189,10 @@ if ($Action -eq 'lock') {
 if ($Action -eq 'unlock') {
     if (-not $Agent) { Write-Output 'unlock needs an agent name'; exit 2 }
     $owner = Get-LockOwner
+    # a client that quits while queued must not leave a waiter behind that takes the lock later
+    foreach ($file in @(Get-ChildItem $queuePath -Filter "*_$Agent.ticket" -ErrorAction SilentlyContinue)) {
+        Remove-Item $file.FullName -Force -ErrorAction SilentlyContinue
+    }
     if ($owner -eq $Agent) { Remove-Lock; Write-Output 'lock released' }
     elseif ($owner) { Write-Output "agent.lock belongs to '$owner'; left alone"; exit 4 }
     exit 0
