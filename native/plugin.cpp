@@ -76,6 +76,21 @@ namespace
         return value;
     }
 
+    std::vector<std::string> ModuleAllowList()
+    {
+        std::vector<std::string> names;
+        const auto text = Environment("SKYRIM_DEVTOOLS_MODULES");
+        for (std::size_t start = 0; start < text.size();) {
+            auto end = text.find(',', start);
+            end = end == std::string::npos ? text.size() : end;
+            if (end > start) {
+                names.push_back(text.substr(start, end - start));
+            }
+            start = end + 1;
+        }
+        return names;
+    }
+
     void RequestClose()
     {
         if (const auto window = devtools::MainWindow()) {
@@ -135,7 +150,7 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* skse)
     if (hooks != MH_OK && hooks != MH_ERROR_ALREADY_INITIALIZED) {
         return false;
     }
-    devtools::InstallModules();
+    devtools::InstallModules(ModuleAllowList());
 
     devtools::ServerOptions options;
     options.port = *port;

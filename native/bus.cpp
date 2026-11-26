@@ -219,10 +219,12 @@ namespace devtools
         Modules().emplace_back(name, install);
     }
 
-    void InstallModules()
+    void InstallModules(const std::vector<std::string>& only)
     {
         for (const auto& [name, install] : Modules()) {
-            install();
+            if (only.empty() || std::find(only.begin(), only.end(), name) != only.end()) {
+                install();
+            }
         }
     }
 

@@ -75,7 +75,9 @@ namespace devtools
     };
 
     // Runs every module's install block once SKSE is initialised.
-    void InstallModules();
+    // An empty allow-list installs every module; otherwise only the named ones, so a leak or a hook can be
+    // bisected by module without rebuilding.
+    void InstallModules(const std::vector<std::string>& only = {});
 }
 
 #define DEVTOOLS_MODULE(id)                                                           \
