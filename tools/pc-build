@@ -6,7 +6,7 @@
   tools/pc-build --config mac.json commonlib         (re)build the shared CommonLibSSE-NG once
   tools/pc-build --config mac.json lock|unlock       hold agent.lock around a live run
   tools/pc-build --config mac.json lock --refresh    heartbeat: a manual lock goes stale 25 min after its last refresh
-  tools/pc-build --config mac.json hold --lock-wait 1200 -- CMD ARGS...
+  tools/pc-build --config mac.json hold --lock-wait 10800 -- CMD ARGS...
                                                      take the lock (queued) as a lease, run CMD with a background
                                                      heartbeat every 20 s (a hold silent for 90 s is taken over), release the lock when CMD ends; CMD is stopped
                                                      after --max-minutes (default 20) so one hold stays bounded; the
