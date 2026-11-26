@@ -4,11 +4,12 @@ The report names game functions from a local skyrim-research checkout (config "r
 SKYRIM_DEVTOOLS_RESEARCH variable); without one it falls back to Address Library IDs and sub_<rva>.
 """
 
+import asyncio
 import json
 from pathlib import Path
 import time
 
-from .. import profile_views, profiling
+from .. import profile_gpa, profile_sqlite, profile_views, profiling
 
 
 def dumps(value):
@@ -16,7 +17,7 @@ def dumps(value):
 
 
 def register(mcp, native, manager, recorder=None):
-    state = {"symbols": None}
+    state = {"symbols": None, "sqlite": None, "gpuCounters": None}
 
     def symbols():
         if state["symbols"] is None:
@@ -24,10 +25,14 @@ def register(mcp, native, manager, recorder=None):
         return state["symbols"]
 
     @mcp.tool()
-    async def profile_start(threads: str = "all", hz: float = 1000.0, duration_s: float = 30.0) -> str:
+    async def profile_start(threads: str = "all", hz: float = 1000.0, duration_s: float = 30.0,
+                            gpu_counters: bool = False) -> str:
         """Start the sampling CPU profiler (Profile.start). threads: main (the game thread), frame (the thread
         that presents), all, or comma-separated thread ids / name fragments. hz 10-4000 (default 1000);
-        duration_s caps the run (max 600). Do the thing to profile, then call profile_stop."""
+        duration_s caps the run (max 600). Do the thing to profile, then call profile_stop. gpu_counters: on an
+        AMD GPU with GPUPerfAPI installed (config gpaDir), profile_stop also captures hardware counters for a
+        few seconds after the CPU profile (see profile_gpu_counters)."""
+        state["gpuCounters"] = gpu_counters
         return dumps(await native("Profile.start", threads=threads, hz=hz, durationS=duration_s))
 
     @mcp.tool()
@@ -37,9 +42,14 @@ def register(mcp, native, manager, recorder=None):
         thread waited on, slow frames (>100 ms) with their stacks and wait chain, sampler overhead and the
         share of game samples with a real function name. Also writes raw data, a Firefox Profiler profile
         (profile.json.gz, open at profiler.firefox.com) and flame graph SVGs and timeline.html (threads, frames, cell loads, tool calls and
-        hitches on one zoomable time axis) to out_dir (default
-        .local/profiles/<stamp> on this machine) and returns their paths."""
+        hitches on one zoomable time axis), and profile.sqlite (for profile_query) to out_dir (default
+        .local/profiles/<stamp> on this machine) and returns their paths. The gpu section has per-frame GPU time,
+        passes, whether frames were GPU- or CPU-bound and, on AMD with the ADLX helper, board metrics (clocks, power,
+        temperature, fan, VRAM); gpuCounters holds the GPUPerfAPI result when profile_start asked for it."""
         raw, _ = await profiling.fetch(native)
+        if state["gpuCounters"]:
+            state["gpuCounters"] = False
+            raw["gpaCounters"] = await gpa(None, None, 600)
         if recorder is not None and raw.get("startEpochMs"):
             raw.setdefault("marks", []).extend(profile_views.recorder_marks(
                 recorder.path, raw["startEpochMs"], raw.get("durationS", 0) * 1000.0))
@@ -47,11 +57,38 @@ def register(mcp, native, manager, recorder=None):
         out = Path(out_dir).expanduser() if out_dir else profiling.default_out()
         paths, summary = profiling.save_outputs(profile, out)
         summary["files"] = paths
+        state["sqlite"] = paths.get("sqlite")
         for key in ("main", "all"):
             if key in summary:
                 for field in ("topSelf", "topTotal"):
                     summary[key][field] = summary[key][field][:top]
         return dumps(summary)
+
+    async def gpa(directory, counters, max_frames):
+        directory = profile_gpa.gpa_dir(directory, manager.config)
+        if not directory:
+            return {"ok": False, "error": "GPUPerfAPI folder unknown: set config gpaDir or SKYRIM_DEVTOOLS_GPA_DIR"}
+        try:
+            return await profile_gpa.capture(native, directory, counters, max_frames)
+        except Exception as error:  # noqa: BLE001 - reported to the caller as data
+            return {"ok": False, "error": f"{type(error).__name__}: {error}"}
+
+    @mcp.tool()
+    async def profile_gpu_counters(action: str = "capture", counters: list[str] | None = None, max_frames: int = 600,
+                                   gpa_dir: str | None = None) -> str:
+        """AMD hardware GPU counters through GPUPerfAPI (opt-in; needs GPA's DLLs on the game PC, config gpaDir).
+        action "list": counters this GPU and D3D11 offer, with the default set. action "capture": one frame per
+        counter pass (GPA reads a few counters per pass), so values combine consecutive frames of the same scene;
+        returns per-counter frame values (GPU busy, shader busy per stage, cache hit rates, memory traffic, stalls),
+        the heaviest clear-delimited samples and the fps cost while capturing. Does not touch a running CPU profile's
+        samples beyond the slower frames."""
+        directory = profile_gpa.gpa_dir(gpa_dir, manager.config)
+        if action == "list":
+            if not directory:
+                return dumps({"ok": False, "error": "GPUPerfAPI folder unknown: set config gpaDir or SKYRIM_DEVTOOLS_GPA_DIR"})
+            return dumps(await profile_gpa.list_counters(native, directory))
+        result = await gpa(directory, counters, max_frames)
+        return dumps(profile_gpa.summarize(result) if result.get("ok") else result)
 
     @mcp.tool()
     async def profile_status() -> str:
@@ -90,3 +127,19 @@ def register(mcp, native, manager, recorder=None):
         """Put a named span ending now on the running profile's timeline (kind: marker, alert, narrate or your
         own word). Ignored when no profile is running."""
         return dumps(await native("Profile.mark", kind=kind, name=name, durationMs=duration_ms))
+
+    @mcp.tool()
+    async def profile_query(sql: str, path: str | None = None, limit: int = 200) -> str:
+        """Run one read-only SQL statement (SQLite) against a profile database: path to a profile.sqlite, or by
+        default the one the last profile_stop wrote. Tables: Frames (frame, start, end, frame_ms, cpu_ms, gpu_ms,
+        hitch, bound), CpuSamples, Callchains (depth 0 = leaf), Symbols, ThreadNames, Markers, GpuRanges,
+        Counters, Meta, StringIds; views SymbolsV, LeafSamplesV, MarkersV, GpuRangesV, CountersV, ThreadsV join
+        names in. Times are ms from the profile start. Writes, ATTACH and PRAGMA are refused; at most `limit`
+        rows come back. Example queries are in docs/profiling.md, SQLite export."""
+        target = path or state["sqlite"]
+        if not target:
+            return dumps({"error": "no profile database yet: run profile_start/profile_stop or pass path"})
+        try:
+            return dumps(await asyncio.to_thread(profile_sqlite.query, target, sql, max(1, min(limit, 5000))))
+        except Exception as error:
+            return dumps({"error": f"{type(error).__name__}: {error}"})

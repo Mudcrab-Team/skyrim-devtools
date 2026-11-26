@@ -293,6 +293,7 @@ class Profile:
         self.kinds = [module_kind(m) for m in self.modules]
         self.sources = Counter()
         self.functions = []      # (label, module name, kind)
+        self.function_meta = []  # {"rva": function start (or address) RVA, "source": where the name came from}
         self.function_index = {}
         self.opaque = {}         # function index -> module name, for frames in modules without symbols
         self.frame_function = [self._function(f) for f in raw.get("frames", [])]
@@ -322,6 +323,8 @@ class Profile:
             self.functions.append(key)
             if source == "module-offset":
                 self.opaque[self.function_index[key]] = key[1]
+            start = frame.get("start")
+            self.function_meta.append({"rva": start if start is not None else frame.get("rva"), "source": source})
         return self.function_index[key]
 
     @staticmethod
@@ -359,6 +362,7 @@ class Profile:
                 if key not in self.function_index:
                     self.function_index[key] = len(self.functions)
                     self.functions.append(key)
+                    self.function_meta.append({"rva": None, "source": "collapsed"})
                 out.append(self.function_index[key])
             else:
                 out.append(functions[i])
@@ -553,6 +557,14 @@ class Profile:
             report["all"] = self.report("all", top=top)
             report["threads"] = self.thread_table()[:15]
         report["hitches"] = self.hitches()
+        if "gpu" in self.raw:
+            from .profile_gpu import gpu_summary
+
+            report["gpu"] = gpu_summary(self)
+        if self.raw.get("gpaCounters"):
+            from .profile_gpa import summarize
+
+            report["gpuCounters"] = summarize(self.raw["gpaCounters"])
         if "context" in self.raw:
             report["context"] = self.raw["context"]
         return report
@@ -812,6 +824,9 @@ def save_outputs(profile, out_dir, title="Skyrim SE"):
     (out_dir / "report.json").write_text(json.dumps(summary, indent=1), encoding="utf-8")
     (out_dir / "report.txt").write_text(render_text(summary), encoding="utf-8")
     paths["report"] = out_dir / "report.txt"
+    if profile.raw.get("gpaCounters"):
+        (out_dir / "gpu-counters.json").write_text(json.dumps(profile.raw["gpaCounters"], indent=1), encoding="utf-8")
+        paths["gpuCounters"] = out_dir / "gpu-counters.json"
     from .profile_firefox import write
 
     paths["firefox"] = write(profile_firefox_data(profile), out_dir / "profile.json.gz")
@@ -830,6 +845,10 @@ def save_outputs(profile, out_dir, title="Skyrim SE"):
 
     (out_dir / "timeline.html").write_text(timeline_html(profile, f"{title} timeline"), encoding="utf-8")
     paths["timeline"] = out_dir / "timeline.html"
+    from .profile_sqlite import export_sqlite
+
+    export_sqlite(profile, out_dir / "profile.sqlite")
+    paths["sqlite"] = out_dir / "profile.sqlite"
     return {k: str(v) for k, v in paths.items()}, summary
 
 
@@ -881,6 +900,36 @@ def render_text(summary, top=10):
             lines.append("top waits (off-CPU leaf):")
             for r in report["topWaits"][:5]:
                 lines.append(f"  {r['pct']:6.2f}%  {r['function']}  [{r['module']}]")
+    gpu = summary.get("gpu")
+    if gpu:
+        lines.append("")
+        board = gpu.get("board") or {}
+        if board.get("source"):
+            shown = ", ".join(f"{name.removeprefix('gpu_')} {m['mean']} (max {m['max']})" for name, m in board["metrics"].items())
+            lines.append(f"== GPU board ({board['source']}, {board.get('gpu')}, mean over {board['samples']} samples): {shown}")
+        if not gpu.get("frames"):
+            lines.append(f"== GPU: no timed frames ({gpu.get('reason') or 'none in this window'})")
+        else:
+            lines.append(f"== GPU: {gpu['frames']} of {gpu['presented']} frames timed; gpu p50 {gpu['gpuMsP50']} ms, p95 "
+                         f"{gpu['gpuMsP95']} ms, max {gpu['gpuMsMax']} ms; main-thread cpu p50 {gpu['cpuMsP50']} ms; "
+                         f"frame p50 {gpu['frameMsP50']} ms")
+            from .profile_gpu import BOUND_LABELS
+
+            lines.append("bound by: " + ", ".join(f"{BOUND_LABELS[k]} {v}%" for k, v in gpu["boundPct"].items()) +
+                         f"; timing cost {gpu['hookUsPerFrame']} us/frame")
+            if gpu.get("pacedPct"):
+                busy = gpu.get("gpuBusyMsP50")
+                lines.append(f"the GPU kept up with the CPU's submissions in {gpu['pacedPct']}% of frames (GPU span "
+                             f"minus CPU issue span p50 {gpu.get('excessMsP50')} ms), so pass times there include "
+                             f"waiting for commands; GPU busy p50 ~{busy if busy is not None else '-'} ms"
+                             + (f" from {gpu['utilPctMean']}% utilisation" if gpu.get("utilPctMean") is not None else ""))
+            for r in gpu["passes"]:
+                lines.append(f"  {r['pct']:6.2f}%  {r['msPerFrame']:7.3f} ms  {r['pass']}  ({r['kind']})")
+    if summary.get("gpuCounters"):
+        from .profile_gpa import render
+
+        lines.append("")
+        lines.extend(render(summary["gpuCounters"]))
     for hitch in summary.get("hitches", [])[:10]:
         lines.append("")
         lines.append(f"hitch frame {hitch['frame']}: {hitch['ms']} ms, {hitch['samples']} samples, waiting {hitch['waitingPct']}%")
@@ -988,6 +1037,8 @@ async def record(args):
         raw, summary = await fetch(manager.call)
         raw["context"] = {"phase": args.phase, "fps": stats.get("fps"), "p50Ms": stats.get("p50Ms"),
                           "p99Ms": stats.get("p99Ms"), "frames": stats.get("count"), "sinceFrame": frame}
+        if args.gpu_counters:
+            raw["gpaCounters"] = await gpa_window(manager, args, config)
         with_name = Profile(raw, symbols)
         paths, report = save_outputs(with_name, out, title=f"Skyrim SE {args.phase}")
         print(render_text(report))
@@ -997,32 +1048,21 @@ async def record(args):
             await manager.stop()
 
 
-def export_command(args, symbols):
-    from . import profile_firefox
+async def gpa_window(manager, args, config):
+    """GPUPerfAPI counters after the CPU profile, under the same load, so its replay passes never land in it."""
+    from .profile_gpa import capture, gpa_dir
 
-    source = Path(args.profile)
-    out = Path(args.firefox) if args.firefox else (source if source.is_dir() else source.parent) / "profile.json.gz"
-    data = profile_firefox_data(Profile(load_raw(source), symbols))
-    problems = profile_firefox.check(data)
-    if problems:
-        raise SystemExit("Firefox export failed its checks: " + "; ".join(problems))
-    profile_firefox.write(data, out)
-    print(f"wrote {out}")
-    if args.open:
-        server, url = profile_firefox.serve(out, open_browser=not args.no_browser)
-        print(f"serving on 127.0.0.1 for {url}\n(the browser reads it from this machine; do not press Upload). Ctrl+C stops.")
-        try:
-            while True:
-                time.sleep(3600)
-        except KeyboardInterrupt:
-            server.shutdown()
-            server.server_close()
-    return 0
-
-
-def profile_firefox_data(profile):
-    """The Firefox profile with everything this build records; save_outputs and export share it."""
-    return profile.firefox().build()
+    directory = gpa_dir(args.gpa_dir, config)
+    if not directory:
+        return {"ok": False, "error": "--gpu-counters needs --gpa-dir, config gpaDir or SKYRIM_DEVTOOLS_GPA_DIR"}
+    counters = [c for c in (args.gpa_counters or "").split(",") if c] or None
+    load = asyncio.create_task(drive(manager, args.phase))
+    try:
+        return await capture(manager.call, directory, counters, args.gpa_frames)
+    except Exception as error:  # noqa: BLE001 - the CPU profile is still worth writing
+        return {"ok": False, "error": f"{type(error).__name__}: {error}"}
+    finally:
+        load.cancel()
 
 
 async def top(args):
@@ -1059,6 +1099,55 @@ async def top(args):
             await manager.stop()
 
 
+def export_command(args, symbols):
+    from . import profile_firefox
+
+    source = Path(args.profile)
+    raw = load_raw(source)
+    if args.recorder and raw.get("startEpochMs"):
+        from .profile_views import recorder_marks
+
+        raw.setdefault("marks", []).extend(recorder_marks(args.recorder, raw["startEpochMs"], raw.get("durationS", 0) * 1000.0))
+    profile = Profile(raw, symbols)
+    if args.sqlite:
+        from .profile_sqlite import export_sqlite
+
+        counts = export_sqlite(profile, args.sqlite)
+        print(json.dumps({"sqlite": str(args.sqlite), "rows": counts}))
+        if not args.firefox and not args.open:
+            return 0
+    out = Path(args.firefox) if args.firefox else (source if source.is_dir() else source.parent) / "profile.json.gz"
+    data = profile_firefox_data(profile)
+    problems = profile_firefox.check(data)
+    if problems:
+        raise SystemExit("Firefox export failed its checks: " + "; ".join(problems))
+    profile_firefox.write(data, out)
+    print(f"wrote {out}")
+    if args.open:
+        server, url = profile_firefox.serve(out, open_browser=not args.no_browser)
+        print(f"serving on 127.0.0.1 for {url}\n(the browser reads it from this machine; do not press Upload). Ctrl+C stops.")
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            server.shutdown()
+            server.server_close()
+    return 0
+
+
+def profile_firefox_data(profile):
+    """The Firefox profile with everything this build records; save_outputs and export share it."""
+    from .profile_gpu import firefox_tracks
+
+    export = profile.firefox()
+    firefox_tracks(export, profile)
+    # AMD board metrics (ADLX) as counter tracks; added last so GPU-timing tracks keep their own names.
+    from .profile_gpu import firefox_board_tracks
+
+    firefox_board_tracks(export, profile.raw)
+    return export.build()
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="skyrim-devtools-profile", description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1082,6 +1171,11 @@ def main(argv=None):
                     help="name other builds through --addrlib even when tables generated from their PDB exist")
     rec.add_argument("--symbols", default=None, help="skyrim-research checkout with the symbol tables")
     rec.add_argument("--out", default=None, help="output directory (default .local/profiles/<stamp>)")
+    rec.add_argument("--gpu-counters", action="store_true",
+                     help="after the profile, capture AMD GPUPerfAPI hardware counters (docs/profiling.md, AMD counters)")
+    rec.add_argument("--gpa-dir", default=None, help="folder with GPUPerfAPIDX11-x64.dll on the game PC (or config gpaDir)")
+    rec.add_argument("--gpa-counters", default=None, help="comma-separated GPA counter names (default: a busy/cache/stall set)")
+    rec.add_argument("--gpa-frames", type=int, default=600, help="give up after this many frames")
     rep = sub.add_parser("report", help="re-symbolise a saved profile and print or rewrite its report")
     rep.add_argument("profile", help="output directory or raw.json.gz")
     rep.add_argument("--addrlib", default=None, help="versionlib-1-7-104-0.bin, to name profiles of other runtimes")
@@ -1101,6 +1195,8 @@ def main(argv=None):
     exp.add_argument("--addrlib", default=None, help="versionlib-1-7-104-0.bin, to name profiles of other runtimes")
     exp.add_argument("--no-build-tables", action="store_true",
                     help="name other builds through --addrlib even when tables generated from their PDB exist")
+    exp.add_argument("--sqlite", default=None, help="also (or only) write the profile as a SQLite database")
+    exp.add_argument("--recorder", default=None, help="skyrim-use timeline .jsonl whose tool calls and narration to add as markers")
     exp.add_argument("--symbols", default=None)
     exp.add_argument("--config", type=Path, default=None)
     dif = sub.add_parser("diff", help="compare two profiles (for example with and without a mod)")
@@ -1132,7 +1228,32 @@ def main(argv=None):
     tl.add_argument("--recorder", default=None, help="skyrim-use timeline .jsonl whose tool calls and narration to overlay")
     tl.add_argument("--symbols", default=None)
     tl.add_argument("--config", type=Path, default=None)
+    qu = sub.add_parser("query", help="run one read-only SQL statement against an exported profile")
+    qu.add_argument("database", help="profile.sqlite, or an output directory that holds one")
+    qu.add_argument("sql")
+    qu.add_argument("--limit", type=int, default=200)
+    qu.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
+    if args.command == "query":
+        import sqlite3
+
+        from .profile_sqlite import query
+
+        database = Path(args.database)
+        try:
+            result = query(database / "profile.sqlite" if database.is_dir() else database, args.sql, args.limit)
+        except (sqlite3.Error, FileNotFoundError) as error:
+            print(f"query failed: {error} (read-only: SELECT only)", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(result, indent=1))
+        else:
+            print("\t".join(result["columns"]))
+            for row in result["rows"]:
+                print("\t".join("" if v is None else str(v) for v in row))
+            if result["truncated"]:
+                print(f"(first {args.limit} rows)")
+        return 0
     if args.command == "record":
         asyncio.run(record(args))
         return 0

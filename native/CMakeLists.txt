@@ -33,9 +33,19 @@ target_link_libraries(SkyrimDevToolsServer PUBLIC nlohmann_json::nlohmann_json P
 file(GLOB DEVTOOLS_MODULES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 add_library(SkyrimDevTools SHARED ${DEVTOOLS_MODULES})
 target_compile_features(SkyrimDevTools PRIVATE cxx_std_23)
-target_include_directories(SkyrimDevTools PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_include_directories(SkyrimDevTools PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/third_party/gpa")
 target_compile_definitions(SkyrimDevTools PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(SkyrimDevTools PRIVATE
     CommonLibSSE::CommonLibSSE SkyrimDevToolsServer minhook::minhook user32)
 # Game headers dominate every module's compile time, so they are parsed once per build.
 target_precompile_headers(SkyrimDevTools PRIVATE pch.h)
+
+# Optional AMD board metrics. The ADLX SDK headers carry AMD's own licence, so they are never vendored; point
+# ADLX_SDK at the SDK folder of a local ADLX checkout to build the helper DLL that the plugin loads if present.
+set(ADLX_SDK "" CACHE PATH "SDK folder of a local ADLX checkout (optional)")
+if(ADLX_SDK)
+    add_library(SkyrimDevToolsAdlx SHARED adlx/devtools_adlx.cpp)
+    target_compile_features(SkyrimDevToolsAdlx PRIVATE cxx_std_17)
+    target_include_directories(SkyrimDevToolsAdlx PRIVATE "${ADLX_SDK}/Include")
+    target_compile_definitions(SkyrimDevToolsAdlx PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()

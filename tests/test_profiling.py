@@ -482,6 +482,7 @@ class ModuleLabelTests(unittest.TestCase):
         data = profile.firefox().build()
         names = [data["threads"][0]["stringArray"][n] for n in data["threads"][0]["funcTable"]["name"]]
         self.assertIn("[amdxx64.dll]", names)
+        self.assertEqual(len(profile.function_meta), len(profile.functions))
 
     def test_overhead_reports_throttling_and_other_threads(self):
         raw = raw_profile(RUNS)
@@ -584,3 +585,381 @@ class ViewTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def gpu_raw():
+    raw = raw_profile(RUNS)
+    # GPU clock reads 1000 s less than the CPU clock; the tightest issue bound puts frame 1 at 0-15 ms. The CPU
+    # issued frame 1 in 5 ms and the GPU took 15, so the GPU fell behind (GPU-bound); frame 2 only followed it.
+    raw["gpu"] = {"available": True, "reason": "", "backbuffer": [1920, 1080],
+                  "labels": ["frame", "present", "dsv 2048x2048 array", "rtv 1920x1080", "rtv 960x540"],
+                  "disjointFrames": 0, "staleFrames": 0,
+                  "frames": [[1, 0.0, 5.0, 4.0, 0, [[0, -999.9995], [2, -999.998], [3, -999.994], [4, -999.990], [1, -999.9845]]],
+                             [2, 16.0, 149.0, 4.0, 0, [[0, -999.8508], [3, -999.8506], [1, -999.8505]]]]}
+    raw["counters"] = [[0.0, 100, 2 << 30, 0, 0, 0, 8 << 30], [250.0, 150, 2 << 30, 1 << 20, 0, 1_250_000, 8 << 30]]
+    raw["gpuCounters"] = [[500.0, 70.0, 2048.0]]
+    raw["marks"] = [[2.0, 9.0, "load", "Loading Menu"]]
+    return raw
+
+
+class GpuTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        write_symbols(self.root)
+        self.profile = profiling.Profile(gpu_raw(), profiling.GameSymbols(self.root))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_alignment_and_passes(self):
+        from skyrim_devtools.profile_gpu import gpu_frames, pass_kind
+
+        frames, offset = gpu_frames(self.profile.raw)
+        self.assertAlmostEqual(offset, 999999.5, places=3)
+        self.assertAlmostEqual(frames[0]["gpuStart"], 0.0, places=3)
+        self.assertAlmostEqual(frames[0]["gpuMs"], 15.0, places=3)
+        self.assertAlmostEqual(frames[1]["gpuStart"], 148.7, places=3)
+        kinds = [p[1] for p in frames[0]["passes"]]
+        self.assertEqual(kinds, ["frame", "shadows", "scene", "post"])
+        self.assertEqual(pass_kind("dsv 1920x1080", [1920, 1080]), "main")
+        self.assertEqual(pass_kind("rtv 512x512", [1920, 1080]), "post")
+
+    def test_summary_and_frames(self):
+        from skyrim_devtools.profile_gpu import frame_table
+
+        rows = frame_table(self.profile)
+        self.assertEqual(rows[0]["cpuMs"], 7.0)   # on-CPU samples at 0-5 ms and 9 ms of frame 1 (0-16 ms)
+        self.assertEqual(rows[0]["bound"], "gpu")
+        self.assertTrue(rows[1]["hitch"])
+        self.assertEqual(rows[1]["bound"], "capped")
+        self.assertEqual(rows[0]["excessMs"], 10.0)
+        self.assertFalse(rows[0]["paced"])
+        self.assertEqual(rows[0]["gpuBusyMs"], 15.0)
+        self.assertTrue(rows[1]["paced"])
+        self.assertEqual(rows[1]["utilPct"], 70.0)
+        gpu = self.profile.summary()["gpu"]
+        self.assertEqual(gpu["frames"], 2)
+        self.assertEqual(gpu["timedPct"], 100.0)
+        self.assertEqual(gpu["passes"][0]["kind"], "post")
+        text = profiling.render_text(self.profile.summary())
+        self.assertIn("== GPU: 2 of 2 frames timed", text)
+
+    def test_no_gpu_reason(self):
+        raw = raw_profile(RUNS)
+        raw["gpu"] = {"available": False, "reason": "the device refused timestamp queries", "frames": []}
+        summary = profiling.Profile(raw, profiling.GameSymbols(self.root)).summary()
+        self.assertEqual(summary["gpu"]["frames"], 0)
+        self.assertIn("refused", profiling.render_text(summary))
+
+    def test_sqlite_export_and_queries(self):
+        from skyrim_devtools.profile_sqlite import export_sqlite, query
+
+        path = self.root / "out" / "profile.sqlite"
+        counts = export_sqlite(self.profile, path)
+        self.assertEqual(counts["Frames"], 2)
+        self.assertEqual(counts["CpuSamples"], 4)
+        top = query(path, "SELECT name, SUM(weight) AS n FROM LeafSamplesV WHERE state = 'running' "
+                          "GROUP BY name ORDER BY n DESC")
+        self.assertEqual(top["rows"][0], ["id:77+0x10", 4])
+        during_hitch = query(path, "SELECT s.name, SUM(c.weight) FROM CpuSamples c JOIN Frames f ON f.hitch = 1 "
+                                   "AND c.timestamp >= f.start AND c.timestamp < f.end JOIN Callchains cc ON cc.id = c.callchainId "
+                                   "AND cc.depth = 0 JOIN SymbolsV s ON s.id = cc.symbolId GROUP BY s.id")
+        self.assertEqual(during_hitch["rows"], [])  # the toy samples all fall in frame 1
+        gpu_first = query(path, "SELECT frame FROM Frames WHERE gpu_ms > cpu_ms")
+        self.assertEqual(gpu_first["rows"], [[1], [2]])
+        loads = query(path, "SELECT s.name, SUM(c.weight) AS n FROM MarkersV m JOIN CpuSamples c ON c.timestamp >= m.start "
+                            "AND c.timestamp < m.end JOIN Callchains cc ON cc.id = c.callchainId AND cc.depth = 0 "
+                            "JOIN SymbolsV s ON s.id = cc.symbolId WHERE m.kind = 'load' AND c.state = 'running' GROUP BY s.id ORDER BY n DESC")
+        self.assertEqual(loads["rows"][0][0], "Beta::Tick (guess)")
+        counters = query(path, "SELECT name, value FROM CountersV WHERE name IN ('page_faults_per_s', 'gpu_util_pct') ORDER BY name")
+        self.assertEqual(counters["rows"], [["gpu_util_pct", 70.0], ["page_faults_per_s", 200.0]])
+        meta = dict(query(path, "SELECT key, value FROM Meta")["rows"])
+        self.assertIn(profiling.CRASHLOGGER_CREDIT, meta["credits"])
+        passes = query(path, "SELECT kind, COUNT(*) FROM GpuRangesV GROUP BY kind ORDER BY kind")
+        self.assertIn(["shadows", 1], passes["rows"])
+        limited = query(path, "SELECT * FROM CpuSamples", limit=2)
+        self.assertTrue(limited["truncated"])
+        self.assertEqual(len(limited["rows"]), 2)
+
+    def test_documented_queries_run(self):
+        import re
+
+        from skyrim_devtools.profile_sqlite import documented_queries, export_sqlite, query
+
+        path = self.root / "doc.sqlite"
+        export_sqlite(self.profile, path)
+        doc = (Path(__file__).resolve().parent.parent / "docs" / "profiling.md").read_text()
+        blocks = re.findall(r"```sql\n(.*?)```", doc, re.S)
+        for sql in blocks:
+            query(path, sql.strip().rstrip(";"))
+        named = documented_queries(doc)
+        self.assertLessEqual({"hitchTop", "gpuOverCpu", "cellLoads"}, set(named))
+        self.assertEqual(query(path, named["hitchTop"])["rows"], [])
+        self.assertEqual([r[0] for r in query(path, named["gpuOverCpu"])["rows"]], [1])
+        self.assertEqual(query(path, named["cellLoads"])["rows"][0][0], "Beta::Tick (guess)")
+
+    def test_two_clock_domains_join(self):
+        """GPU timestamps on a counter that started days before the profile (as a real GPU clock does) and CPU
+        samples, frames, markers and hitches in ms from the profile start: every time join returns rows."""
+        from skyrim_devtools.profile_gpu import gpu_frames
+        from skyrim_devtools.profile_sqlite import documented_queries, export_sqlite, query
+
+        gpu_epoch_s = 237054.8671875  # GPU counter seconds at the profile start
+        frames, marks, runs, gpu = [], [], [], []
+        for i in range(12):
+            start = i * 16.0
+            end = start + (180.0 if i == 6 else 16.0)
+            frames.append([start, end, 100 + i])
+            # the GPU starts each frame 0.5 ms after the CPU issued it and takes 12 ms
+            gpu.append([100 + i, start, start + 4.0, 3.0, 0,
+                        [[0, gpu_epoch_s + (start + 0.5) / 1000.0], [3, gpu_epoch_s + (start + 6.5) / 1000.0],
+                         [1, gpu_epoch_s + (start + 12.5) / 1000.0]]])
+        for i, (start, end, _) in enumerate(frames):
+            runs.append([start + 1.0, 1 if i % 2 else 2, 3, 0])
+        hitch = frames[6]
+        runs.append([hitch[0] + 50.0, 2, 20, 0])
+        marks.append([hitch[0] + 40.0, hitch[0] + 120.0, "load", "Loading Menu"])
+        raw = raw_profile(runs)
+        raw.update({"frameMarks": frames, "durationS": frames[-1][1] / 1000.0,
+                    "hitches": [{"frame": hitch[2], "ms": hitch[1] - hitch[0], "startMs": hitch[0]}], "marks": marks,
+                    "counters": [[0.0, 100, 2 << 30, 0, 0, 0, 8 << 30], [250.0, 150, 2 << 30, 1 << 20, 0, 1_250_000, 8 << 30]],
+                    "gpu": {"available": True, "reason": "", "backbuffer": [1920, 1080],
+                            "labels": ["frame", "present", "dsv 2048x2048 array", "rtv 1920x1080"],
+                            "disjointFrames": 0, "staleFrames": 0, "frames": gpu}})
+        profile = profiling.Profile(raw, profiling.GameSymbols(self.root))
+
+        timed, offset = gpu_frames(raw)
+        self.assertLess(offset, -2e8)  # the clocks' zero points are days apart; that alone is not misalignment
+        self.assertAlmostEqual(timed[0]["gpuStart"], 0.0, places=3)  # tightest bound: no lag left after alignment
+        summary = profile.summary()["gpu"]
+        self.assertGreaterEqual(summary["gpuLagMsP50"], 0.0)
+        self.assertLess(summary["gpuLagMsP50"], 1.0)
+
+        path = self.root / "clocks.sqlite"
+        export_sqlite(profile, path)
+        named = documented_queries((Path(__file__).resolve().parent.parent / "docs" / "profiling.md").read_text())
+        self.assertEqual(query(path, named["hitchTop"])["rows"][0][:2], ["id:77+0x10", "SkyrimSE.exe"])
+        self.assertEqual(query(path, named["cellLoads"])["rows"][0][:2], ["id:77+0x10", "SkyrimSE.exe"])
+        hitch_marker = query(path, "SELECT COUNT(*) FROM MarkersV m JOIN Frames f ON f.hitch = 1 "
+                                   "AND m.start >= f.start AND m.start < f.end WHERE m.kind = 'hitch'")["rows"]
+        self.assertEqual(hitch_marker, [[1]])
+        inside = query(path, "SELECT COUNT(*) FROM GpuRanges g JOIN Frames f ON f.frame = g.frame "
+                             "AND g.start >= f.start AND g.end <= f.end")["rows"][0][0]
+        self.assertEqual(inside, query(path, "SELECT COUNT(*) FROM GpuRanges")["rows"][0][0])
+        gpu_during_load = query(path, "SELECT COUNT(*) FROM MarkersV m JOIN GpuRanges g ON g.start < m.end "
+                                      "AND g.end > m.start WHERE m.kind = 'load'")["rows"][0][0]
+        self.assertGreater(gpu_during_load, 0)
+        counters = query(path, "SELECT COUNT(*) FROM Counters c JOIN Frames f ON c.timestamp >= f.start "
+                               "AND c.timestamp < f.end")["rows"][0][0]
+        self.assertGreater(counters, 0)
+
+    def test_query_is_read_only(self):
+        import sqlite3
+
+        from skyrim_devtools.profile_sqlite import export_sqlite, query
+
+        path = self.root / "p.sqlite"
+        export_sqlite(self.profile, path)
+        for sql in ("DELETE FROM Frames", "PRAGMA query_only = OFF", f"ATTACH DATABASE '{self.root / 'x.db'}' AS x",
+                    "CREATE TABLE t (a)", "SELECT 1; DELETE FROM Frames"):
+            with self.assertRaises((sqlite3.DatabaseError, sqlite3.Warning, sqlite3.ProgrammingError), msg=sql):
+                query(path, sql)
+        self.assertFalse((self.root / "x.db").exists())
+        self.assertEqual(query(path, "SELECT COUNT(*) FROM Frames")["rows"], [[2]])
+
+    def test_timeline_has_gpu_rows(self):
+        data = profile_views.timeline_data(self.profile)
+        self.assertEqual(len(data["gpu"]["frames"]), 2)
+        self.assertIn(["rtv 1920x1080", "scene"], data["gpu"]["passes"])
+        html_text = profile_views.timeline_html(self.profile)
+        self.assertIn("GPU passes", html_text)
+
+    def test_save_outputs_writes_sqlite(self):
+        paths, _ = profiling.save_outputs(self.profile, self.root / "saved")
+        self.assertTrue(Path(paths["sqlite"]).is_file())
+
+    def test_classify_vsync_capped(self):
+        from skyrim_devtools.profile_gpu import classify
+
+        # A 60 fps capped frame: the GPU span fills the frame only because it followed a sleeping CPU.
+        self.assertEqual(classify(16.7, 5.0, 16.2, excess_ms=-0.2), "capped")
+        self.assertEqual(classify(16.7, 5.0, 16.2, excess_ms=None, util_pct=24.0), "capped")
+        self.assertEqual(classify(16.7, 5.0, 16.2, excess_ms=11.0, util_pct=24.0), "capped")
+        self.assertEqual(classify(16.7, 5.0, 16.2, excess_ms=11.0), "gpu")
+        self.assertEqual(classify(16.7, 5.0, 16.2, excess_ms=-0.2, util_pct=97.0), "gpu")
+        self.assertEqual(classify(16.7, 16.0, 16.2, excess_ms=-0.2), "cpu")
+        self.assertEqual(classify(33.0, 31.0, 30.0, excess_ms=12.0), "cpu")
+        self.assertIsNone(classify(16.7, 5.0, None))
+
+    def test_firefox_gpu_tracks(self):
+        from skyrim_devtools import profile_firefox
+
+        data = profiling.profile_firefox_data(self.profile)
+        self.assertEqual(profile_firefox.check(data), [])
+        self.assertIn("GpuFrame", {s["name"] for s in data["meta"]["markerSchema"]})
+        main = data["threads"][0]
+        kinds = [d.get("type") for d in main["markers"]["data"] if d]
+        self.assertEqual(kinds.count("GpuFrame"), 2)
+        self.assertIn("GpuPass", kinds)
+        bounds = [d["bound"] for d in main["markers"]["data"] if d and d.get("type") == "GpuFrame"]
+        self.assertEqual(bounds, ["gpu", "capped (vsync or frame limiter)"])
+        self.assertEqual([c["name"] for c in data["counters"]], ["gpu_frame_ms", "gpu_util_pct"])
+
+    def test_report_names_capped(self):
+        text = profiling.render_text(self.profile.summary())
+        self.assertIn("capped (vsync or frame limiter) 50.0%", text)
+        self.assertIn("kept up with the CPU's submissions in 50.0% of frames", text)
+
+    def test_top_gpu_timing(self):
+        timing = profile_views._gpu_timing({"frames": 50, "gpuMsP50": 15.5, "gpuMsP95": 16.0, "passes": []}, 16.6, 0.5)
+        self.assertEqual(timing["cpuMsP50"], 8.3)
+        self.assertEqual(timing["bound"], "gpu")
+        capped = profile_views._gpu_timing({"frames": 50, "gpuMsP50": 16.2, "passes": []}, 16.7, 0.3, util_pct=24.0)
+        self.assertEqual(capped["bound"], "capped")
+
+
+def amd_raw():
+    raw = gpu_raw()
+    raw["gpuMetrics"] = {"source": "adlx", "reason": None, "gpu": "Toy Radeon", "sampleUs": 900,
+                         "names": ["gpu_util_pct", "gpu_clock_mhz", "gpu_vram_mb", "gpu_fan_rpm"],
+                         "supported": ["gpu_util_pct", "gpu_clock_mhz", "gpu_vram_mb"],
+                         "rows": [[0.0, 90.0, 2500, 6000, None], [1000.0, 80.0, 2400, 6100, None]]}
+    raw["gpaCounters"] = {
+        "ok": True, "device": "Toy Radeon", "passCount": 3, "framesUsed": 4, "sampleCount": 2,
+        "samples": ["clear 1", "clear 2"], "missingCounters": ["VALUUtilization"],
+        "overhead": {"initMs": 40.0, "cpuUsPerFrame": 120.0, "baselineFps": 60.0, "captureFps": 30.0},
+        "counters": [
+            {"name": "GPUTime", "group": "Timing", "usage": "milliseconds", "values": [3.0, 1.0]},
+            {"name": "GPUBusy", "group": "Timing", "usage": "percentage", "values": [100.0, 60.0]},
+            {"name": "FetchSize", "group": "GlobalMemory", "usage": "kilobytes", "values": [10.0, None]},
+            {"name": "TexAveAnisotropy", "group": "TextureUnit", "usage": "items", "values": [None, None]},
+        ]}
+    return raw
+
+
+class AmdTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        write_symbols(self.root)
+        self.profile = profiling.Profile(amd_raw(), profiling.GameSymbols(self.root))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_board_metrics_replace_pdh(self):
+        from skyrim_devtools.profile_gpu import counter_series
+
+        series = counter_series(self.profile.raw)
+        util = [(at, v) for at, name, v in series if name == "gpu_util_pct"]
+        self.assertEqual(util, [(0.0, 90.0), (1000.0, 80.0)])  # PDH's 70 % is dropped
+        self.assertIn((500.0, "gpu_process_vram_mb", 2048.0), series)
+        self.assertFalse(any(name == "gpu_fan_rpm" for _, name, _ in series))
+        board = self.profile.summary()["gpu"]["board"]
+        self.assertEqual(board["source"], "adlx")
+        self.assertEqual(board["metrics"]["gpu_clock_mhz"], {"mean": 2450.0, "max": 2500})
+        text = profiling.render_text(self.profile.summary())
+        self.assertIn("== GPU board (adlx, Toy Radeon", text)
+
+    def test_pdh_only_without_board(self):
+        from skyrim_devtools.profile_gpu import counter_series
+
+        raw = gpu_raw()
+        raw["gpuMetrics"] = {"source": None, "reason": "no AMD driver"}
+        series = counter_series(raw)
+        self.assertIn((500.0, "gpu_util_pct", 70.0), series)
+        self.assertIn((500.0, "gpu_vram_mb", 2048.0), series)
+        summary = profiling.Profile(raw, profiling.GameSymbols(self.root)).summary()
+        self.assertEqual(summary["gpu"]["board"], {"source": None, "reason": "no AMD driver"})
+
+    def test_gpa_summary(self):
+        from skyrim_devtools.profile_gpa import render, summarize
+
+        summary = summarize(self.profile.raw["gpaCounters"])
+        rows = {r["name"]: r for r in summary["counters"]}
+        self.assertEqual(rows["GPUTime"]["value"], 4.0)
+        self.assertEqual(rows["GPUBusy"]["value"], 90.0)  # weighted by GPU time: (100*3 + 60*1) / 4
+        self.assertEqual(rows["FetchSize"]["value"], 10.0)
+        self.assertIsNone(rows["TexAveAnisotropy"]["value"])
+        self.assertEqual(summary["heaviestSamples"][0]["label"], "clear 1")
+        text = "\n".join(render(summary))
+        self.assertIn("3 passes over 4 frames", text)
+        self.assertIn("not offered on this GPU: VALUUtilization", text)
+        failed = summarize({"ok": False, "error": "no device"})
+        self.assertIn("failed: no device", render(failed)[0])
+
+    def test_gpa_in_sqlite_and_outputs(self):
+        from skyrim_devtools.profile_sqlite import export_sqlite, query
+
+        path = self.root / "amd.sqlite"
+        counts = export_sqlite(self.profile, path)
+        self.assertEqual(counts["GpaCounters"], 5)
+        busy = query(path, "SELECT label, value FROM GpaCountersV WHERE name = 'GPUBusy' ORDER BY sample")
+        self.assertEqual(busy["rows"], [["clear 1", 100.0], ["clear 2", 60.0]])
+        meta = dict(query(path, "SELECT key, value FROM Meta")["rows"])
+        self.assertEqual(meta["gpuBoardSource"], "adlx")
+        self.assertEqual(meta["gpaPassCount"], "3")
+        paths, report = profiling.save_outputs(self.profile, self.root / "saved")
+        self.assertTrue(Path(paths["gpuCounters"]).is_file())
+        self.assertTrue(report["gpuCounters"]["ok"])
+
+    def test_board_tracks_in_firefox_export(self):
+        from skyrim_devtools import profile_firefox
+
+        data = profiling.profile_firefox_data(self.profile)
+        self.assertEqual(profile_firefox.check(data), [])
+        tracks = {c["name"]: c for c in data["counters"]}
+        for name in ("gpu_util_pct", "gpu_clock_mhz", "gpu_vram_mb"):
+            self.assertIn(name, tracks)
+        self.assertNotIn("gpu_fan_rpm", tracks)  # never reported, so no track
+        clock = tracks["gpu_clock_mhz"]
+        self.assertEqual(clock["display"]["unit"], "MHz")
+        running, levels = 0.0, []
+        for delta in clock["samples"]["count"]:
+            running += delta
+            levels.append(running)
+        self.assertEqual(levels, [0.0, 2500.0, 2400.0])
+        self.assertIn("adlx", clock["description"])
+
+    def test_board_tracks_not_duplicated(self):
+        from skyrim_devtools.profile_gpu import firefox_board_tracks
+
+        export = self.profile.firefox()
+        export.add_counter("gpu_util_pct", "GPU utilisation", [0.0], [50.0], unit="percent")
+        added = firefox_board_tracks(export, self.profile.raw)
+        self.assertNotIn("gpu_util_pct", added)
+        self.assertEqual([c["name"] for c in export.counters].count("gpu_util_pct"), 1)
+        raw = gpu_raw()
+        raw["gpuMetrics"] = {"source": None, "reason": "no AMD driver"}
+        self.assertEqual(firefox_board_tracks(profiling.Profile(raw, profiling.GameSymbols(self.root)).firefox(), raw), [])
+
+    def test_gpa_skipped_counters_are_warnings(self):
+        from skyrim_devtools.profile_gpa import summarize
+
+        result = dict(self.profile.raw["gpaCounters"], warnings=["counter VALUUtilization is not offered by this device; skipped"])
+        summary = summarize(result)
+        self.assertTrue(summary["ok"])
+        self.assertEqual(summary["warnings"], result["warnings"])
+
+    def test_timeline_counter_rows(self):
+        data = profile_views.timeline_data(self.profile)
+        names = [c[0] for c in data["counters"]]
+        self.assertEqual(names[:3], ["gpu_util_pct", "gpu_clock_mhz", "gpu_vram_mb"])
+        self.assertIn("gpu_process_vram_mb", names)
+        self.assertIn("drawCounter", profile_views.timeline_html(self.profile))
+
+    def test_top_board_line(self):
+        board = {"source": "adlx", "gpu": "Toy", "metrics": {"gpu_util_pct": 97, "gpu_clock_mhz": 2900,
+                                                            "gpu_board_power_w": 250, "gpu_vram_mb": 6000}}
+        reply = {"seconds": 3.0, "hz": 250.0, "ready": True, "warm": True, "samples": 10, "waiting": 0,
+                 "self": [dict(FRAMES[0], n=10)], "total": [dict(FRAMES[0], n=10)], "waits": [], "modules": MODULES,
+                 "gpu": {"utilPct": None, "engines": {}, "vramMb": None, "board": board}, "profiling": True}
+
+        async def call(method, **params):
+            return reply if method == "Profile.top" else {"fps": 60.0}
+
+        text = profile_views.render_top(asyncio.run(profile_views.top_snapshot(call, profiling.GameSymbols(self.root))))
+        self.assertIn("GPU board  97 %  core 2900 MHz", text)
+        self.assertIn("power 250 W", text)
+        self.assertIn("VRAM used 5.86 GB", text)
