@@ -97,7 +97,7 @@ async def case_speed(manager, tool, details):
         mult[walk] = reading.get("speedMult") if isinstance(reading, dict) else reading
         # the movement code picks the new speed up over a moment; measuring straight away reads the old one
         await asyncio.sleep(1.5)
-        result = await manager.call("Move.walk", timeout=30, direction="forward", durationMs=4000, run=True)
+        result = await manager.call("Move.walk", timeout=30, direction="forward", durationMs=4000, run=True, stuck=False)
         steady[walk] = walked_speed(result)
         distance[walk] = result.get("distance") if isinstance(result, dict) else None
         await asyncio.sleep(0.5)
