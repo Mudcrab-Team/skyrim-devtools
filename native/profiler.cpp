@@ -1327,7 +1327,8 @@ namespace
             { "frameMarks", std::move(marks) }, { "marks", std::move(markList) }, { "hitchThresholdMs", hitchThresholdMs.load() },
             { "hitches", std::move(kept) }, { "hitchFrames", std::move(hitchJson["frames"]) },
             { "gpu", profiler::GpuFrames(s.started, s.stopped, s.started) }, { "counters", perf::CounterSeries(s.started - 0.3, s.stopped + 0.3, s.started) },
-            { "gpuCounters", profiler::GpuCounters(s.started, s.stopped + 1.1, s.started) } };
+            { "gpuCounters", profiler::GpuCounters(s.started, s.stopped + 1.1, s.started) },
+            { "gpuMetrics", profiler::GpuMetrics(s.started, s.stopped + 1.1, s.started) } };
         out["modules"] = resolver.Modules();
         return out.dump(-1, ' ', false, Json::error_handler_t::replace);
     }

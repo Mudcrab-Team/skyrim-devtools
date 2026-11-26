@@ -70,6 +70,7 @@ namespace devtools::profiler
         Slot slots[slotCount];
         Slot* current = nullptr;
         bool passHooks = false;
+        bool passHooksOk = false;
         std::uint64_t disjointFrames = 0;
         std::uint64_t staleDropped = 0;
 
@@ -93,28 +94,6 @@ namespace devtools::profiler
             return it->second;
         }
 
-        // "rtv 1920x1080" or "dsv 2048x2048 array": the target's size is what tells shadow, main and post passes apart.
-        std::string ViewLabel(const char* kind, ID3D11View* view)
-        {
-            ID3D11Resource* resource = nullptr;
-            view->GetResource(&resource);
-            if (!resource) {
-                return kind;
-            }
-            D3D11_RESOURCE_DIMENSION dimension{};
-            resource->GetType(&dimension);
-            char text[64];
-            if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
-                D3D11_TEXTURE2D_DESC desc{};
-                static_cast<ID3D11Texture2D*>(resource)->GetDesc(&desc);
-                std::snprintf(text, sizeof(text), "%s %ux%u%s", kind, desc.Width, desc.Height, desc.ArraySize > 1 ? " array" : "");
-            } else {
-                std::snprintf(text, sizeof(text), "%s other", kind);
-            }
-            resource->Release();
-            return text;
-        }
-
         void Stamp(std::uint16_t label)
         {
             // The last stamp is kept for Present so every frame has an end.
@@ -133,6 +112,9 @@ namespace devtools::profiler
                 Stamp(Label(ViewLabel("rtv", view)));
                 current->hookSeconds += perf::Now() - started;
             }
+            if (view && GpaWantsClears()) {
+                GpaOnClear(self, "rtv", view);
+            }
             originalClearRtv(self, view, color);
         }
 
@@ -144,23 +126,10 @@ namespace devtools::profiler
                 Stamp(Label(ViewLabel("dsv", view)));
                 current->hookSeconds += perf::Now() - started;
             }
-            originalClearDsv(self, view, flags, depth, stencil);
-        }
-
-        // Clear hooks go in on the first sampled frame, not at load, so an unprofiled game runs untouched.
-        void InstallPassHooks()
-        {
-            passHooks = true;
-            auto** vtable = *reinterpret_cast<void***>(context);
-            const bool rtv = MH_CreateHook(vtable[clearRtvSlot], reinterpret_cast<void*>(&HookedClearRtv),
-                                 reinterpret_cast<void**>(&originalClearRtv)) == MH_OK &&
-                             MH_EnableHook(vtable[clearRtvSlot]) == MH_OK;
-            const bool dsv = MH_CreateHook(vtable[clearDsvSlot], reinterpret_cast<void*>(&HookedClearDsv),
-                                 reinterpret_cast<void**>(&originalClearDsv)) == MH_OK &&
-                             MH_EnableHook(vtable[clearDsvSlot]) == MH_OK;
-            if (!rtv || !dsv) {
-                logs::Plugin("warn", "profiler: GPU pass hooks not installed; frames are timed without passes");
+            if (view && GpaWantsClears()) {
+                GpaOnClear(self, "dsv", view);
             }
+            originalClearDsv(self, view, flags, depth, stencil);
         }
 
         bool Init(void* swapChainPointer)
@@ -245,8 +214,56 @@ namespace devtools::profiler
         }
     }
 
+    std::string ViewLabel(const char* kind, void* viewPointer)
+    {
+        auto* view = static_cast<ID3D11View*>(viewPointer);
+        ID3D11Resource* resource = nullptr;
+        view->GetResource(&resource);
+        if (!resource) {
+            return kind;
+        }
+        D3D11_RESOURCE_DIMENSION dimension{};
+        resource->GetType(&dimension);
+        char text[64];
+        if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+            D3D11_TEXTURE2D_DESC desc{};
+            static_cast<ID3D11Texture2D*>(resource)->GetDesc(&desc);
+            std::snprintf(text, sizeof(text), "%s %ux%u%s", kind, desc.Width, desc.Height, desc.ArraySize > 1 ? " array" : "");
+        } else {
+            std::snprintf(text, sizeof(text), "%s other", kind);
+        }
+        resource->Release();
+        return text;
+    }
+
+    // Clear hooks go in on the first sampled frame or GPA capture, not at load, so an unprofiled game runs untouched.
+    void EnsurePassHooks(void* immediateContext)
+    {
+        if (passHooks || !immediateContext) {
+            return;
+        }
+        passHooks = true;
+        auto** vtable = *static_cast<void***>(immediateContext);
+        const bool rtv = MH_CreateHook(vtable[clearRtvSlot], reinterpret_cast<void*>(&HookedClearRtv),
+                             reinterpret_cast<void**>(&originalClearRtv)) == MH_OK &&
+                         MH_EnableHook(vtable[clearRtvSlot]) == MH_OK;
+        const bool dsv = MH_CreateHook(vtable[clearDsvSlot], reinterpret_cast<void*>(&HookedClearDsv),
+                             reinterpret_cast<void**>(&originalClearDsv)) == MH_OK &&
+                         MH_EnableHook(vtable[clearDsvSlot]) == MH_OK;
+        passHooksOk = rtv && dsv;
+        if (!passHooksOk) {
+            logs::Plugin("warn", "profiler: GPU pass hooks not installed; frames are timed without passes");
+        }
+    }
+
+    bool PassHooksOk()
+    {
+        return passHooksOk;
+    }
+
     void GpuBeforePresent(void* swapChain)
     {
+        GpaBeforePresent(swapChain);
         if (!context) {
             if (broken || !Sampling() || !Init(swapChain)) {
                 return;
@@ -267,13 +284,12 @@ namespace devtools::profiler
 
     void GpuAfterPresent(std::uint64_t nextFrame)
     {
+        GpaAfterPresent();
         if (!context || !Sampling()) {
             return;
         }
         const double started = perf::Now();
-        if (!passHooks) {
-            InstallPassHooks();
-        }
+        EnsurePassHooks(context);
         Slot* slot = nullptr;
         for (auto& candidate : slots) {
             if (!candidate.pending) {

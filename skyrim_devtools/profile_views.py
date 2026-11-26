@@ -137,6 +137,14 @@ def render_top(snap, width=110):
                     + (f" ({engines})" if engines else "") + f"   VRAM {_mb(gpu.get('vramMb'))}")
     if line:
         out.append("   ".join(line))
+    board = (gpu.get("board") or {}).get("metrics") or {}
+    if board:
+        def value(name, unit):
+            return f"{board[name]:g} {unit}" if board.get(name) is not None else "-"
+        out.append(f"GPU board  {value('gpu_util_pct', '%')}  core {value('gpu_clock_mhz', 'MHz')}  mem {value('gpu_vram_clock_mhz', 'MHz')}"
+                   f"  power {value('gpu_board_power_w', 'W') if board.get('gpu_board_power_w') is not None else value('gpu_power_w', 'W')}"
+                   f"  temp {value('gpu_temp_c', 'C')} (hotspot {value('gpu_hotspot_c', 'C')})  fan {value('gpu_fan_rpm', 'rpm')}"
+                   f"  VRAM used {_mb(board.get('gpu_vram_mb'))}")
     timing = snap.get("gpuTiming") or {}
     if timing.get("frames"):
         passes = ", ".join(f"{p['pass']} {p['msPerFrame']}" for p in (timing.get("passes") or [])[:4])
@@ -203,6 +211,15 @@ def recorder_marks(path, start_epoch_ms, duration_ms):
 # ---- timeline -------------------------------------------------------------------------------------
 
 
+# Counter rows under the threads, in this order, with their unit; board metrics only appear when the vendor
+# helper (ADLX) reported them.
+TIMELINE_COUNTERS = {
+    "gpu_util_pct": "%", "gpu_clock_mhz": "MHz", "gpu_vram_clock_mhz": "MHz", "gpu_board_power_w": "W", "gpu_power_w": "W",
+    "gpu_temp_c": "C", "gpu_hotspot_c": "C", "gpu_fan_rpm": "rpm", "gpu_vram_mb": "MB", "gpu_process_vram_mb": "MB",
+    "process_cpu_pct_of_one_core": "%", "working_set_mb": "MB", "page_faults_per_s": "/s",
+}
+
+
 def timeline_data(profile):
     """The profile reduced to what the viewer draws: function labels, a function-level stack tree, per-thread
     samples and the spans."""
@@ -260,7 +277,14 @@ def timeline_data(profile):
                 pass_names.append([label, kind])
             passes.append([start, end, pass_index[key]])
         gpu_rows.append([f["gpuStart"], f["gpuEnd"], f["frame"], passes])
+    from .profile_gpu import counter_series
+
+    series = {}
+    for at, name, value in counter_series(raw):
+        if name in TIMELINE_COUNTERS:
+            series.setdefault(name, []).append([at, value])
     return {
+        "counters": [[name, TIMELINE_COUNTERS[name], series[name]] for name in TIMELINE_COUNTERS if name in series],
         "gpu": {"frames": gpu_rows, "passes": pass_names, "offsetMs": offset,
                 "reason": None if gpu_rows else (raw.get("gpu") or {}).get("reason")},
         "title": context.get("phase") or "profile",
@@ -382,13 +406,14 @@ const MARK_ORDER = ["load", "hitch", "alert", "narrate", "tool", "rpc", "menu", 
 const PASS_COLORS = { shadows: "#6b7fa8", main: "#3f9d6b", scene: "#55b37f", post: "#c98b3a", offscreen: "#9a7bc0",
   frame: "#8a94a6", present: "#d0d4dc", other: "#a0a0a0" };
 const GPU = D.gpu || { frames: [], passes: [] };
+const COUNTERS = D.counters || [];
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const canvas = document.getElementById("c"), ctx = canvas.getContext("2d");
 const ruler = document.getElementById("r"), rctx = ruler.getContext("2d");
 const over = document.getElementById("o"), octx = over.getContext("2d");
 const view = document.getElementById("view"), side = document.getElementById("side"), tip = document.getElementById("tip");
 const help = document.getElementById("help");
-const LABEL_W = 150, AXIS_H = 20, FRAME_H = 18, LANE_H = 12, LEVEL_H = 5, MAX_LEVELS = 14;
+const LABEL_W = 150, AXIS_H = 20, FRAME_H = 18, COUNTER_H = 26, LANE_H = 12, LEVEL_H = 5, MAX_LEVELS = 14;
 // below about 50 us a 1 kHz profile has nothing left to separate, and float labels start to repeat
 const MIN_SPAN = 0.05;
 const SIDE_HINT = '<p class="hint">Click a frame band or a thread row to see that frame\'s stacks. Press ? for keys.</p>';
@@ -505,6 +530,7 @@ function draw() {
   for (const t of threads) { const h = t.levels * LEVEL_H + 4; layout.push({ type: "thread", thread: t, y, h }); y += h + 3; }
   if (GPU.frames.length) { y += 4; layout.push({ type: "gpu", y, h: FRAME_H }); y += FRAME_H + 2;
     layout.push({ type: "passes", y, h: FRAME_H }); y += FRAME_H + 4; }
+  for (const c of COUNTERS) { layout.push({ type: "counter", counter: c, y, h: COUNTER_H }); y += COUNTER_H + 2; }
   const dpr = window.devicePixelRatio || 1, w = W(), h = Math.max(y + 10, view.clientHeight - AXIS_H);
   for (const [cv, ch] of [[canvas, h], [over, h], [ruler, AXIS_H]]) {
     cv.width = w * dpr; cv.height = ch * dpr; cv.style.width = w + "px"; cv.style.height = ch + "px"; }
@@ -520,6 +546,7 @@ function draw() {
     else if (row.type === "lane") { ctx.fillText(row.lane.label, 6, row.y + row.h / 2); drawLane(row); }
     else if (row.type === "gpu") { ctx.fillStyle = P.ink; ctx.fillText("GPU frames", 6, row.y + row.h / 2); drawGpu(row, false); }
     else if (row.type === "passes") { ctx.fillText("GPU passes", 6, row.y + row.h / 2); drawGpu(row, true); }
+    else if (row.type === "counter") { ctx.fillText(row.counter[0].replace(/^gpu_/, "gpu ").replace(/_/g, " ").slice(0, 24), 6, row.y + row.h / 2); drawCounter(row); }
     else { const t = row.thread; ctx.fillStyle = P.ink;
       ctx.fillText((t.main ? "main thread" : (t.name || "thread") + (t.frameThread ? " (presents)" : "")).slice(0, 22), 6, row.y + 7);
       ctx.fillStyle = P.muted; ctx.fillText(`${t.tid}  ${(t.onCpu * D.periodMs / 1000).toFixed(2)} s cpu`, 6, row.y + 19);
@@ -562,6 +589,20 @@ function drawGpu(row, passes) {
 }
 function gpuAt(time) { for (let i = gpuFirst(); i < GPU.frames.length && GPU.frames[i][0] <= t1; i++) {
   const f = GPU.frames[i]; if (f[0] <= time && time <= f[1]) return f; } return null; }
+function counterAt(points, time) { if (!points.length) return null; const i = Math.min(lower(points.map(p => p[0]), time), points.length - 1);
+  return i > 0 && time - points[i - 1][0] < points[i][0] - time ? points[i - 1] : points[i]; }
+function drawCounter(row) {
+  const pts = row.counter[2]; let lo = Infinity, hi = -Infinity;
+  for (const p of pts) { lo = Math.min(lo, p[1]); hi = Math.max(hi, p[1]); }
+  if (row.counter[1] === "%") { lo = 0; hi = Math.max(hi, 100); }
+  const span = hi - lo || 1, top = row.y + 2, h = row.h - 4;
+  ctx.strokeStyle = css("--line"); ctx.strokeRect(LABEL_W, row.y, W() - LABEL_W, row.h);
+  ctx.strokeStyle = MARK_COLORS.load; ctx.lineWidth = 1.5; ctx.beginPath(); let started = false;
+  for (const [t, v] of pts) { const px = x(t), py = top + h - (v - lo) / span * h;
+    if (px < LABEL_W) continue; if (!started) { ctx.moveTo(px, py); started = true; } else ctx.lineTo(px, py); if (t > t1) break; }
+  ctx.stroke(); ctx.lineWidth = 1;
+  ctx.fillStyle = css("--muted"); ctx.textAlign = "right"; ctx.fillText(`${hi.toFixed(hi < 10 ? 1 : 0)} ${row.counter[1]}`, W() - 4, row.y + 7); ctx.textAlign = "left";
+}
 function drawLane(row) {
   ctx.fillStyle = MARK_COLORS[row.lane.kind] || "#888";
   for (const m of row.lane.marks) { if (m[1] < t0 || m[0] > t1) continue;

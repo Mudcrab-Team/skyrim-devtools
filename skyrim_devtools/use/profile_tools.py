@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 import time
 
-from .. import profile_sqlite, profile_views, profiling
+from .. import profile_gpa, profile_sqlite, profile_views, profiling
 
 
 def dumps(value):
@@ -17,7 +17,7 @@ def dumps(value):
 
 
 def register(mcp, native, manager, recorder=None):
-    state = {"symbols": None, "sqlite": None}
+    state = {"symbols": None, "sqlite": None, "gpuCounters": None}
 
     def symbols():
         if state["symbols"] is None:
@@ -25,10 +25,14 @@ def register(mcp, native, manager, recorder=None):
         return state["symbols"]
 
     @mcp.tool()
-    async def profile_start(threads: str = "all", hz: float = 1000.0, duration_s: float = 30.0) -> str:
+    async def profile_start(threads: str = "all", hz: float = 1000.0, duration_s: float = 30.0,
+                            gpu_counters: bool = False) -> str:
         """Start the sampling CPU profiler (Profile.start). threads: main (the game thread), frame (the thread
         that presents), all, or comma-separated thread ids / name fragments. hz 10-4000 (default 1000);
-        duration_s caps the run (max 600). Do the thing to profile, then call profile_stop."""
+        duration_s caps the run (max 600). Do the thing to profile, then call profile_stop. gpu_counters: on an
+        AMD GPU with GPUPerfAPI installed (config gpaDir), profile_stop also captures hardware counters for a
+        few seconds after the CPU profile (see profile_gpu_counters)."""
+        state["gpuCounters"] = gpu_counters
         return dumps(await native("Profile.start", threads=threads, hz=hz, durationS=duration_s))
 
     @mcp.tool()
@@ -40,8 +44,12 @@ def register(mcp, native, manager, recorder=None):
         (profile.json.gz, open at profiler.firefox.com) and flame graph SVGs and timeline.html (threads, frames, cell loads, tool calls and
         hitches on one zoomable time axis), and profile.sqlite (for profile_query) to out_dir (default
         .local/profiles/<stamp> on this machine) and returns their paths. The gpu section has per-frame GPU time,
-        passes and whether frames were GPU- or CPU-bound."""
+        passes, whether frames were GPU- or CPU-bound and, on AMD with the ADLX helper, board metrics (clocks, power,
+        temperature, fan, VRAM); gpuCounters holds the GPUPerfAPI result when profile_start asked for it."""
         raw, _ = await profiling.fetch(native)
+        if state["gpuCounters"]:
+            state["gpuCounters"] = False
+            raw["gpaCounters"] = await gpa(None, None, 600)
         if recorder is not None and raw.get("startEpochMs"):
             raw.setdefault("marks", []).extend(profile_views.recorder_marks(
                 recorder.path, raw["startEpochMs"], raw.get("durationS", 0) * 1000.0))
@@ -55,6 +63,32 @@ def register(mcp, native, manager, recorder=None):
                 for field in ("topSelf", "topTotal"):
                     summary[key][field] = summary[key][field][:top]
         return dumps(summary)
+
+    async def gpa(directory, counters, max_frames):
+        directory = profile_gpa.gpa_dir(directory, manager.config)
+        if not directory:
+            return {"ok": False, "error": "GPUPerfAPI folder unknown: set config gpaDir or SKYRIM_DEVTOOLS_GPA_DIR"}
+        try:
+            return await profile_gpa.capture(native, directory, counters, max_frames)
+        except Exception as error:  # noqa: BLE001 - reported to the caller as data
+            return {"ok": False, "error": f"{type(error).__name__}: {error}"}
+
+    @mcp.tool()
+    async def profile_gpu_counters(action: str = "capture", counters: list[str] | None = None, max_frames: int = 600,
+                                   gpa_dir: str | None = None) -> str:
+        """AMD hardware GPU counters through GPUPerfAPI (opt-in; needs GPA's DLLs on the game PC, config gpaDir).
+        action "list": counters this GPU and D3D11 offer, with the default set. action "capture": one frame per
+        counter pass (GPA reads a few counters per pass), so values combine consecutive frames of the same scene;
+        returns per-counter frame values (GPU busy, shader busy per stage, cache hit rates, memory traffic, stalls),
+        the heaviest clear-delimited samples and the fps cost while capturing. Does not touch a running CPU profile's
+        samples beyond the slower frames."""
+        directory = profile_gpa.gpa_dir(gpa_dir, manager.config)
+        if action == "list":
+            if not directory:
+                return dumps({"ok": False, "error": "GPUPerfAPI folder unknown: set config gpaDir or SKYRIM_DEVTOOLS_GPA_DIR"})
+            return dumps(await profile_gpa.list_counters(native, directory))
+        result = await gpa(directory, counters, max_frames)
+        return dumps(profile_gpa.summarize(result) if result.get("ok") else result)
 
     @mcp.tool()
     async def profile_status() -> str:

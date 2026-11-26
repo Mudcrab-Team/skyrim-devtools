@@ -5,6 +5,7 @@
 #include "core.h"
 
 #include <cstdint>
+#include <string>
 #include <string_view>
 
 namespace devtools::profiler
@@ -35,4 +36,19 @@ namespace devtools::profiler
     Json GpuRecent(double seconds);
     // GPU utilisation and VRAM sampled once a second while a profile runs (profiler_top.cpp).
     Json GpuCounters(double from, double to, double origin);
+    // AMD board metrics through the optional ADLX helper, sampled with GpuCounters:
+    // {source, reason, gpu, names, supported, sampleUs, rows: [[ms, value per name...]]}; source null without it.
+    Json GpuMetrics(double from, double to, double origin);
+
+    // Render-target/depth clear hooks on the immediate context, shared by GPU timing and GPA (profiler_gpu.cpp).
+    void EnsurePassHooks(void* immediateContext);
+    bool PassHooksOk();
+    // "rtv 1920x1080" or "dsv 2048x2048 array" for an ID3D11View.
+    std::string ViewLabel(const char* kind, void* view);
+
+    // GPUPerfAPI hardware counters (profiler_gpa.cpp), driven from the Present detour and the clear hooks.
+    void GpaBeforePresent(void* swapChain);
+    void GpaAfterPresent();
+    bool GpaWantsClears();
+    void GpaOnClear(void* context, const char* kind, void* view);
 }

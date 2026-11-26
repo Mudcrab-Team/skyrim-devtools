@@ -25,6 +25,7 @@ CREATE TABLE CpuSamples (timestamp REAL, threadId INTEGER, callchainId INTEGER, 
 CREATE TABLE Markers (id INTEGER PRIMARY KEY, kind TEXT, start REAL, end REAL, textId INTEGER);
 CREATE TABLE GpuRanges (frame INTEGER, passId INTEGER, kind TEXT, start REAL, end REAL, ms REAL);
 CREATE TABLE Counters (timestamp REAL, nameId INTEGER, value REAL);
+CREATE TABLE GpaCounters (sample INTEGER, labelId INTEGER, nameId INTEGER, groupId INTEGER, usage TEXT, value REAL);
 CREATE INDEX CpuSamplesTime ON CpuSamples (timestamp);
 CREATE INDEX CpuSamplesThread ON CpuSamples (threadId, timestamp);
 CREATE INDEX CallchainsSymbol ON Callchains (symbolId, depth);
@@ -38,6 +39,9 @@ CREATE VIEW MarkersV AS SELECT k.id, k.kind, k.start, k.end, k.end - k.start AS 
     FROM Markers k JOIN StringIds t ON t.id = k.textId;
 CREATE VIEW GpuRangesV AS SELECT g.frame, p.value AS pass, g.kind, g.start, g.end, g.ms
     FROM GpuRanges g JOIN StringIds p ON p.id = g.passId;
+CREATE VIEW GpaCountersV AS SELECT g.sample, l.value AS label, n.value AS name, gr.value AS grp, g.usage, g.value
+    FROM GpaCounters g JOIN StringIds l ON l.id = g.labelId JOIN StringIds n ON n.id = g.nameId
+    JOIN StringIds gr ON gr.id = g.groupId;
 CREATE VIEW CountersV AS SELECT c.timestamp, n.value AS name, c.value FROM Counters c JOIN StringIds n ON n.id = c.nameId;
 CREATE VIEW LeafSamplesV AS SELECT c.timestamp, c.end, c.threadId, c.state, c.weight, s.name, s.module, s.kind
     FROM CpuSamples c JOIN Callchains cc ON cc.id = c.callchainId AND cc.depth = 0 JOIN SymbolsV s ON s.id = cc.symbolId;
@@ -96,6 +100,12 @@ def export_sqlite(profile, path):
         ranges = [(f["frame"], sid(label), kind, start, end, round(end - start, 3))
                   for f in timed for label, kind, start, end in f["passes"]]
         counters = [(at, sid(name), value) for at, name, value in counter_series(raw)]
+        gpa = raw.get("gpaCounters") or {}
+        labels = gpa.get("samples") or []
+        gpa_rows = [(i, sid(labels[i] if i < len(labels) else ""), sid(c.get("name")), sid(c.get("group")), c.get("usage"), v)
+                    for c in gpa.get("counters") or [] for i, v in enumerate(c.get("values") or [])
+                    if isinstance(v, (int, float))] if gpa.get("ok") else []
+        board = (raw.get("gpuMetrics") or {})
         context = raw.get("context") or {}
         meta_rows = {
             "format": "skyrim-devtools-profile-sqlite", "version": "1", "pluginBuild": raw.get("pluginBuild"),
@@ -106,6 +116,10 @@ def export_sqlite(profile, path):
             "gpuAlignment": "GPU times are placed as early as the CPU issue times allow (docs/profiling.md, GPU timing)",
             "gpuAvailable": (raw.get("gpu") or {}).get("available"), "context": json.dumps(context) if context else None,
             "timeUnit": "ms from profile start (QPC clock)",
+            "gpuBoardSource": board.get("source"), "gpuBoardName": board.get("gpu"),
+            "gpaDevice": gpa.get("device"), "gpaPassCount": gpa.get("passCount"), "gpaFramesUsed": gpa.get("framesUsed"),
+            "gpaOverhead": json.dumps(gpa["overhead"]) if gpa.get("overhead") else None,
+            "gpaError": None if not gpa or gpa.get("ok") else gpa.get("error"),
         }
         db.executemany("INSERT INTO StringIds VALUES (?, ?)", ((i, t) for t, i in strings.items()))
         db.executemany("INSERT INTO ThreadNames VALUES (?, ?, ?, ?, ?, ?)", thread_rows)
@@ -116,13 +130,14 @@ def export_sqlite(profile, path):
         db.executemany("INSERT INTO Markers VALUES (?, ?, ?, ?, ?)", markers)
         db.executemany("INSERT INTO GpuRanges VALUES (?, ?, ?, ?, ?, ?)", ranges)
         db.executemany("INSERT INTO Counters VALUES (?, ?, ?)", counters)
+        db.executemany("INSERT INTO GpaCounters VALUES (?, ?, ?, ?, ?, ?)", gpa_rows)
         db.executemany("INSERT INTO Meta VALUES (?, ?)", ((k, None if v is None else str(v)) for k, v in meta_rows.items()))
         db.commit()
     finally:
         db.close()
     temp.replace(path)
     return {"Frames": len(frames), "CpuSamples": len(samples), "Callchains": len(chains), "Symbols": len(symbols),
-            "Markers": len(markers), "GpuRanges": len(ranges), "Counters": len(counters), "ThreadNames": len(thread_rows),
+            "Markers": len(markers), "GpuRanges": len(ranges), "Counters": len(counters), "GpaCounters": len(gpa_rows), "ThreadNames": len(thread_rows),
             "StringIds": len(strings)}
 
 
