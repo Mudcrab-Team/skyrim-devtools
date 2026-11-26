@@ -28,6 +28,7 @@ class FakeSocket:
         self.dead = False
         self.closed = False
         self.results = {}
+        self.errors = {}
 
     def __aiter__(self):
         return self
@@ -56,7 +57,9 @@ class FakeSocket:
         method, params = request["method"], request["params"]
         self.calls.append((method, params))
         reply = {"jsonrpc": "2.0", "id": request["id"]}
-        if method in self.results:
+        if method in self.errors:
+            reply["error"] = self.errors[method]
+        elif method in self.results:
             reply["result"] = self.results[method]
         elif method == "Session.getInfo":
             reply["result"] = {"protocol": 2, "dataLoaded": True, "loadEpoch": self.epoch, "headless": True,

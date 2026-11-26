@@ -12,6 +12,7 @@
 #include <cmath>
 #include <numbers>
 #include <regex>
+#include <set>
 
 // windows.h maps GetObject to GetObjectA, which hides BSScript::Variable::GetObject.
 #undef GetObject
@@ -308,6 +309,12 @@ namespace
 
     bool Matches(const std::string& text, const std::regex& pattern) { return std::regex_search(text, pattern); }
 
+    std::string NameOf(RE::TESObjectREFR* ref)
+    {
+        const auto name = RefName(ref);
+        return name ? name : "";
+    }
+
     RE::Setting* FindSetting(const std::string& name)
     {
         if (const auto ini = RE::INISettingCollection::GetSingleton()) {
@@ -380,6 +387,7 @@ namespace devtools::inspect
     {
         static const std::regex barrier("gate|portcullis|door|web|bars|grate|lever|pillar|wall|cage|rubble|collapse",
             std::regex::icase);
+        static const std::regex loose("torch|candle|lantern|lamp|brazier|sconce|chandelier|clutter|light", std::regex::icase);
         const auto tes = RE::TES::GetSingleton();
         const auto player = RE::PlayerCharacter::GetSingleton();
         const double dx = goal.x - end.x, dy = goal.y - end.y;
@@ -417,7 +425,10 @@ namespace devtools::inspect
             }
             const auto category = RefCategory(ref);
             const auto model = Basename(ModelPath(ref));
-            const bool interesting = category == "door" || category == "activator" || Matches(model, barrier);
+            // Torches and similar fixtures are activators (they can be taken) but the player walks past
+            // them; naming one as the cause of a dead end sends the caller after the wrong thing.
+            const bool fixture = category != "door" && (Matches(model, loose) || Matches(NameOf(ref), loose));
+            const bool interesting = !fixture && (category == "door" || category == "activator" || Matches(model, barrier));
             if (!interesting) {
                 return RE::BSContainer::ForEachResult::kContinue;
             }
@@ -461,6 +472,72 @@ namespace devtools::inspect
         }
         out["likely"] = likely.empty() ? Json("the navmesh ends with no door, gate or activator nearby") : Json(likely);
         out["refs"] = std::move(refs);
+        return out;
+    }
+
+    std::vector<RE::FormID> Pullables(const RE::NiPoint3& end, double radius)
+    {
+        static const std::regex lever("lever|chain|pull|switch|button|handle|winch|crank", std::regex::icase);
+        static const std::regex barrier("gate|portcullis|bars|grate|bridge|cage|rubble|collapse|door", std::regex::icase);
+        static const std::regex loose("torch|candle|lantern|lamp|brazier|sconce|chandelier|clutter|light", std::regex::icase);
+        const auto tes = RE::TES::GetSingleton();
+        const auto player = RE::PlayerCharacter::GetSingleton();
+        if (!tes || !player) {
+            return {};
+        }
+        struct Candidate
+        {
+            double score;
+            RE::FormID id;
+        };
+        std::vector<Candidate> candidates;
+        std::set<RE::FormID> barriers;
+        std::vector<RE::TESObjectREFR*> all;
+        tes->ForEachReferenceInRange(player, static_cast<float>(player->GetPosition().GetDistance(end) + radius), [&](RE::TESObjectREFR* ref) {
+            if (!ref || ref == player || ref->IsDeleted() || !ref->GetBaseObject() || ref->As<RE::Actor>()) {
+                return RE::BSContainer::ForEachResult::kContinue;
+            }
+            all.push_back(ref);
+            // A gate or drawbridge is a candidate barrier whether or not it is currently loaded visibly:
+            // what matters is that something else activates it.
+            const auto base = ref->GetBaseObject();
+            const bool loadDoor = base->Is(RE::FormType::Door) && ref->extraList.HasType(RE::ExtraDataType::kTeleport);
+            if (!loadDoor && Matches(Basename(ModelPath(ref)), barrier)) {
+                barriers.insert(ref->GetFormID());
+                if (const auto parents = ref->extraList.GetByType<RE::ExtraActivateRef>()) {
+                    for (const auto data : parents->parents) {
+                        if (const auto parent = data ? data->activateRef.get() : nullptr; parent && !parent->IsDeleted()) {
+                            candidates.push_back({ end.GetDistance(parent->GetPosition()) - 2000.0, parent->GetFormID() });
+                        }
+                    }
+                }
+            }
+            return RE::BSContainer::ForEachResult::kContinue;
+        });
+        for (const auto ref : all) {
+            if (ref->IsDisabled() || ref->IsLocked() || ref->IsActivationBlocked() || RefCategory(ref) != "activator") {
+                continue;
+            }
+            const auto model = Basename(ModelPath(ref));
+            const bool named = Matches(model, lever) || Matches(NameOf(ref), lever);
+            bool linked = false;
+            if (const auto extra = ref->extraList.GetByType<RE::ExtraLinkedRef>()) {
+                for (const auto& link : extra->linkedRefs) {
+                    linked = linked || (link.refr && barriers.contains(link.refr->GetFormID()));
+                }
+            }
+            if (!linked && (!named || Matches(model, loose))) {
+                continue;
+            }
+            candidates.push_back({ end.GetDistance(ref->GetPosition()) - (linked ? 2000.0 : 0.0), ref->GetFormID() });
+        }
+        std::ranges::sort(candidates, [](const Candidate& a, const Candidate& b) { return a.score < b.score; });
+        std::vector<RE::FormID> out;
+        for (const auto& c : candidates) {
+            if (std::ranges::find(out, c.id) == out.end()) {
+                out.push_back(c.id);
+            }
+        }
         return out;
     }
 
