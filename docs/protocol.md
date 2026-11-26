@@ -87,6 +87,10 @@ finishes later, its result is dropped. Server notifications have no `id`:
 | Profile.status | any | | `{profiling, watching, watchHz, hitchMs, mainThread, frameThread, hitchesCaptured}` |
 | Profile.watch | any | enabled?, hz? (default 250), hitchMs? (default 100) | Low-rate main-thread sampling kept in a ring so every slow frame keeps its stacks. |
 | Profile.hitches | any | limit? (default 10), sinceFrame?, clear? | `{hitches[], frames[], modules[], status}`; each hitch `{frame, ms, startMs, stacks[], samples[[ms, stack, flags]], waitChain}`; flags 1 = the thread was not running. |
+| IoTrace.status | any | | `{armed, recording, events, dropped, hooks, hookOverheadS, files}`; `armed` only when the game started with `SKYRIM_DEVTOOLS_IOTRACE` (see [profiling](profiling.md#io-and-load-traces)). |
+| IoTrace.mark | any | name | Adds a named mark to the I/O trace timeline (phase boundaries such as a `coc`). |
+| IoTrace.pause | any | paused? (default true) | Stops or resumes recording; the hooks stay installed. Returns `IoTrace.status`. |
+| IoTrace.dump | any | label? | Writes everything recorded so far to `SKYRIM_DEVTOOLS_RUN_DIR/iotrace-<n>[-label].bin` and `.json`: `{bin, json, events, dropped, files, stacks}`. Read them with `skyrim-devtools-io`. |
 | Window.place | ui | mode | `offscreen`, `hide`, `minimize` or `restore` |
 
 Mutations that take `loadEpoch` fail with `-32005` and the current epoch when the world was
