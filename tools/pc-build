@@ -9,7 +9,10 @@
   tools/pc-build --config mac.json hold --lock-wait 1200 -- CMD ARGS...
                                                      take the lock (queued), run CMD with a background heartbeat
                                                      every 4 min, release the lock when CMD ends; CMD is stopped
-                                                     after --max-minutes (default 20) so one hold stays bounded
+                                                     after --max-minutes (default 20) so one hold stays bounded; the
+                                                     lock is released on timeout, on exit and on SIGTERM/SIGHUP
+  --lock-file probe.lock                             with lock/unlock/hold: use another lock file (tests of the lock
+                                                     handling itself, while agent.lock is held by a live session)
 
 With --lock-wait, waiting agents queue by ticket next to agent.lock and are served oldest first.
 """
@@ -20,6 +23,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import tarfile
@@ -129,6 +133,53 @@ def run_remote(host, args):
 
 
 HEARTBEAT_SECONDS = 240
+UNLOCK_ATTEMPTS = 3
+LOCK_ARGS = ""  # set from --lock-file
+RETRY_DELAY = 2
+
+
+def supervise(argv, max_seconds):
+    """Run a command in its own process group and stop the whole group when the time limit passes.
+
+    A grandchild left running (a game driver spawning helpers) would otherwise outlive the hold."""
+    child = subprocess.Popen(argv, start_new_session=True)
+
+    def stop_group(sig):
+        try:
+            os.killpg(child.pid, sig)
+        except ProcessLookupError:
+            pass
+
+    try:
+        return child.wait(timeout=max_seconds)
+    except subprocess.TimeoutExpired:
+        stop_group(signal.SIGTERM)
+        try:
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            stop_group(signal.SIGKILL)
+            child.wait()
+        print(f"pc-build: stopped the command after {max_seconds / 60:g} min (lock hold limit)", file=sys.stderr)
+        return 124
+    except BaseException:
+        # interrupted or terminated while waiting: the command must not keep running without the lock
+        stop_group(signal.SIGTERM)
+        raise
+
+
+def release_lock(host, name, remote=None):
+    """Give agent.lock back, retrying: a lock left behind blocks every other agent for 25 minutes."""
+    remote = remote or run_remote
+    for attempt in range(UNLOCK_ATTEMPTS):
+        code = remote(host, f"-Action unlock -Agent {name} -LockWait 0{LOCK_ARGS}")
+        if code == 0:
+            return True
+        if code == 4:
+            # the lock belongs to someone else now: ours is already gone, nothing to retry
+            return False
+        time.sleep(RETRY_DELAY)
+    print(f"pc-build: could not release agent.lock for {name}; it goes stale 25 min after its last refresh", file=sys.stderr)
+    return False
 
 
 def hold(host, options, argv):
@@ -136,7 +187,7 @@ def hold(host, options, argv):
     import threading
 
     name = options.name
-    wait = f"-Action lock -Agent {name} -LockWait {options.lock_wait}"
+    wait = f"-Action lock -Agent {name} -LockWait {options.lock_wait}{LOCK_ARGS}"
     code = run_remote(host, wait)
     if code:
         fail(f"could not take agent.lock (exit {code}); it is held by another agent", code)
@@ -146,29 +197,25 @@ def hold(host, options, argv):
     def beat():
         while not stop.wait(HEARTBEAT_SECONDS):
             result = host.run(rf"powershell -NoProfile -ExecutionPolicy Bypass -File {REMOTE_ROOT}\pc_build_remote.ps1 "
-                              f"-Action lock -Agent {name} -LockWait 0 -Refresh", check=False)
+                              f"-Action lock -Agent {name} -LockWait 0 -Refresh{LOCK_ARGS}", check=False)
             if result.returncode:
                 lost.set()
                 print("pc-build: agent.lock refresh failed; the lock is no longer ours", file=sys.stderr)
 
+    # a terminate or hangup of pc-build itself must still run the release below
+    previous = {}
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        previous[sig] = signal.signal(sig, lambda number, frame: sys.exit(128 + number))
     thread = threading.Thread(target=beat, daemon=True)
     thread.start()
     status = 1
     try:
-        child = subprocess.Popen(argv)
-        try:
-            status = child.wait(timeout=options.max_minutes * 60)
-        except subprocess.TimeoutExpired:
-            child.terminate()
-            try:
-                child.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                child.kill()
-            print(f"pc-build: stopped the command after {options.max_minutes} min (lock hold limit)", file=sys.stderr)
-            status = 124
+        status = supervise(argv, options.max_minutes * 60)
     finally:
         stop.set()
-        run_remote(host, f"-Action unlock -Agent {name} -LockWait 0")
+        release_lock(host, name)
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
     if lost.is_set() and status == 0:
         status = 125
     return status
@@ -189,6 +236,8 @@ def main():
     parser.add_argument("--lock-wait", type=int, default=0, metavar="SECONDS", help="wait this long for agent.lock")
     parser.add_argument("--refresh", action="store_true",
                         help="with lock: touch agent.lock if this agent holds it (non-zero exit if not); long holders call it every few minutes")
+    parser.add_argument("--lock-file", default="agent.lock", metavar="NAME.lock",
+                        help="lock/unlock/hold on this lock file instead of agent.lock (a probe lock for tests)")
     parser.add_argument("--max-minutes", type=float, default=20, help="with hold: stop the command after this long")
     parser.add_argument("--full", action="store_true", help="resend every source file")
     parser.add_argument("--reconfigure", action="store_true", help="delete the build directory first")
@@ -198,6 +247,11 @@ def main():
         fail("pass --config or set SKYRIM_DEVTOOLS_CONFIG")
     if not NAME_RE.fullmatch(options.name):
         fail("name must be letters, digits, dot, dash or underscore")
+    global LOCK_ARGS
+    if options.lock_file != "agent.lock":
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,40}\.lock", options.lock_file):
+            fail("lock file must look like NAME.lock")
+        LOCK_ARGS = f" -LockFile {options.lock_file}"
     host = Host(json.loads(options.config.read_text()))
     started = time.monotonic()
 
@@ -208,7 +262,7 @@ def main():
 
     if options.command in {"lock", "unlock"}:
         refresh = " -Refresh" if options.refresh and options.command == "lock" else ""
-        sys.exit(run_remote(host, f"-Action {options.command} -Agent {options.name} -LockWait {options.lock_wait}{refresh}"))
+        sys.exit(run_remote(host, f"-Action {options.command} -Agent {options.name} -LockWait {options.lock_wait}{refresh}{LOCK_ARGS}"))
 
     t = time.monotonic()
     changed, removed = sync(host, options.name, options.full)

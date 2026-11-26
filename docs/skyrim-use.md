@@ -196,6 +196,32 @@ once a second into a CSV), and restart the game if nothing explains it.
   drew the picture in a corner of the monitor and made the desktop capture black. `Window.info` reports the
   window, client, monitor, swap chain size and DPI awareness, to check the game fills the screen.
 
+## Long sessions
+
+Restart the game about every 30 minutes (`game_stop`, then `game_start`, then load the save again) until the cause of
+the thread growth is fixed: the game's thread count rises by roughly two per second during play and the main thread
+hung at a few thousand threads in the long playtests. `game_stop` leaves the host ready for the next `game_start`
+(it ends the scheduled task and removes the stale lease marker), and `game_start` clears the same leftovers itself
+when no game is running (`staleCleared` in its reply says what it removed).
+
+`game_status` carries a `health` object read from the operating system, so it also answers when the game is hung:
+
+* `threads`, `handles`: the leading indicator; a healthy start is about 100 to 250 threads. Watch the trend, not one value.
+* `privateMB`, `workingSetMB`: memory of the game process.
+* `cpuCores`: CPU used over the last half second, in cores (1.0 is one fully busy core); a hung game with a blocked
+  main thread still burns several.
+* `responding`: false when the game window stopped answering messages; `uptimeS`: age of the process.
+* `healthWarnings` (and `warning`): `threadCount` at 1500 threads or more, `threadGrowth` when the count rose by 60 or
+  more per minute over at least a minute, `notResponding`, and an informational `longSession` after 30 minutes. The
+  limits are config keys `healthThreadWarn`, `healthThreadGrowthPerMin`, `healthGrowthWindowS`, `healthGrowthMinSpanS`
+  and `healthRestartAfterMin`. The MCP link samples health once a minute in the background so the growth rate is
+  known even when nobody calls `game_status`. Each warning has a stable `code` so the alerts layer can raise it as an
+  alert (the single integration point is `GameManager.health_watch.warnings`).
+
+`combat_fight` warns at its start (`warnings`, plus a `warning` event for `events_drain`) when the inventory holds no
+healing potion and the player knows no healing spell. `windows/perf-watch.ps1 -Out FILE -Detach` starts the host
+sampler detached from the SSH session (once a second, with the game's thread count in `gameThreads`); `-Stop` ends it.
+
 ## Showcase video
 
 For a non-technical audience: game footage beside an "agent view" panel (tool calls, status, captions).

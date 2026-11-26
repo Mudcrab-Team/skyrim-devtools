@@ -15,8 +15,10 @@ import time
 
 from ..client import MAX_MESSAGE, TIMEOUT, ConnectionLost, RpcError, Session, observe
 from ..smoke import ACTIVE, WindowsHost
+from .health import HealthWatch
 
 KEEPALIVE_SECONDS = 15
+HEALTH_SAMPLE_SECONDS = 60
 START_RETRIES = 2
 VANITY_OFF_SECONDS = 86400.0
 EVENT_BUFFER = 5000
@@ -110,6 +112,9 @@ class GameManager:
         self.event_total = 0
         self.drain_cursor = 0
         self.subscribed = []
+        self.stale_cleared = []
+        self.health_watch = HealthWatch(self.config)
+        self.health_sampled = 0.0
 
     @property
     def alive(self):
@@ -126,6 +131,10 @@ class GameManager:
             return
         self.events.append(compact)
         self.event_total += 1
+
+    def note_warning(self, code, message):
+        """Put a tool-side warning into the event buffer, where events_drain and the timeline can see it."""
+        self._on_event({"type": "warning", "seq": None, "epoch": None, "data": {"code": code, "message": message}})
 
     def events_since(self, cursor):
         """Buffered events with absolute index >= cursor, plus how many were lost to the ring."""
@@ -202,6 +211,7 @@ class GameManager:
     async def _launch(self, save):
         bootstrap = await self.host.command("start", mode=self.mode)
         self.session_id, self.token, self.port = bootstrap["sessionId"], bootstrap["token"], bootstrap["port"]
+        self.stale_cleared = list(bootstrap.get("staleCleared") or [])
         if not re.fullmatch("[a-f0-9]{32}", self.session_id) or not re.fullmatch("[a-f0-9]{64}", self.token):
             raise GameError("Invalid session bootstrap from the host")
         await self.host.wait_ready(self.session_id)
@@ -276,6 +286,9 @@ class GameManager:
             await asyncio.sleep(self.keepalive_seconds)
             if self.session is None:
                 return
+            if time.monotonic() - self.health_sampled >= HEALTH_SAMPLE_SECONDS:
+                # sampled in the background so the growth rate is known even if nobody asks for the status
+                await self.sample_health()
             try:
                 await self.session.call("Session.ping", timeout=20)
             except (ConnectionLost, OSError, TimeoutError, RpcError, asyncio.TimeoutError):
@@ -283,6 +296,17 @@ class GameManager:
                     if self.phase == "running":
                         await self._recover()
                 return
+
+    async def sample_health(self):
+        """Read the game process health from the host; never raises (a failed read is reported, not fatal)."""
+        self.health_sampled = time.monotonic()
+        try:
+            async with asyncio.timeout(20):
+                raw = await self.host.command("health")
+        except Exception as error:
+            return {"error": f"health read failed: {type(error).__name__}"}
+        health = self.health_watch.record(raw)
+        return health if health is not None else {"running": False}
 
     async def _host_status(self):
         try:
@@ -448,6 +472,8 @@ class GameManager:
             if result["plugin"].get("warning"):
                 result["warning"] = result["plugin"]["warning"]
             result["bufferedEvents"] = self.event_total - self.drain_cursor
+        if self.stale_cleared:
+            result["staleCleared"] = self.stale_cleared
         return result
 
     async def status(self):
@@ -459,4 +485,15 @@ class GameManager:
                 async with self.lock:
                     if self.phase == "running":
                         await self._recover()
-        return await self._status_locked()
+        result = await self._status_locked()
+        if self.phase == "running":
+            # read even when the link is dead: a hung game still shows its thread count and "not responding"
+            result["health"] = await self.sample_health()
+            warnings = self.health_watch.warnings
+            if warnings:
+                # integration point for the alerts layer: raise each warning under its `code`
+                result["healthWarnings"] = warnings
+                text = "; ".join(w["message"] for w in warnings if w["severity"] != "info")
+                if text:
+                    result["warning"] = f"{result['warning']}; {text}" if result.get("warning") else text
+        return result
