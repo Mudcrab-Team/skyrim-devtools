@@ -160,13 +160,16 @@ async def perf_check(manager, seconds=10.0):
 
 
 def last_json(text):
-    for line in reversed(text.strip().splitlines()):
-        line = line.strip()
-        if line.startswith("{"):
+    """The last JSON object in a script's output: one line, or an indented block starting at column 0."""
+    lines = text.strip().splitlines()
+    for index in range(len(lines) - 1, -1, -1):
+        if lines[index].startswith("{"):
             try:
-                return json.loads(line)
+                value = json.loads("\n".join(lines[index:]))
             except ValueError:
                 continue
+            if isinstance(value, dict):
+                return value
     return None
 
 
@@ -209,6 +212,10 @@ async def run_script(ctx, script, root, timeout):
         process.kill()
         raise
     text = data.decode("utf-8", "replace")
+    ctx.artifacts.mkdir(parents=True, exist_ok=True)
+    log = ctx.artifacts / f"{ctx.request_id}-{path.stem}.log"
+    log.write_text(text, encoding="utf-8")
+    ctx.mark(f"script output {log.name}")
     result = last_json(text)
     if result is None:
         return {"pass": False, "details": {"error": "script printed no JSON object", "output": text[-600:]}}

@@ -150,6 +150,12 @@ class LiveTest(unittest.TestCase):
         self.assertEqual(manager.starts, 1)
         self.assertEqual(len(batch.perf), 1)
 
+    def test_last_json_reads_indented_blocks_and_one_liners(self):
+        self.assertEqual(livetest.last_json('log\n{\n "pass": true,\n "details": {\n  "a": 1\n }\n}\n'),
+                         {"pass": True, "details": {"a": 1}})
+        self.assertEqual(livetest.last_json('{"a": 1}\nnoise\n{"b": 2}'), {"b": 2})
+        self.assertIsNone(livetest.last_json("nothing here"))
+
     def test_script_error_and_timeout_are_errors(self):
         manager, batch = self.run_batch([self.req("e", script="tests/live/boom.py")])
         self.assertEqual(batch.outcomes["e"][0]["status"], "error")
