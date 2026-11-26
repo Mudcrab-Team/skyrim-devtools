@@ -124,12 +124,13 @@ def load_timeline(path, footage_start_ms=None):
                                        (record["endMs"] - t0) / 1000, record.get("ok", True),
                                        record.get("summary", ""), record.get("error", "")))
         elif kind == "narrate":
-            narrations.append(((record["ms"] - t0) / 1000, record["text"]))
+            narrations.append(((record["ms"] - t0) / 1000, record["text"], record.get("holdS")))
         elif kind == "status":
             timeline.statuses.append(((record["ms"] - t0) / 1000, {k: v for k, v in record.items() if k not in ("t", "ms")}))
     narrations.sort()
-    for index, (start, text) in enumerate(narrations):
-        hold = max(4.0, 0.07 * len(text) + 1.5)
+    for index, (start, text, hold_s) in enumerate(narrations):
+        # holdS keeps a caption up for a long stretch of footage, for example a frozen game shown sped up
+        hold = float(hold_s) if hold_s else max(4.0, 0.07 * len(text) + 1.5)
         end = start + hold
         if index + 1 < len(narrations):
             end = min(end, narrations[index + 1][0])
@@ -159,6 +160,9 @@ def merge(windows):
     return out
 
 
+LONG_CAPTION_S = 60.0
+
+
 def plan_segments(timeline, duration, speedup=4.0, idle_threshold=3.0, max_idle_out=6.0, speedup_walk=None,
                   speedup_action=1.0):
     """Return [(start, end, speed)] over source time covering [0, duration]; gaps with nothing to watch run faster."""
@@ -170,14 +174,17 @@ def plan_segments(timeline, duration, speedup=4.0, idle_threshold=3.0, max_idle_
             windows.append((call.start - 1.0, call.end + 2.0))
         elif call.name.startswith(QUERY_TOOLS) and call.end - call.start < 2.0:
             windows.append((call.start - 0.15, call.end + 0.4))
-        elif is_boring(call.name):
+        elif is_boring(call.name) or (not call.ok and call.end - call.start > 3.0):
+            # a call that failed after a long wait (a stalled game) is a wait too
             # the moment of the call and of its result stay at normal speed; the middle is the wait
             windows.append((call.start - 0.5, call.start + 1.0))
             windows.append((call.end - 0.5, call.end + 1.0))
         else:
             windows.append((call.start - 0.5, call.end + 1.5))
     for start, end, _ in timeline.captions:
-        windows.append((start - 0.3, end))
+        # a caption held for minutes (holdS) labels a stretch that should still run fast
+        if end - start <= LONG_CAPTION_S:
+            windows.append((start - 0.3, end))
     windows = merge([(max(0.0, s), min(duration, e)) for s, e in windows if e > 0 and s < duration])
     segments = []
     cursor = 0.0
@@ -191,7 +198,7 @@ def plan_segments(timeline, duration, speedup=4.0, idle_threshold=3.0, max_idle_
     segments = [s for s in segments if s[1] - s[0] > 0.02]
     if speedup_action > 1.0:
         # tool activity with no caption or conversation to read (fights, searching) runs a little faster
-        watch = [(a - 0.3, b) for a, b, _ in timeline.captions]
+        watch = [(a - 0.3, b) for a, b, _ in timeline.captions if b - a <= LONG_CAPTION_S]
         watch += [(c.start - 1.0, c.end + 2.0) for c in timeline.calls if is_dialogue(c.name)]
         segments = [(a, b, speedup_action) if speed == 1.0 and not any(w0 < b and a < w1 for w0, w1 in watch)
                     else (a, b, speed) for a, b, speed in segments]
