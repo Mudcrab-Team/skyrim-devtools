@@ -100,7 +100,7 @@ class ToolTests(unittest.TestCase):
             socket.results["Combat.state"] = {"player": player, "hostileTotal": 0, "hostiles": []}
             socket.results["UI.listMenus"] = [{"name": "Tutorial Menu", "open": True}]
             result = json.loads(await h.text("combat_fight", rounds=3))
-            self.assertIn(("UI.closeMenu", {"name": "Tutorial Menu", "wait": True}), [(m, p) for m, p in socket.calls])
+            self.assertIn(("UI.closeMenu", {"name": "Tutorial Menu"}), [(m, p) for m, p in socket.calls])
             socket.results["UI.listMenus"] = [{"name": "InventoryMenu", "open": True}]
             result = json.loads(await h.text("combat_fight", rounds=3))
             self.assertEqual(result["outcome"], "menu open: InventoryMenu")
