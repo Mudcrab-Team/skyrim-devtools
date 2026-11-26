@@ -165,3 +165,69 @@ class HighlightTests(unittest.TestCase):
             path = pathlib.Path(folder) / "t.jsonl"
             path.write_text("\n".join(json.dumps(r) for r in records))
             self.assertEqual(video.load_timeline(path).footage_seconds, 60.0)
+
+
+class PresentationRecordTests(unittest.TestCase):
+    def load(self, records):
+        import tempfile, pathlib
+        folder = tempfile.mkdtemp()
+        path = pathlib.Path(folder) / "t.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in
+                                  [{"t": "capture", "action": "start", "startEpochMs": 1000, "ms": 1000}] + records))
+        return video.load_timeline(path), pathlib.Path(folder)
+
+    def test_slides_insets_metrics_and_banners_are_loaded(self):
+        timeline, folder = self.load([
+            {"t": "chapter", "ms": 3000, "title": "Profiler"},
+            {"t": "slide", "ms": 11000, "image": "flame.png", "durationS": 5},
+            {"t": "inset", "ms": 5000, "image": "/abs/map.png", "durationS": 4, "label": "map"},
+            {"t": "metrics", "ms": 6000, "rows": [["FPS", "60"]]},
+            {"t": "metrics", "ms": 9000, "hide": True},
+            {"t": "event", "ms": 7000, "type": "moveStuck", "data": {"reason": "wall"}},
+            {"t": "event", "ms": 8000, "type": "moveUnstuck", "data": {}},
+            {"t": "alert", "ms": 20000, "action": "raised", "kind": "lowHealth"}])
+        self.assertEqual([(t, d, s["kind"]) for t, d, s in timeline.slides], [(2.0, 3.0, "chapter"), (10.0, 5.0, "slide")])
+        self.assertEqual(timeline.slides[1][2]["image"], str(folder / "flame.png"))
+        self.assertEqual(timeline.insets, [(4.0, 8.0, "/abs/map.png", "map")])
+        perf = lambda at: json.loads(video.panel_state(timeline, at, 1.0)[3]).get("perf")
+        self.assertIsNone(perf(1))
+        self.assertEqual(perf(6)["rows"], [["FPS", "60"]])
+        self.assertIsNone(perf(9))
+        # the stuck banner stays up at least 2.5 s even when the unstuck event comes sooner
+        self.assertEqual(timeline.banners[0], [6.0, 8.5, "STUCK DETECTED: wall"])
+        self.assertEqual(timeline.banners[1][2], "ALERT: lowHealth")
+        state = video.panel_state(timeline, 7, 1.0)
+        self.assertEqual(json.loads(state[3])["banner"], "STUCK DETECTED: wall")
+
+    def test_slides_split_segments_and_land_between_them(self):
+        segments = video.split_at([(0, 10, 1.0), (10, 30, 4.0)], [15.0, 40.0])
+        self.assertEqual(segments, [(0, 10, 1.0), (10, 15.0, 4.0), (15.0, 30, 4.0)])
+        self.assertEqual(video.slide_positions(segments, [15.0, 0.0, 99.0]), [2, 0, 3])
+
+    def test_graph_wires_insets_before_the_split_and_slides_into_the_concat(self):
+        graph = video.filter_script([(0, 10, 1.0), (10, 20, 1.0)], 3.5, 4.0, insets=[(2, 6, 900, 50)], slides=[(1, 4.0)])
+        self.assertIn("[4:v]format=yuv420p[ins0]", graph)
+        self.assertIn("enable='between(t,2.000,6.000)'", graph)
+        self.assertIn("[5:v]fps=30", graph)
+        concat = graph.split(";\n")[-1]
+        self.assertTrue(concat.startswith("[intro][s0][sl0][s1][outro]concat=n=5"), concat)
+
+    def test_frames_with_perf_box_and_banner_draw(self):
+        try:
+            video.need_pillow()
+        except SystemExit:
+            self.skipTest("Pillow not installed")
+        status = {"perf": {"title": "PROFILER top", "badge": "GPU bound", "rows": [["FPS", "60.0"], ["GPU", "84 W"]],
+                           "spark": [16.6, 17.0, 33.0, 16.7]}, "banner": "STUCK DETECTED: wall"}
+        image = video.draw_frame(((), None, "hello", json.dumps(status), 12.0), "title")
+        self.assertEqual(image.size, (video.W, video.H))
+
+    def test_insets_and_banners_play_at_normal_speed(self):
+        timeline, _ = self.load([
+            {"t": "tool", "name": "nav_goto", "args": {}, "startMs": 1000, "endMs": 61000, "ok": True},
+            {"t": "inset", "ms": 11000, "image": "m.png", "durationS": 5},
+            {"t": "event", "ms": 31000, "type": "moveStuck", "data": {}}])
+        segments = video.plan_segments(timeline, 60, speedup=10)
+        self.assertEqual(video.speed_at(segments, 12.0), 1.0)
+        self.assertEqual(video.speed_at(segments, 31.0), 1.0)
+        self.assertGreater(video.speed_at(segments, 45.0), 1.0)
