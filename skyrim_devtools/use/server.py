@@ -26,6 +26,28 @@ Anything the plugin can do that has no curated tool is reachable via rpc_methods
 UNAVAILABLE = "method {} is not available in this plugin build (see rpc_methods); update the plugin or use another tool"
 
 
+FPS_WARN = 30.0
+P99_WARN_MS = 100.0
+
+
+def perf_verdict(stats, hitches, seconds):
+    """Condense Perf.frameStats and Perf.hitches into one reading with warnings."""
+    result = {"seconds": seconds, "frames": stats.get("count"), "fps": stats.get("fps"), "p50Ms": stats.get("p50Ms"),
+              "p99Ms": stats.get("p99Ms"), "maxMs": stats.get("maxMs"), "hitchCount": len(hitches.get("hitches", [])),
+              "worstHitches": sorted(hitches.get("hitches", []), key=lambda h: -h["ms"])[:3],
+              "slowCalls": hitches.get("slowCalls", {}), "warnings": []}
+    fps, p99 = stats.get("fps"), stats.get("p99Ms")
+    if fps is None:
+        result["warnings"].append("no frames were presented in the window: the game is stalled or minimised")
+    else:
+        if fps < FPS_WARN:
+            result["warnings"].append(f"fps {fps} is under {FPS_WARN:g}: play is unreliable; see docs/skyrim-use.md, Performance")
+        if p99 is not None and p99 > P99_WARN_MS:
+            result["warnings"].append(f"p99 frame {p99} ms is over {P99_WARN_MS:g} ms: expect stutter")
+    result["ok"] = not result["warnings"]
+    return result
+
+
 def dumps(value):
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
 
@@ -106,7 +128,8 @@ def build_server(manager, recorder=None):
         """Launch Skyrim on the test PC and connect (30-90 s). headless=true renders no window.
         Optionally load `save` (a name from list_saves, no extension) and wait until the world is playable.
         Idempotent: if a game is already running its status is returned. A crashed game is reported
-        by game_status/any tool; call game_start again to relaunch."""
+        by game_status/any tool; call game_start again to relaunch. With a window (headless=false), call
+        perf_check next: a slideshow game wastes the whole session."""
         return dumps(await manager.start(headless=headless, save=save))
 
     @mcp.tool()
@@ -486,6 +509,26 @@ def build_server(manager, recorder=None):
         """Frame timing (Perf.frameStats): fps, frame-time percentiles in ms and recent hitches. window is
         the look-back in seconds (default: everything buffered)."""
         return dumps(await native("Perf.frameStats", window=window))
+
+    @mcp.tool()
+    async def perf_hitches(limit: int | None = None, since_frame: int | None = None, clear: bool | None = None) -> str:
+        """Frames over the hitch-log threshold (Perf.hitches, default 100 ms) with what the frame thread was doing
+        (threadCpuMs vs blockedMs), process page faults and disk traffic during the hitch, and the plugin's own
+        main-thread calls that overlapped it. slowCalls tallies every handler that held the game thread over 5 ms."""
+        return dumps(await native("Perf.hitches", limit=limit, sinceFrame=since_frame, clear=clear))
+
+    @mcp.tool()
+    async def perf_check(seconds: float = 10.0) -> str:
+        """Quick frame-rate reading for the start of a session: waits `seconds` (default 10, 2-60), then reports
+        fps, median and p99 frame time and the hitches seen, with a warning when fps is under 30 or p99 is over
+        100 ms. Call it first in every playtest, once the world is loaded and before any other tool, and act on
+        a warning (see docs/skyrim-use.md, Performance) instead of playing through a slideshow."""
+        seconds = min(max(float(seconds), 2.0), 60.0)
+        frame = (await native("Perf.frameStats")).get("frame", 0)
+        await asyncio.sleep(seconds)
+        stats = await native("Perf.frameStats", window=seconds)
+        hitches = await native("Perf.hitches", sinceFrame=frame, limit=10)
+        return dumps(perf_verdict(stats, hitches, seconds))
 
     @mcp.tool()
     async def papyrus_log(since: int | None = None, level: str | None = None, limit: int | None = None,

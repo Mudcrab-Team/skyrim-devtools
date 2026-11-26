@@ -66,8 +66,60 @@ namespace
     }
 }
 
+namespace
+{
+    // Where the game thinks it renders versus where Windows puts it: a swap chain smaller than the monitor,
+    // or a window smaller than the swap chain, shows up as a game drawn in a corner of the screen.
+    devtools::Json Info()
+    {
+        using devtools::Json;
+        const auto window = devtools::MainWindow();
+        if (!window) {
+            throw devtools::RpcError(devtools::code::notReady, "The game window does not exist yet");
+        }
+        RECT outer{}, client{};
+        GetWindowRect(window, &outer);
+        GetClientRect(window, &client);
+        const auto monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO monitorInfo{ sizeof(monitorInfo) };
+        GetMonitorInfoW(monitor, &monitorInfo);
+        Json result{
+            { "window", { { "left", outer.left }, { "top", outer.top }, { "width", outer.right - outer.left }, { "height", outer.bottom - outer.top } } },
+            { "client", { { "width", client.right - client.left }, { "height", client.bottom - client.top } } },
+            { "monitor", { { "width", monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left },
+                             { "height", monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top } } },
+            { "style", static_cast<std::uint64_t>(GetWindowLongPtrW(window, GWL_STYLE)) },
+        };
+        const auto user32 = GetModuleHandleW(L"user32.dll");
+        using DpiFn = UINT(WINAPI*)(HWND);
+        using ContextFn = HANDLE(WINAPI*)(HWND);
+        using AwarenessFn = int(WINAPI*)(HANDLE);
+        if (const auto dpi = reinterpret_cast<DpiFn>(GetProcAddress(user32, "GetDpiForWindow"))) {
+            result["dpi"] = dpi(window);
+        }
+        const auto context = reinterpret_cast<ContextFn>(GetProcAddress(user32, "GetWindowDpiAwarenessContext"));
+        const auto awareness = reinterpret_cast<AwarenessFn>(GetProcAddress(user32, "GetAwarenessFromDpiAwarenessContext"));
+        if (context && awareness) {
+            result["dpiAwareness"] = awareness(context(window));  // 0 unaware, 1 system, 2 per-monitor
+        }
+        if (const auto render = RE::BSGraphics::Renderer::GetCurrentRenderWindow(); render && render->swapChain) {
+            REX::W32::DXGI_SWAP_CHAIN_DESC desc{};
+            if (SUCCEEDED(render->swapChain->GetDesc(&desc))) {
+                result["swapChain"] = { { "width", desc.bufferDesc.width }, { "height", desc.bufferDesc.height },
+                    { "windowed", desc.windowed != FALSE }, { "buffers", desc.bufferCount }, { "swapEffect", static_cast<int>(desc.swapEffect) },
+                    { "refreshNum", desc.bufferDesc.refreshRate.numerator }, { "refreshDen", desc.bufferDesc.refreshRate.denominator } };
+            }
+        }
+        return result;
+    }
+}
+
 DEVTOOLS_MODULE(Window)
 {
+    devtools::Register("Window.info", [](const devtools::Json& params) {
+        devtools::AllowOnly(params, {});
+        return Info();
+    }, { .thread = devtools::Thread::UI });
     SetCapability("headless", GetConfig().headless);
     if (GetConfig().headless) {
         // The window appears while the plugin is still loading; move it as soon as it exists so

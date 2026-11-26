@@ -4,6 +4,7 @@
 
 #include "game.h"
 #include "methods.h"
+#include "perf.h"
 
 #include <algorithm>
 #include <condition_variable>
@@ -119,12 +120,29 @@ namespace devtools
             }
         }
 
-        void Run(const Method& method, const Json& params, const ReplyPtr& reply)
+        void Run(const Method& method, const Json& params, const ReplyPtr& reply, const std::string& name, Thread thread,
+            double enqueuedAt)
         {
             // A call that timed out before the game reached it is not run: its client has moved on.
             if (reply->Done()) {
                 return;
             }
+            const double started = perf::Now();
+            struct Timing
+            {
+                const std::string& name;
+                Thread thread;
+                double enqueuedAt;
+                double started;
+                ~Timing()
+                {
+                    if (thread != Thread::Any) {
+                        const double ended = perf::Now();
+                        perf::NoteCall(name, thread == Thread::Main ? "main" : "ui", started, (started - enqueuedAt) * 1000.0,
+                            (ended - started) * 1000.0);
+                    }
+                }
+            } timing{ name, thread, enqueuedAt, started };
             try {
                 method.handler(params, reply);
             } catch (const RpcError& error) {
@@ -261,15 +279,17 @@ namespace devtools
                         { "timeoutMs", method.spec.timeout.count() } });
             }
             const auto tasks = SKSE::GetTaskInterface();
-            switch (method.spec.thread) {
+            const auto thread = method.spec.thread;
+            const double enqueuedAt = perf::Now();
+            switch (thread) {
             case Thread::Main:
-                tasks->AddTask([&method, params, reply] { Run(method, params, reply); });
+                tasks->AddTask([&method, params, reply, name, thread, enqueuedAt] { Run(method, params, reply, name, thread, enqueuedAt); });
                 break;
             case Thread::UI:
-                tasks->AddUITask([&method, params, reply] { Run(method, params, reply); });
+                tasks->AddUITask([&method, params, reply, name, thread, enqueuedAt] { Run(method, params, reply, name, thread, enqueuedAt); });
                 break;
             default:
-                Run(method, params, reply);
+                Run(method, params, reply, name, thread, enqueuedAt);
                 break;
             }
         }

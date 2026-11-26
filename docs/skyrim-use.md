@@ -41,7 +41,7 @@ server speaks plain stdio. When the client exits the server stops the game, so a
 | Observe | `snapshot`, `list_menus {open_only}`, `events_list`, `events_subscribe`, `events_drain {types?, limit}`, `wait_for` |
 | Act | `open_menu`, `close_menu`, `console {command, target}`, `press_key`, `press_control`, `mouse`, `release_all_input`, `look {yaw_deg, pitch_deg}` |
 | Saves and world | `list_saves`, `load_save`, `reload`, `center_on_cell` |
-| State (newer plugin builds) | `player_state`, `player_inventory`, `world_nearby`, `world_crosshair`, `quest_get`, `quest_find`, `quest_active`, `activate`, `message_box`, `message_box_select`, `dialogue_state`, `dialogue_select`, `dialogue_wait`, `dialogue_advance`, `dialogue_close`, `ui_list_items`, `ui_select_item`, `ui_dump`, `ui_get`, `ui_set`, `ui_invoke`, `ui_list`, `dialogue_start`, `screenshot` (image), `perf_frame_stats`, `papyrus_log` |
+| State (newer plugin builds) | `player_state`, `player_inventory`, `world_nearby`, `world_crosshair`, `quest_get`, `quest_find`, `quest_active`, `activate`, `message_box`, `message_box_select`, `dialogue_state`, `dialogue_select`, `dialogue_wait`, `dialogue_advance`, `dialogue_close`, `ui_list_items`, `ui_select_item`, `ui_dump`, `ui_get`, `ui_set`, `ui_invoke`, `ui_list`, `dialogue_start`, `screenshot` (image), `perf_frame_stats`, `perf_hitches`, `perf_check`, `papyrus_log` |
 | Perceive | `world_inspect {ref_id, nodes, graph, scripts}`, `world_models {contains, radius, limit}`, `screen_capture {ref_id or x,y,z or region, zoom, pad, include_ui}` (image), `game_setting {name, value?}` |
 | Move and camera | `walk {direction, duration_ms or distance, run?, sprint?}`, `turn_to {heading_deg or x,y or ref_id}`, `jump`, `sneak {on}`, `camera_state`, `camera_set {mode, yaw_deg, pitch_deg, zoom, fov}`, `camera_look_at {ref_id or x,y,z}` |
 | Combat | `combat_state {radius}`, `combat_target`, `combat_face`, `combat_draw`, `combat_equip {name, hand}`, `combat_unequip`, `combat_attack {kind=light\|power, hand}`, `combat_block`, `combat_cast`, `combat_drink {kind}`, `combat_fight {style, rounds, drink_below}` (a bounded loop over the primitives), `player_equipped`, `player_spells` |
@@ -104,6 +104,23 @@ one. Loop: `dialogue_start` -> `dialogue_wait` (greeting and topics) -> `dialogu
 fast path (and the one that works with muted audio). A trainer, merchant or gift topic opens another menu over
 the dialogue; `dialogue_wait` then answers `submenu` and the conversation stays frozen until that menu is closed
 so act in it first and leave it with the exit key (`press_control Cancel`) or `dialogue_close`; hiding a training menu with `close_menu` was followed by a frozen game within two minutes in two of two runs, so `open_menu` now refuses trainer, barter, gift, container, lockpicking, crafting, dialogue and book menus (pass `force` to override) and `close_menu` leaves them with the Cancel control. Muted (headless) audio does not stall a conversation, but every line still lasts as long as its voice, so use `skip`. The plugin turns dialogue subtitles on so NPC lines can be read.
+
+## Performance
+
+Call `perf_check` first in every playtest, once the world is loaded and before any other tool. It waits 10 s,
+then reports fps, p50/p99 frame time and the worst hitches, and warns when fps is under 30 or p99 is over
+100 ms. On a warning do not play on: read `perf_hitches` (each hitch with the frame thread's CPU time versus
+blocked time, process page faults and disk traffic, and the plugin's own main-thread calls that overlapped it),
+then check the host (`windows/perf-watch.ps1` samples memory, paging, disk queue, CPU per process and GPU load
+once a second into a CSV), and restart the game if nothing explains it.
+
+* `Perf.hitches` logs every frame over 100 ms (`Perf.configure {hitchLogMs}`); `slowCalls` tallies each handler
+  that held the game thread over 5 ms (also written to the plugin log from 20 ms).
+* `tools/perf_session.py` is the A/B harness: one visible game session, phases of idle, walking, polling,
+  scanning and a Riverwood navigation loop with the desktop capture, one reading per phase.
+* A visible game runs borderless-windowed at the profile's resolution (`bFull Screen=0`): exclusive fullscreen
+  drew the picture in a corner of the monitor and made the desktop capture black. `Window.info` reports the
+  window, client, monitor, swap chain size and DPI awareness, to check the game fills the screen.
 
 ## Showcase video
 

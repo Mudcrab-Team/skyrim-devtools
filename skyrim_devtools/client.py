@@ -188,11 +188,18 @@ class Session:
     async def frame_stats(self, window=None):
         return await self.call("Perf.frameStats", **({} if window is None else {"window": window}))
 
+    async def perf_hitches(self, limit=None, since_frame=None, clear=None, calls=None):
+        params = {key: value for key, value in
+                  {"limit": limit, "sinceFrame": since_frame, "clear": clear, "calls": calls}.items() if value is not None}
+        return await self.call("Perf.hitches", **params)
+
     async def perf_reset(self):
         return await self.call("Perf.reset")
 
-    async def perf_configure(self, hitch_ms=None, ring_size=None):
+    async def perf_configure(self, hitch_ms=None, ring_size=None, hitch_log_ms=None):
         params = {}
+        if hitch_log_ms is not None:
+            params["hitchLogMs"] = hitch_log_ms
         if hitch_ms is not None:
             params["hitchMs"] = hitch_ms
         if ring_size is not None:

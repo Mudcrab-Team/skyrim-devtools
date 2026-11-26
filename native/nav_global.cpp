@@ -3,12 +3,15 @@
 // Loads the offline worldspace graphs and joins the player and the goal to them. The graph files
 // are derived from the user's own plugins and live next to the runs, never in the repository:
 // <scratch>/navgraph/<worldspace editor id>.navg, or the folder SKYRIM_DEVTOOLS_NAVGRAPH names.
+#include "game.h"
 #include "methods.h"
 #include "nav_path.h"
 
 #include <chrono>
 #include <fstream>
 #include <map>
+#include <mutex>
+#include <thread>
 #include <memory>
 #include <sstream>
 
@@ -23,6 +26,9 @@ namespace
         std::filesystem::file_time_type stamp;
         std::string error;
     };
+
+    // Guards the cache: a background read at start-up races the first Nav.goto.
+    std::mutex cacheMutex;
 
     std::map<std::string, Loaded>& Cache()
     {
@@ -59,6 +65,7 @@ namespace
             note = "No navigation graph for this worldspace; build one with skyrim-devtools-navgraph";
             return nullptr;
         }
+        std::lock_guard lock(cacheMutex);
         const auto stamp = std::filesystem::last_write_time(path, ec);
         auto& entry = Cache()[world];
         if (entry.stamp != stamp || (!entry.graph && entry.error.empty())) {
@@ -145,4 +152,29 @@ namespace devtools::nav
         }
         return out;
     }
+}
+
+// Reading and parsing a worldspace graph took up to half a second on the game thread at the first
+// Nav.goto, which showed as a visible hitch; reading them once the data is loaded moves that off it.
+DEVTOOLS_MODULE(NavGraphWarm)
+{
+    OnSkseMessage([](SKSE::MessagingInterface::Message& message) {
+        if (message.type != SKSE::MessagingInterface::kDataLoaded) {
+            return;
+        }
+        std::thread([] {
+            std::error_code ec;
+            const auto folder = GraphFile("x").parent_path();
+            if (folder.empty() || !std::filesystem::is_directory(folder, ec)) {
+                return;
+            }
+            for (const auto& entry : std::filesystem::directory_iterator(folder, ec)) {
+                if (entry.path().extension() == ".navg") {
+                    std::string file;
+                    std::string note;
+                    Graph(entry.path().stem().string(), file, note);
+                }
+            }
+        }).detach();
+    });
 }
