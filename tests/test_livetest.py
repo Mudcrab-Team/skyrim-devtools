@@ -73,6 +73,7 @@ def write(directory, name, text):
 
 class LiveTest(unittest.TestCase):
     def setUp(self):
+        livetest.START_SETTLE = 0
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmp.name)
         write(self.dir, "tests/live/ok.py", "async def run(ctx):\n    ctx.mark('hi')\n    return {'pass': True, 'details': {'n': 1}}\n")
@@ -155,6 +156,12 @@ class LiveTest(unittest.TestCase):
                          {"pass": True, "details": {"a": 1}})
         self.assertEqual(livetest.last_json('{"a": 1}\nnoise\n{"b": 2}'), {"b": 2})
         self.assertIsNone(livetest.last_json("nothing here"))
+
+    def test_host_start_failure_is_retried(self):
+        write(self.dir, "tests/live/flaky.py", "import json, pathlib, sys\nmark = pathlib.Path(__file__).with_suffix('.mark')\nif not mark.exists():\n    mark.write_text('x')\n    print('RuntimeError: Windows host start failed')\n    sys.exit(1)\nprint(json.dumps({'pass': True, 'details': {}}))\n")
+        livetest.START_RETRY_WAIT = 0.01
+        manager, batch = self.run_batch([self.req("fl", script="tests/live/flaky.py")])
+        self.assertEqual(batch.outcomes["fl"][0]["status"], "pass")
 
     def test_script_error_and_timeout_are_errors(self):
         manager, batch = self.run_batch([self.req("e", script="tests/live/boom.py")])
