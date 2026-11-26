@@ -290,13 +290,14 @@ def render_report(request, outcomes, timeline, notes, perf):
 
 
 class Batch:
-    def __init__(self, manager, results_dir, root, config_path=None, perf_interval=PERF_INTERVAL, perf_seconds=10.0):
+    def __init__(self, manager, results_dir, root, config_path=None, perf_interval=PERF_INTERVAL, perf_seconds=10.0, perf_save=""):
         self.manager = manager
         self.results = Path(results_dir)
         self.root = Path(root)
         self.config_path = config_path
         self.perf_interval = perf_interval
         self.perf_seconds = perf_seconds
+        self.perf_save = perf_save
         self.perf = []
         self.last_perf = None
         self.notes = {}
@@ -351,16 +352,19 @@ class Batch:
             for case in request.cases:
                 if only_case and case["name"] != only_case:
                     continue
-                needs_game = uses_session(case, self.root, self.config_path) or self.perf_due()
-                if needs_game:
+                session_case = uses_session(case, self.root, self.config_path)
+                if session_case or self.perf_due():
+                    # a standalone script loads its own save; the game started for a perf reading only needs a world
+                    wanted = request.setup if session_case else self.perf_save
                     try:
+                        was_alive = self.manager.alive
                         await self.ensure_game()
-                        if request.setup and (loaded != request.setup or not self.manager.alive):
-                            await ctx.setup(request.setup)
-                            loaded = request.setup
+                        if wanted and (loaded != wanted or not was_alive):
+                            await ctx.setup(wanted)
+                            loaded = wanted
                     except Exception as error:
                         loaded = None
-                        self.note(request.id, f"setup {request.setup} failed: {error}")
+                        self.note(request.id, f"setup {wanted} failed: {error}")
                         results.append({"name": case["name"], "expect": case.get("expect", ""), "status": "error",
                                         "details": {}, "error": f"setup failed: {error}", "seconds": 0})
                         continue
@@ -413,7 +417,7 @@ async def amain(options):
     if not requests:
         print("no requests")
         return 1
-    batch = Batch(manager, options.results, options.root, options.config)
+    batch = Batch(manager, options.results, options.root, options.config, perf_save=options.perf_save)
     try:
         await batch.run(requests, getattr(options, "case", None), options.case_timeout)
     finally:
@@ -435,6 +439,7 @@ def main(argv=None):
     parser.add_argument("--root", type=Path, default=Path.cwd(), help="checkout the case scripts are resolved against")
     parser.add_argument("--results", type=Path, help="report directory (default: <queue>/results)")
     parser.add_argument("--case-timeout", type=float, default=None, help="seconds per case unless the case sets timeout_s")
+    parser.add_argument("--perf-save", default="", help="save to load for perf readings taken before standalone scripts")
     parser.add_argument("--keep", action="store_true", help="leave the game running afterwards")
     options = parser.parse_args(argv)
     if not options.config:
