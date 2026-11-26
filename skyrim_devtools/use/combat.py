@@ -9,6 +9,8 @@ import asyncio
 import json
 import time
 
+from . import ranged
+
 MELEE_REACH = 170.0
 POWER_STAMINA_PCT = 70
 CASTER_STYLES = {"mage", "caster"}
@@ -94,6 +96,8 @@ def healing_spells(spells):
 
 
 def register(mcp, native, manager):
+    ranged.register(mcp, native, manager)
+
     @mcp.tool()
     async def player_equipped() -> str:
         """What the player wears and holds: rightHand, leftHand (weapon, shield or spell), worn armor, voice power."""
@@ -181,7 +185,8 @@ def register(mcp, native, manager):
         returns outcome "retreated" (health low, no way to heal) so you can flee with nav_goto or rest.
         It also judges the fight (enemy levels and health against yours, and trades lost so far) and returns outcome
         "outmatched" with `assessment` before it loses, at the start or mid-fight; stand_ground=true fights on
-        regardless. Returns what happened per round summarised, plus your lowest health. Use the primitives instead
+        regardless. A target it cannot walk to (higher with no navmesh path) is shot with a bow when one is carried
+        (see combat_shoot), otherwise it returns outcome "unreachable"; style ranged always shoots. Returns what happened per round summarised, plus your lowest health. Use the primitives instead
         when you want to choose each move yourself."""
         started = time.monotonic()
         log = []
@@ -197,6 +202,8 @@ def register(mcp, native, manager):
         except Exception:  # an older plugin build: potions only
             healers = []
         have_potion = True
+        ranged_memory = {}
+        unreachable_advice = None
         for number in range(1, rounds + 1):
             if time.monotonic() - started > timeout_s:
                 log.append("timeout")
@@ -231,6 +238,15 @@ def register(mcp, native, manager):
             if action == "done":
                 log.append(arg)
                 break
+            if action in ("approach", "attack") and style not in CASTER_STYLES:
+                # a target that cannot be walked to (a bridge above, no navmesh path) is shot or reported
+                step = await ranged.fight_step(native, manager, state, ranged_memory, number, force=style == "ranged")
+                if step:
+                    log.append(step["log"])
+                    if step.get("stop"):
+                        unreachable_advice = step.get("advice")
+                        break
+                    continue
             if action == "drink":
                 try:
                     await native("Combat.drink", kind="health")
@@ -287,7 +303,11 @@ def register(mcp, native, manager):
                   "player": final["player"], "hostilesLeft": final["hostileTotal"], "hostiles": final["hostiles"]}
         if assessment:
             result["assessment"] = assessment
-        if result["outcome"] in ("outmatched", "retreated"):
+        if ranged_memory.get("shots"):
+            result["rangedShots"] = ranged_memory["shots"]
+        if unreachable_advice:
+            result["advice"] = unreachable_advice
+        if result["outcome"] in ("outmatched", "retreated") and not unreachable_advice:
             result["advice"] = ("flee with nav_goto (the enemies keep chasing; a door or a fast travel breaks contact), "
                                 "or call combat_fight again with stand_ground=true to fight on")
         return dumps(result)
