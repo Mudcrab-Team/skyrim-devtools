@@ -7,7 +7,7 @@ import tempfile
 import unittest
 import zlib
 
-from skyrim_devtools import profiling
+from skyrim_devtools import profile_views, profiling
 
 
 def write_symbols(root):
@@ -235,6 +235,90 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(raw["hz"], 1000.0)
         self.assertEqual(summary["transfer"]["encoding"], "json")
         self.assertEqual(calls[1], ("Profile.stop", {}))
+
+
+
+class ViewTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        write_symbols(self.root)
+        self.symbols = profiling.GameSymbols(self.root)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_top_snapshot_folds_pcs_into_functions(self):
+        reply = {"seconds": 3.0, "hz": 250.0, "ready": True, "warm": True, "samples": 100, "waiting": 20,
+                 "self": [dict(FRAMES[0], n=50), dict(FRAMES[0], rva=0x1020, n=10), dict(FRAMES[3], n=15), dict(FRAMES[5], n=5)],
+                 "total": [dict(FRAMES[0], n=80), dict(FRAMES[3], n=15)],
+                 "waits": [dict(FRAMES[4], n=20)], "modules": MODULES,
+                 "memory": {"workingSetMb": 3000.0, "privateMb": 3500.0, "residentPct": 85.7, "pageFaultsPerS": 12.0,
+                            "systemAvailableMb": 9000.0},
+                 "threads": {"count": 80, "processCpuPct": 140.0, "cores": 16,
+                             "top": [{"tid": 1, "name": "main", "cpuS": 10.0, "pct": 90.0}]},
+                 "gpu": {"utilPct": 60.0, "engines": {"3D": 60.0}, "vramMb": 2048.0}, "profiling": False}
+
+        async def call(method, **params):
+            if method == "Profile.top":
+                return reply
+            return {"fps": 60.0, "p50Ms": 16.6, "p99Ms": 20.1, "maxMs": 25.0, "count": 180}
+
+        snap = asyncio.run(profile_views.top_snapshot(call, self.symbols))
+        self.assertEqual(snap["topSelf"][0]["function"], "Alpha::Run")
+        self.assertEqual(snap["topSelf"][0]["samples"], 60)
+        self.assertEqual(snap["topSelf"][0]["pct"], 60.0)
+        self.assertEqual(snap["topSelf"][0]["totalPct"], 80.0)
+        self.assertEqual(snap["main"]["busyPct"], 80.0)
+        self.assertEqual(snap["waits"][0]["function"], "NtWaitForSingleObject")
+        self.assertAlmostEqual(snap["main"]["namedPct"], 80.0)
+        text = profile_views.render_top(snap)
+        self.assertIn("fps", text)
+        self.assertIn("Alpha::Run", text)
+        self.assertIn("VRAM 2.00 GB", text)
+        self.assertTrue(any(profiling.CRASHLOGGER_CREDIT in c for c in snap["credits"]))
+
+    def test_top_snapshot_cold(self):
+        async def call(method, **params):
+            if method == "Profile.top":
+                return {"seconds": 3.0, "hz": 250.0, "ready": False, "warm": False}
+            raise RuntimeError("no Present hook")
+
+        snap = asyncio.run(profile_views.top_snapshot(call))
+        self.assertIn("no main-thread samples", profile_views.render_top(snap))
+
+    def test_recorder_marks_window(self):
+        path = self.root / "t.jsonl"
+        lines = [{"t": "tool", "name": "walk", "startMs": 10_500, "endMs": 11_000},
+                 {"t": "narrate", "ms": 12_000, "text": "entering Riverwood"},
+                 {"t": "tool", "name": "late", "startMs": 99_000, "endMs": 99_100},
+                 {"t": "status", "ms": 10_600}]
+        path.write_text("\n".join(json.dumps(x) for x in lines) + "\nnot json\n", encoding="utf-8")
+        marks = profile_views.recorder_marks(path, 10_000, 5_000)
+        self.assertEqual(marks, [[500, 1000, "tool", "walk"], [2000, 2000, "narrate", "entering Riverwood"]])
+
+    def test_timeline_html(self):
+        raw = raw_profile(RUNS)
+        raw["marks"] = [[2.0, 9.0, "load", "Loading Menu"], [1.0, 1.5, "rpc", "Console.execute</script>"]]
+        profile = profiling.Profile(raw, self.symbols)
+        data = profile_views.timeline_data(profile)
+        self.assertEqual([m[2] for m in data["marks"]], ["rpc", "load", "hitch"])
+        thread = data["threads"][0]
+        self.assertEqual(sum(s[2] for s in thread["samples"]), 10)
+        self.assertEqual(thread["onCpu"], 7)
+        leaf = thread["samples"][0][1]
+        names = []
+        while leaf >= 0:
+            names.append(data["functions"][data["tree"][leaf][1]][0])
+            leaf = data["tree"][leaf][0]
+        self.assertEqual(names[::-1], ["Alpha::Run", "Beta::Tick (guess)", "id:77+0x10"])
+        page = profile_views.timeline_html(profile)
+        self.assertTrue(page.startswith("<!doctype html>"))
+        self.assertNotIn("</script>\"", page)
+        self.assertEqual(page.count("</script>"), 1)
+        with tempfile.TemporaryDirectory() as out:
+            paths, _ = profiling.save_outputs(profile, out)
+            self.assertTrue(Path(paths["timeline"]).exists())
 
 
 if __name__ == "__main__":

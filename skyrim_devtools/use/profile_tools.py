@@ -8,14 +8,14 @@ import json
 from pathlib import Path
 import time
 
-from .. import profiling
+from .. import profile_views, profiling
 
 
 def dumps(value):
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
 
 
-def register(mcp, native, manager):
+def register(mcp, native, manager, recorder=None):
     state = {"symbols": None}
 
     def symbols():
@@ -36,9 +36,13 @@ def register(mcp, native, manager):
         stacks, the module split (game / plugin / skse / gpu-driver / kernel / system / other-dll), what the
         thread waited on, slow frames (>100 ms) with their stacks and wait chain, sampler overhead and the
         share of game samples with a real function name. Also writes raw data, a Firefox Profiler profile
-        (profile.json.gz, open at profiler.firefox.com) and flame graph SVGs to out_dir (default
+        (profile.json.gz, open at profiler.firefox.com) and flame graph SVGs and timeline.html (threads, frames, cell loads, tool calls and
+        hitches on one zoomable time axis) to out_dir (default
         .local/profiles/<stamp> on this machine) and returns their paths."""
         raw, _ = await profiling.fetch(native)
+        if recorder is not None and raw.get("startEpochMs"):
+            raw.setdefault("marks", []).extend(profile_views.recorder_marks(
+                recorder.path, raw["startEpochMs"], raw.get("durationS", 0) * 1000.0))
         profile = profiling.Profile(raw, symbols())
         out = Path(out_dir).expanduser() if out_dir else profiling.default_out()
         paths, summary = profiling.save_outputs(profile, out)
@@ -70,3 +74,19 @@ def register(mcp, native, manager):
                                      "hitchFrames": raw.get("frames", []), "frames": [], "stacks": []}, symbols())
         return dumps({"status": raw.get("status"),
                       "hitches": profile.hitches(), "credits": profile.credits() or None, "at": time.time()})
+
+    @mcp.tool()
+    async def profile_top(seconds: float = 3.0, top: int = 15) -> str:
+        """Live snapshot without stopping anything, like nvidia-smi for the game: fps and frame time p50/p99,
+        main thread busy vs waiting %, its top functions by self % over the last `seconds`, per-thread CPU %,
+        process memory (working set vs private bytes; a low resident % means trimmed pages faulting back in),
+        page faults/s and GPU utilisation/VRAM. Each call keeps the main-thread sampler (250 Hz) running for
+        10 s, so the first call after a pause has few samples; call again a second later. Rates are null on a
+        first call."""
+        return dumps(await profile_views.top_snapshot(native, symbols(), seconds=seconds, top=top))
+
+    @mcp.tool()
+    async def profile_mark(name: str, kind: str = "marker", duration_ms: float = 0.0) -> str:
+        """Put a named span ending now on the running profile's timeline (kind: marker, alert, narrate or your
+        own word). Ignored when no profile is running."""
+        return dumps(await native("Profile.mark", kind=kind, name=name, durationMs=duration_ms))
