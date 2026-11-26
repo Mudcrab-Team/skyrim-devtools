@@ -282,7 +282,8 @@ class LiveHelperTests(unittest.TestCase):
                 self.percent = 100
 
             async def call(self, method, timeout=None, **params):
-                return {"distance": 1000.0 * min(self.percent, 300) / 100}
+                steady = 400.0 * min(self.percent, 300) / 100
+                return {"distance": steady * 4, "durationMs": 4000, "speed": {"steadyUnitsPerSecond": steady}}
 
         manager = Manager()
 
@@ -304,4 +305,11 @@ class LiveHelperTests(unittest.TestCase):
         out = run(scenario())
         self.assertEqual(out["ratioToNormal"][300], 3.0)
         self.assertEqual(out["ratioToNormal"][400], 3.0)
+        self.assertEqual(out["steadySpeed"][100], 400.0)
+        # 400 delivering only 3x is 75% of the request: inside the 70% bound
         self.assertTrue(out["pass"])
+
+    def test_walked_speed_prefers_the_steady_median_and_falls_back_to_distance(self):
+        self.assertEqual(self.mod.walked_speed({"speed": {"steadyUnitsPerSecond": 900.0}, "distance": 1, "durationMs": 1000}), 900.0)
+        self.assertEqual(self.mod.walked_speed({"distance": 2000.0, "durationMs": 4000}), 500.0)
+        self.assertIsNone(self.mod.walked_speed({"error": "x"}))

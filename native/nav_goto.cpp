@@ -16,6 +16,7 @@
 #include "nav_path.h"
 #include "quest_targets.h"
 #include "speed.h"
+#include "speed_math.h"
 
 #include <deque>
 #include <set>
@@ -815,6 +816,21 @@ namespace
         return Dist2D(pos, point) < xyRadius && std::abs(pos.z - point.z) < zTolerance;
     }
 
+    // Horizontal speed over roughly the last second, from the position history.
+    double RecentSpeed(const Process& p)
+    {
+        if (p.history.size() < 2) {
+            return 0.0;
+        }
+        const auto& newest = p.history.back();
+        for (const auto& sample : p.history) {
+            if (newest.t - sample.t <= 1.0 && newest.t - sample.t > 0.2) {
+                return Dist2D(sample.pos, newest.pos) / (newest.t - sample.t);
+            }
+        }
+        return 0.0;
+    }
+
     // Distance along the route to the next sharp corner within `within`, or a negative number.
     double SharpCornerAhead(const Process& p, const RE::NiPoint3& pos, double within, double minTurn)
     {
@@ -1041,7 +1057,7 @@ namespace
             p.offPathNow = graph::SegmentDistance2D({ pos.x, pos.y, pos.z },
                 { p.plan.points[p.waypoint - 1].x, p.plan.points[p.waypoint - 1].y, 0.0 },
                 { p.plan.points[p.waypoint].x, p.plan.points[p.waypoint].y, 0.0 });
-            deviated = p.offPathNow > 200.0;
+            deviated = p.offPathNow > speed::math::OffPathLimit(200.0, RecentSpeed(p));
             // On another level than the segment it is following (under the deck it should be crossing):
             // the plan no longer describes where the player is.
             const auto& from = p.plan.points[p.waypoint - 1];
@@ -1078,11 +1094,11 @@ namespace
             // A sharp corner is reached properly (its point already keeps clear of the walls); a gentle
             // bend may be rounded.
             while (p.waypoint + 1 < p.plan.points.size() &&
-                   AtLevel(pos, p.plan.points[p.waypoint], TurnAt(p.plan, p.waypoint) >= sharpTurnDeg ? 35.0 : 90.0)) {
+                   AtLevel(pos, p.plan.points[p.waypoint], TurnAt(p.plan, p.waypoint) >= sharpTurnDeg ? 35.0 : speed::math::GentleReach(90.0, RecentSpeed(p)))) {
                 ++p.waypoint;
             }
             if (p.waypoint < p.plan.points.size()) {
-                aim = LookAhead(p, pos, 150.0);
+                aim = LookAhead(p, pos, speed::math::LookAheadDistance(150.0, RecentSpeed(p)));
             }
             if (p.waypoint + 1 == p.plan.points.size() && !p.plan.complete && AtLevel(pos, p.plan.points[p.waypoint], 90.0)) {
                 // Plan the next stretch before reaching the end of this one, so there is no pause.
@@ -1716,7 +1732,12 @@ namespace
         }
         p.combat = player->IsInCombat();
         // Fast only while walking undisturbed: combat, dialogue, doors, loading and recovery run at normal speed.
-        speed::Boost(p.fast > 0.0F && p.state == "moving" && p.interruption.empty() && !p.combat ? p.fast : 0.0F);
+        // Dropped ahead of a sharp corner: at three times the walk speed the player overshoots it and the planner
+        // replans, which cost more time than the boost saved. The distance follows the requested percent, not the
+        // measured speed, so slowing down does not make the boost flip back on before the corner.
+        const bool cornerAhead = p.fast > 0.0F && p.plan.found &&
+            SharpCornerAhead(p, pos, speed::math::BrakeDistance(speed::math::normalRunSpeed * p.fast / 100.0), 45.0) >= 0.0;
+        speed::Boost(p.fast > 0.0F && p.state == "moving" && p.interruption.empty() && !p.combat && !cornerAhead ? p.fast : 0.0F);
 
         Json details;
         const auto reason = DetectInterruption(p, *player, now, details);

@@ -76,27 +76,39 @@ def nav_verdict(runs):
             "pass": bool(normal_ok and all(v for k, v in arrived.items() if k != "100") and fast["seconds"] < normal["seconds"] * 0.6)}
 
 
+def walked_speed(result):
+    """Steady speed (units per second) of a Move.walk reply; the plugin's median after the ramp when present."""
+    if not isinstance(result, dict):
+        return None
+    speed = result.get("speed")
+    if isinstance(speed, dict) and speed.get("steadyUnitsPerSecond"):
+        return speed["steadyUnitsPerSecond"]
+    seconds = result.get("durationMs", 0) / 1000.0
+    return result.get("distance", 0) / seconds if seconds > 0 else None
+
+
 async def case_speed(manager, tool, details):
-    walked, mult = {}, {}
+    """Steady walking speed per requested percent. The distance over a fixed 3 s walk mixes the ramp and any obstacle
+    in the way (it clustered at 1400-1600 units for 150-250% where a rock or the slope ended the walk), so the
+    median per-poll speed after the ramp is what is compared."""
+    steady, distance, mult = {}, {}, {}
     for walk in SWEEP:
         reading = await tool("game_speed", walk=walk)
         mult[walk] = reading.get("speedMult") if isinstance(reading, dict) else reading
         # the movement code picks the new speed up over a moment; measuring straight away reads the old one
         await asyncio.sleep(1.5)
-        samples = []
-        for _ in range(2):
-            result = await manager.call("Move.walk", timeout=30, direction="forward", durationMs=3000, run=True)
-            samples.append(result.get("distance") if isinstance(result, dict) else None)
-            await asyncio.sleep(0.5)
-        walked[walk] = samples
+        result = await manager.call("Move.walk", timeout=30, direction="forward", durationMs=4000, run=True)
+        steady[walk] = walked_speed(result)
+        distance[walk] = result.get("distance") if isinstance(result, dict) else None
+        await asyncio.sleep(0.5)
     reset = await tool("game_speed", reset=True)
-    numbers = {w: [d for d in v if isinstance(d, (int, float))] for w, v in walked.items()}
-    base = min(numbers[100], default=None)
-    ratio = {w: round(sum(v) / len(v) / base, 2) for w, v in numbers.items() if v} if base else {}
-    # 400 is reported only: the engine's animation-driven movement stops following SpeedMult near 3x
-    ok = bool(base) and all(ratio.get(w, 0) >= (w / 100) * 0.7 for w in (150, 200, 250, 300))
-    details["speed"] = {"distance3s": walked, "ratioToNormal": ratio, "speedMultReadback": mult, "afterReset": reset, "pass": ok,
-                        "expect": "ratio to the 100% distance is within 30% of the percent at 150..300; 400 is informative"}
+    base = steady.get(100)
+    ratio = {w: round(v / base, 2) for w, v in steady.items() if v and base}
+    # the 70% bound applies to every percent; a value outside it is reported with the achieved speed in game_speed `measured`
+    ok = bool(base) and all(ratio.get(w, 0) >= (w / 100) * 0.7 for w in (150, 200, 250, 300, 400))
+    details["speed"] = {"steadySpeed": steady, "distance4s": distance, "ratioToNormal": ratio, "speedMultReadback": mult,
+                        "afterReset": reset, "pass": ok,
+                        "expect": "steady speed ratio to the 100% walk is at least 70% of the percent, 150..400"}
 
 
 async def case_nav(manager, tool, reload, details):
@@ -152,11 +164,13 @@ async def case_travel(manager, tool, reload, details):
     after = readings[-1]
     gained = after.get("daysPassed", 0) - mid.get("daysPassed", 0)
     stable = all(abs(r.get("daysPassed", 0) - readings[0].get("daysPassed", 0)) < 0.05 for r in readings)
+    # the reply is written before the engine rebuilds the global from its counters; they must agree
+    consistent = isinstance(waited, dict) and abs(waited.get("daysPassed", 0) - after.get("daysPassed", 0)) < 0.05
     day_moved = (after.get("day"), after.get("month")) != (mid.get("day"), mid.get("month"))
     details["travel"] = {"markers": markers, "unforced": refused, "forced": forced, "cell": state.get("cell"), "waited": waited,
-                         "timeBefore": before, "timeAfterTravel": mid, "readings": readings, "daysGained": round(gained, 3),
+                         "timeBefore": before, "timeAfterTravel": mid, "readings": readings, "daysGained": round(gained, 3), "replyMatchesReading": consistent,
                          "pass": isinstance(forced, dict) and "error" not in forced and isinstance(waited, dict)
-                         and 1.1 < gained < 1.4 and stable and day_moved}
+                         and 1.1 < gained < 1.4 and stable and consistent and day_moved}
 
 
 async def run_cases(manager, tool, cases, details):

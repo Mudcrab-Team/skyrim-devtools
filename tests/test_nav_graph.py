@@ -25,6 +25,9 @@ class NavGraphTests(unittest.TestCase):
     def test_global_route(self):
         self.run_cpp("nav_global_test")
 
+    def test_speed_math(self):
+        self.run_cpp("speed_math_test")
+
 
 if __name__ == "__main__":
     unittest.main()

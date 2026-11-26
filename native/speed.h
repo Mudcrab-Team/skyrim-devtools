@@ -15,6 +15,11 @@ namespace devtools::speed
     // gives control back to the manual setting.
     void Boost(float percent);
 
+    // Records the steady horizontal speed (units per second) the player was measured to walk at the current
+    // walk percent; Game.speed reports it as `measured`.
+    void Observe(double unitsPerSecond);
+    float AppliedPercent();
+
     // Moves the game clock forward and reports the before/after reading; throws not-ready without a calendar.
     Json SkipHours(float hours);
 }

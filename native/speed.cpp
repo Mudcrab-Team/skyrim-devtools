@@ -6,6 +6,7 @@
 #include "speed.h"
 
 #include "events.h"
+#include "speed_math.h"
 #include "state_common.h"
 
 #include <algorithm>
@@ -23,6 +24,13 @@ namespace
     float manual = 0.0F;      // Game.setSpeed walk, 0 when unset
     float boost = 0.0F;       // automatic boost, 0 when off
     float applied = 0.0F;
+
+    struct Observed
+    {
+        double unitsPerSecond = 0.0;
+        float percent = 100.0F;
+        bool valid = false;
+    } observed;  // the last measured steady walk, so the API can say what the engine actually delivered
 
     float tempDelta = 0.0F;  // the temporary modifier this module has put on SpeedMult
 
@@ -100,6 +108,11 @@ namespace
             out["speedMult"] = Round(values->GetActorValue(kSpeed));
             out["speedMultBase"] = Round(values->GetBaseActorValue(kSpeed));
         }
+        if (observed.valid) {
+            // Percent is what was requested; the measured speed is what the movement code delivered.
+            out["measured"] = { { "unitsPerSecond", Round(observed.unitsPerSecond, 1) }, { "atPercent", Round(observed.percent) },
+                { "perPercent", Round(observed.unitsPerSecond / std::max(observed.percent, 1.0F), 100.0) } };
+        }
         if (const auto calendar = RE::Calendar::GetSingleton(); calendar && calendar->timeScale) {
             out["timescale"] = Round(calendar->timeScale->value);
         }
@@ -119,20 +132,15 @@ namespace devtools::speed
         const auto beforeDays = calendar->gameDaysPassed->value;
         const auto beforeRaw = calendar->rawDaysPassed;
         const auto beforeMidnights = calendar->midnightsPassed;
-        // The skip is added to each counter instead of recomputed from one of them, so every counter keeps its
-        // own convention. The engine rebuilds the global from its counters on every update, so they move too;
-        // otherwise the skip is undone on the next frame (the global fell back by the skipped days).
-        const double added = hours / 24.0;
-        const double total = static_cast<double>(beforeDays) + added;
-        const double hourNow = std::fmod(static_cast<double>(beforeHour) + hours, 24.0);
-        const auto crossed = static_cast<std::uint32_t>(std::floor((static_cast<double>(beforeHour) + hours) / 24.0));
-        // rawDaysPassed is either the running day count (it tracks the global) or only the fraction of the
-        // current day; whichever it is, it keeps the same convention after the skip.
-        const bool rawIsTotal = std::abs(static_cast<double>(beforeRaw) - static_cast<double>(beforeDays)) < 0.01;
-        calendar->midnightsPassed = beforeMidnights + crossed;
-        calendar->rawDaysPassed = rawIsTotal ? static_cast<float>(static_cast<double>(beforeRaw) + added) : static_cast<float>(hourNow / 24.0);
-        calendar->gameDaysPassed->value = static_cast<float>(total);
-        calendar->gameHour->value = static_cast<float>(hourNow);
+        // Every counter moves, since the engine rebuilds the global from them on each update and would otherwise
+        // undo the skip or, with a wrongly converted counter, count part of it twice.
+        const auto skipped = math::Skip({ beforeHour, beforeDays, beforeRaw, beforeMidnights }, hours);
+        const auto crossed = skipped.crossed;
+        const bool rawIsTotal = !skipped.rawExcludesToday;
+        calendar->midnightsPassed = skipped.after.midnights;
+        calendar->rawDaysPassed = static_cast<float>(skipped.after.raw);
+        calendar->gameDaysPassed->value = static_cast<float>(skipped.after.daysPassed);
+        calendar->gameHour->value = static_cast<float>(skipped.after.hour);
         if (calendar->gameDay && calendar->gameMonth && calendar->gameYear) {
             AdvanceDate(*calendar, static_cast<int>(crossed));
         }
@@ -144,6 +152,13 @@ namespace devtools::speed
         events::Emit("timeSkipped", out);
         return out;
     }
+
+    void Observe(double unitsPerSecond)
+    {
+        observed = { unitsPerSecond, overridden ? applied : 100.0F, true };
+    }
+
+    float AppliedPercent() { return overridden ? applied : 100.0F; }
 
     void Boost(float percent)
     {
@@ -162,6 +177,7 @@ DEVTOOLS_MODULE(Speed)
             boost = 0.0F;
             applied = 0.0F;
             tempDelta = 0.0F;
+            observed = {};
         }
     });
 
