@@ -36,4 +36,10 @@ namespace devtools::view
     void AddDoorDetails(RE::TESObjectREFR* ref, Json& out);
 
     [[nodiscard]] RE::PlayerCharacter& RequirePlayer();
+
+    // The engine keeps the player's combat flag set for a while after the fight is over (a teleport or a load
+    // leaves it behind), so "in combat" needs a living, loaded actor that is fighting the player right now.
+    [[nodiscard]] int ActiveCombatants(RE::PlayerCharacter& player);
+    // Ends combat and alarm state on the player and on everyone fighting them; returns how many actors were stopped.
+    int ClearPlayerCombat(RE::PlayerCharacter& player);
 }

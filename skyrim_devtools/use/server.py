@@ -230,6 +230,17 @@ def build_server(manager, recorder=None, board=None):
         board.sync(state)
         return state
 
+    def resync_after_load(event):
+        """A load clears every alert; those the plugin still holds come back from its own list."""
+        if event.get("type") != "loadGame":
+            return
+        try:
+            asyncio.get_running_loop().create_task(sync_alerts())
+        except RuntimeError:
+            pass
+
+    manager.event_listeners.append(resync_after_load)
+
     # ---- lifecycle ----------------------------------------------------------------------------
 
     @mcp.tool()
@@ -358,7 +369,8 @@ def build_server(manager, recorder=None, board=None):
 
     @mcp.tool()
     async def center_on_cell(cell: str) -> str:
-        """Teleport the player to a cell by editor id (console `coc`), e.g. WhiterunBanneredMare. Returns console lines."""
+        """Teleport the player to a cell by editor id (console `coc`), e.g. WhiterunBanneredMare. Returns console lines and `combatCleared`: how many actors
+        fighting the player were stopped, because the combat state would otherwise follow the player away."""
         return dumps(await manager.call("World.centerOnCell", cell=cell))
 
     # ---- waiting and events -------------------------------------------------------------------

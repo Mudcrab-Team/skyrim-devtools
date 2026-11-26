@@ -344,7 +344,7 @@ namespace
             s.healthMax = player->GetActorValueMax(RE::ActorValue::kHealth);
             s.carry = values->GetActorValue(RE::ActorValue::kInventoryWeight);
             s.carryMax = values->GetActorValue(RE::ActorValue::kCarryWeight);
-            s.inCombat = player->IsInCombat();
+            s.inCombat = view::ActiveCombatants(*player) > 0;
             s.dead = player->IsDead();
             s.swimming = player->AsActorState()->IsSwimming();
             s.pitchDeg = player->GetAngleX() * radiansToDegrees;

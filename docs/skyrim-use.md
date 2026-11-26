@@ -174,7 +174,7 @@ the showcase composer shows the active kinds in the status panel.
 | `crime` | a bounty gained, stolen goods value rising, or a hostile guard (held 60 s) | pay, jail or avoid |
 | `targetDead`, `targetUnreachable` | a tracked quest's target actor is dead (the detail says if it is essential), or is disabled or in no cell; checked every `targetCheckS` (10 s) | re-check the quest, reload, or another route |
 | `lowHealthNoHeal` | health under `lowHealthPct` (30) with no restoring potion and no healing spell | retreat, rest, console heal |
-| `moveStuck` | the movement stuck detector's `moveStuck` event, until `moveUnstuck` | another route, open the door |
+| `moveStuck` | the movement stuck detector's `moveStuck` event, until `moveUnstuck`, an arrival, a new `nav_goto`/`walk`/`nav_cancel`, a teleport or a cell change; a loaded save clears every alert (those still true in the plugin return at the next sync) | another route, open the door |
 
 Change thresholds with `agent_alerts {configure: {"thresholds": {"questStalledMin": 3}, "disable": ["crime"]}}`;
 the plugin owns the native keys (`Alerts.configure`), the MCP server the `actionLoop*` and `blind*` ones. Alerts
