@@ -8,6 +8,7 @@
 // navmeshes, holds Forward towards the next bend, and when the goal is beyond the loaded cells
 // walks to the nearest reachable point and plans again as cells stream in.
 #include "console.h"
+#include "inspect.h"
 #include "events.h"
 #include "menu_util.h"
 #include "methods.h"
@@ -60,6 +61,7 @@ namespace
         std::string state = "planning";  // planning, moving, recovering, paused, door, arrived, failed, cancelled
         std::string onCombat = "flee";
         std::string reason;
+        Json blockers;  // set when the walk fails at a dead end
         double started = 0.0;
         double timeout = 300.0;
         bool run = true;
@@ -328,7 +330,7 @@ namespace
         Json out{ { "id", p.id }, { "state", p.state }, { "mode", p.mode }, { "goal", p.goal.describe },
             { "elapsedS", Round((p.ended > 0 ? p.ended : Now()) - p.started, 10.0) }, { "stuckCount", p.stuckCount },
             { "replans", p.replans }, { "travelled", Round(p.travelled) }, { "combat", p.combat },
-            { "reason", p.reason.empty() ? Json(nullptr) : Json(p.reason) }, { "teleports", p.teleports }, { "unsticks", p.unsticks } };
+            { "reason", p.reason.empty() ? Json(nullptr) : Json(p.reason) }, { "blockers", p.blockers.is_null() ? Json(nullptr) : p.blockers }, { "teleports", p.teleports }, { "unsticks", p.unsticks } };
         if (const auto player = RE::PlayerCharacter::GetSingleton()) {
             const auto pos = player->GetPosition();
             const auto goalPos = GoalPosition(p);
@@ -721,7 +723,9 @@ namespace
                 return;
             }
             if (p.deadEnds > 5) {
-                Finish(p, "failed", "Dead end: the loaded navmeshes have no way closer to the goal");
+                const auto stop = p.plan.points.empty() ? pos : p.plan.points.back();
+                p.blockers = inspect::Blockers(stop, target);
+                Finish(p, "failed", "Dead end: the loaded navmeshes have no way closer to the goal; " + inspect::BlockerSummary(p.blockers));
                 return;
             }
         }

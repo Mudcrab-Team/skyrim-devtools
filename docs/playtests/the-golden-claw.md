@@ -119,3 +119,60 @@ attack phase, 9 won fights. Not exercised live: `Combat.cast` (the fixture has n
 
 Screenshots live under `.local/playtests/golden-claw/`, the tool-call log in `toollog.jsonl`, the composed video
 in `.local/videos/golden-claw.mp4`. Nothing game-derived is in this repository.
+
+## Addendum: a full run with the perception tools
+
+A second run took the quest from the pillar room to Lucan's reward (MS13 stage 100, completed) with the new
+perception tools (`world_inspect`, `world_models`, `screen_capture` with zoom and crop, dead-end `blockers`)
+and the idle vanity camera switched off. About 110 minutes of play; a 4:45 highlight cut was composed from
+the narration markers with `--highlights`.
+
+**How the puzzles were read.**
+* Pillars: `screen_capture` zoomed on each stone face over the gate (the middle tablet lies on the floor and
+  was read there); `world_inspect` gave each pillar's node rotation, so one push established the cycle order
+  instead of guessing from pixels. The first guess read the tablets mirrored and kept the gate shut (one
+  lever pull wasted); the direct reading opened it.
+* Claw door: `world_models contains=claw` found the door rings; the claw's palm was read by rotating it in the
+  inventory and cropping with UI kept (`include_ui` was added for this). The rings were set from the reading.
+* Webs, chains, the exit: `world_inspect`'s "activates" field named the portcullis a chain opens and the handle
+  that opens the secret exit; `world_models contains=web` found the web door the navmesh stops at.
+
+**Fallbacks and findings (logged, not hidden).**
+* God-mode fallback: after three deaths to draugr groups (level 1 character, no potions), the rest of the
+  barrow was walked with `nav_goto invulnerable=true on_combat=fight`. A player would have levelled first.
+* Objective missed: navigation walked past the word wall, so Lucan had no topic for the claw. A save before
+  the sanctum was reloaded and the wall found with `world_models contains=word`. No tool shows where the
+  current quest target is.
+* Nav ping-pong (high): from the barrow exit, `nav_goto place=Riverwood` re-planned through the exit door it had
+  just used and walked in and out for about 12 minutes. A `route=global` goal set from outside worked; no fast
+  travel was used. Fix: after a door transition, do not plan back through the same door; prefer the global
+  route right after a door.
+* Low frame rate (high): `Perf.frameStats` read 10 fps with the desktop capture running (median frame 16.7 ms,
+  p99 1.4 s, hitches up to 14-31 s). 10 s after stopping the capture: 4.8 fps; walking: 3.7 fps; 20 s settled:
+  14.9 fps, p99 0.7 s. Stopping the capture did not remove the hitches, so the capture is not the main cause;
+  multi-second stalls during long sessions are. Not yet diagnosed.
+
+**Improvements, most costly first** (time is this run's estimated loss).
+1. Multi-second hitches / low fps (~40 min across nav, fights and dialogue): log each hitch with cell loads,
+   streaming and host CPU in `Perf.frameStats`; take an A/B at session start as routine.
+2. No quest-target tool (~25 min re-run after missing the word wall): `quest_targets` returning the objective's
+   alias refs and positions, as the compass marker shows a player.
+3. Combat at level 1 without potions (~20 min, three deaths): `combat_fight` retreats and heals below a
+   threshold, and reports "outmatched" early so the agent can choose a fallback.
+4. Nav door ping-pong (~15 min): do not re-plan through the door just used; global route after any door.
+5. Nav planner returns to an old dead end after a gate or web opened (~10 min): invalidate cached dead ends
+   when a nearby `World.inspect` open state changes.
+6. Plugin build rounds from header differences between the Mac and PC CommonLib (~10 min): build against the
+   PC headers only, or sync them into the worktree.
+7. `nav_wait` times out (RPC -32008) during cell loads (~5 min): treat a load as progress, not a timeout.
+8. Blocker heuristic blamed the wrong web (~5 min): rank candidates by whether they lie on the straight line
+   to the goal and by load-door links; include a crop of the stop view.
+9. Inventory navigation ignored `press_key`; `press_control Accept/Down` worked (~5 min): document it in the
+   menu tools, or add `ui_inspect_item`.
+10. `combat_unequip` left the sword off after a conversation (~3 min): re-equip the previous weapon on draw.
+11. `screen_capture` dropped menus (~3 min): fixed here with `include_ui`.
+12. Stale daemon after a rebuild (~3 min): the server warns when its own code is older than the files.
+13. Arrival radius 150 versus activation reach (~3 min): `nav_goto` with `ref_id` stops within activation reach.
+14. Lock refresh during long holds (minor): refresh automatically while a game session is open.
+15. Long footage and a full Mac disk (~10 min): `--emit-dir` composes on the host; a `capture_stop transcode`
+    step would make the copy small enough to fetch.

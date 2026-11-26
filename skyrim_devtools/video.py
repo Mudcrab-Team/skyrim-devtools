@@ -1,10 +1,13 @@
 """Compose a showcase video: game footage beside an "agent view" panel, boring stretches sped up.
 
   skyrim-devtools-video compose --footage x.mp4 --timeline t.jsonl -o out.mp4 [--speedup-idle 4] [--title ...]
+  ... compose ... --highlights [--skip 71:00-73:40] [--target-length 270]   # a highlight cut around narration
+  ... compose ... --keep 0:30-6:00 --keep 14:00-15:30                     # only these stretches of footage
+  ... compose ... --emit-dir work/ --duration 6640                         # write the inputs; run ffmpeg elsewhere
 
 The panel (recent tool calls, status, captions) is drawn with Pillow as one still image per change in
 source time, turned into a video, and overlaid with the footage in a single ffmpeg run that also applies
-the speed-up segments and the title cards. Needs `pip install -e .[video]` and ffmpeg on PATH.
+the speed-up segments and the title cards. Needs `pip install -e .[video]` and ffmpeg 7 or newer on PATH.
 """
 
 import argparse
@@ -97,6 +100,7 @@ class Timeline:
     captions: list = field(default_factory=list)  # (start, end, text)
     statuses: list = field(default_factory=list)  # (t, dict)
     footage_start_ms: int | None = None
+    footage_seconds: float | None = None  # from the capture stop record, when the timeline has one
 
 
 def load_timeline(path, footage_start_ms=None):
@@ -108,6 +112,10 @@ def load_timeline(path, footage_start_ms=None):
         footage_start_ms = starts[-1]
     t0 = footage_start_ms
     timeline = Timeline(footage_start_ms=t0)
+    stops = [r["stopEpochMs"] for r in records if r.get("t") == "capture" and r.get("action") == "stop"
+             and r.get("startEpochMs") == t0 and r.get("stopEpochMs")]
+    if stops:
+        timeline.footage_seconds = (stops[-1] - t0) / 1000
     narrations = []
     for record in records:
         kind = record.get("t")
@@ -193,6 +201,62 @@ def plan_segments(timeline, duration, speedup=4.0, idle_threshold=3.0, max_idle_
         segments = [(a, b, max(speed, speedup_walk, (b - a) / max_idle_out)) if speed > 1.0 and any(
             w0 <= (a + b) / 2 <= w1 for w0, w1 in walks) else (a, b, speed) for a, b, speed in segments]
     return segments
+
+
+def parse_time(text):
+    """Seconds from "SS", "M:SS" or "H:MM:SS" (fractions allowed)."""
+    seconds = 0.0
+    for part in str(text).strip().split(":"):
+        seconds = seconds * 60 + float(part)
+    return seconds
+
+
+def parse_interval(text):
+    start, sep, end = str(text).partition("-")
+    if not sep:
+        raise ValueError(f"interval {text!r} is START-END")
+    start, end = parse_time(start), parse_time(end)
+    if end <= start:
+        raise ValueError(f"interval {text!r} ends before it starts")
+    return (start, end)
+
+
+def narration_windows(timeline, before=4.0, after=6.0):
+    """Footage stretches worth keeping in a highlight cut: from `before` seconds ahead of each narration
+    marker to `after` seconds past the end of its caption. Narration is written at the moments the agent
+    found worth explaining, so it is the cheapest available signal of what a viewer wants to see."""
+    return merge([(max(0.0, start - before), end + after) for start, end, _ in timeline.captions])
+
+
+def subtract(windows, holes):
+    out = []
+    for start, end in windows:
+        pieces = [(start, end)]
+        for h0, h1 in holes:
+            pieces = [p for a, b in pieces for p in ((a, min(b, h0)), (max(a, h1), b)) if p[1] - p[0] > 1e-6]
+        out += pieces
+    return [list(p) for p in sorted(out)]
+
+
+def restrict(segments, keep):
+    """The parts of the speed plan inside the kept windows; everything else is cut out."""
+    out = []
+    for start, end, speed in segments:
+        for k0, k1 in keep:
+            a, b = max(start, k0), min(end, k1)
+            if b - a > 0.02:
+                out.append((a, b, speed))
+    return sorted(out)
+
+
+def fit_length(segments, target, max_factor=2.0):
+    """Speed every segment up by one common factor (at most max_factor) so the cut lasts about `target`
+    seconds. Returns (segments, factor); factor 1 when the cut is already short enough."""
+    length = sum((e - s) / sp for s, e, sp in segments)
+    if not target or length <= target:
+        return segments, 1.0
+    factor = min(length / target, max_factor)
+    return [(s, e, sp * factor) for s, e, sp in segments], factor
 
 
 def gap_segment(start, end, speedup, idle_threshold, max_idle_out):
@@ -393,6 +457,13 @@ def build_panel_images(timeline, duration, segments, title, workdir):
         length = times[index + 1] - start
         if length <= 1e-3:
             continue
+        if not any(a <= start + 1e-4 < b for a, b, _ in segments):
+            # cut out of the result: one cheap still keeps the panel stream aligned with the footage
+            if "cut" not in cache:
+                cache["cut"] = workdir / "panel-cut.png"
+                need_pillow()[0].new("RGB", (W, H), BG).save(cache["cut"])
+            entries.append((cache["cut"], length))
+            continue
         # sample just after the boundary so a call that starts here is already shown as running
         state = panel_state(timeline, start + 1e-4, speed_at(segments, start + 1e-4))
         if state not in cache:
@@ -410,7 +481,7 @@ def write_concat(entries, path):
     path.write_text("\n".join(lines) + "\n")
 
 
-def filter_script(segments, intro, outro):
+def filter_script(segments, intro, outro, fade=0.0):
     """One graph: overlay footage on the panel video, cut the speed segments, join with the cards."""
     parts = [f"[0:v]fps={FPS},format=yuv420p,setpts=PTS-STARTPTS[panel]",
              f"[1:v]setpts=PTS-STARTPTS,fps={FPS},scale={GAME_W}:{GAME_H}:force_original_aspect_ratio=decrease,"
@@ -425,7 +496,13 @@ def filter_script(segments, intro, outro):
         labels.append("[intro]")
         index += 1
     for i, (start, end, speed) in enumerate(segments):
-        parts.append(f"[c{i}]trim=start={start:.4f}:end={end:.4f},setpts=(PTS-STARTPTS)/{speed:.4f},fps={FPS}[s{i}]")
+        # a short fade marks a jump in a highlight cut, where the footage skips ahead
+        cut_in = fade and i and abs(segments[i - 1][1] - start) > 0.05
+        cut_out = fade and i + 1 < count and abs(segments[i + 1][0] - end) > 0.05
+        out_len = (end - start) / speed
+        fades = (f",fade=t=in:st=0:d={fade}" if cut_in else "") + (
+            f",fade=t=out:st={max(out_len - fade, 0):.4f}:d={fade}" if cut_out else "")
+        parts.append(f"[c{i}]trim=start={start:.4f}:end={end:.4f},setpts=(PTS-STARTPTS)/{speed:.4f},fps={FPS}{fades}[s{i}]")
         labels.append(f"[s{i}]")
     if outro:
         parts.append(f"[{index}:v]fps={FPS},scale={W}:{H},setsar=1,format=yuv420p,fade=t=in:st=0:d=0.4[outro]")
@@ -443,17 +520,32 @@ def compose(options):
     if start_ms is None and options.use_sidecar and sidecar.exists():
         start_ms = json.loads(sidecar.read_text()).get("startEpochMs")
     timeline = load_timeline(options.timeline, start_ms)
-    duration = probe_duration(footage)
+    duration = getattr(options, "duration", None) or (timeline.footage_seconds if getattr(options, "emit_dir", None)
+                                                       else None) or probe_duration(footage)
     segments = plan_segments(timeline, duration, options.speedup_idle, options.idle_threshold, options.max_idle,
                              options.speedup_walk, options.speedup_action)
+    keep = [list(parse_interval(k)) for k in getattr(options, "keep", None) or []]
+    if getattr(options, "highlights", False):
+        keep += narration_windows(timeline, options.highlight_before, options.highlight_after)
+    skip = [parse_interval(k) for k in getattr(options, "skip", None) or []]
+    if keep or skip:
+        segments = restrict(segments, subtract(merge(keep) if keep else [[0.0, duration]], skip))
+        if not segments:
+            raise SystemExit("nothing left to show: the kept windows are empty")
+    segments, factor = fit_length(segments, getattr(options, "target_length", None))
     out_seconds = sum((e - s) / sp for s, e, sp in segments)
     print(f"footage {duration:.1f}s, {len(timeline.calls)} tool calls, {len(timeline.captions)} captions, "
-          f"{len(segments)} segments -> {out_seconds:.1f}s")
+          f"{len(segments)} segments -> {out_seconds:.1f}s" + (f" (all sped up x{factor:.2f} to fit)" if factor > 1 else ""))
     if options.dry_run:
         for s, e, sp in segments:
             print(f"  {s:7.1f}-{e:7.1f}  x{sp:g}")
         return 0
-    workdir = Path(tempfile.mkdtemp(prefix="skyrim-video-"))
+    emit = getattr(options, "emit_dir", None)
+    if emit:
+        Path(emit).mkdir(parents=True, exist_ok=True)
+    workdir = Path(emit) if emit else Path(tempfile.mkdtemp(prefix="skyrim-video-"))
+    if emit:
+        workdir = workdir.resolve()
     try:
         entries = build_panel_images(timeline, duration, segments, options.title or "", workdir)
         concat = workdir / "panel.txt"
@@ -470,21 +562,31 @@ def compose(options):
                        ("skyrim-use: automated playtesting for Skyrim mods", 28, ACCENT, "sans")], workdir / "outro.png")
             cards = [("intro.png", intro), ("outro.png", outro)]
         script = workdir / "graph.txt"
-        script.write_text(filter_script(segments, intro, outro))
+        cut = bool(keep or skip)
+        script.write_text(filter_script(segments, intro, outro, fade=0.25 if cut else 0.0))
+        if emit:
+            # the concat list and graph name their files relative to the folder, so it can be copied to
+            # the host that holds the footage and run there
+            write_concat([(Path(image).name, length) for image, length in entries], concat)
+        local = (lambda name: name) if emit else (lambda name: str(workdir / name))
         command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-stats", "-y",
-                   "-f", "concat", "-safe", "0", "-i", str(concat), "-i", str(footage)]
+                   "-f", "concat", "-safe", "0", "-i", local("panel.txt"), "-i", str(footage)]
         for name, length in cards:
-            command += ["-loop", "1", "-t", f"{length}", "-framerate", str(FPS), "-i", str(workdir / name)]
-        command += ["-filter_complex_script", str(script), "-map", "[out]", "-c:v", options.encoder,
+            command += ["-loop", "1", "-t", f"{length}", "-framerate", str(FPS), "-i", local(name)]
+        command += ["-/filter_complex", local("graph.txt"), "-map", "[out]", "-c:v", options.encoder,
                     "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(options.output)]
         if options.encoder == "h264_videotoolbox":
             command = [c for c in command if c not in ("-preset", "veryfast", "-crf", "20")]
             command[command.index(str(options.output)):command.index(str(options.output))] = ["-b:v", "10M"]
+        if emit:
+            (workdir / "command.json").write_text(json.dumps(command, indent=1))
+            print(f"wrote the ffmpeg inputs to {workdir}; run command.json from inside that folder")
+            return 0
         result = subprocess.run(command)
         if result.returncode:
             raise SystemExit(f"ffmpeg failed with code {result.returncode} (work files kept in {workdir})")
     except BaseException:
-        if options.keep_work:
+        if options.keep_work or emit:
             print(f"work files kept in {workdir}", file=sys.stderr)
         else:
             shutil.rmtree(workdir, ignore_errors=True)
@@ -565,6 +667,17 @@ def main(argv=None):
     c.add_argument("--keep-work", action="store_true")
     c.add_argument("--encoder", default="libx264", help="ffmpeg video encoder (h264_videotoolbox is faster on a Mac)")
     c.add_argument("--no-sidecar", dest="use_sidecar", action="store_false")
+    c.add_argument("--keep", action="append", metavar="START-END",
+                   help="only show this stretch of footage (seconds or M:SS); repeat for several")
+    c.add_argument("--highlights", action="store_true",
+                   help="only show the stretches around narration markers (adds to --keep)")
+    c.add_argument("--highlight-before", type=float, default=4.0, help="seconds kept before each narration marker")
+    c.add_argument("--highlight-after", type=float, default=6.0, help="seconds kept after each caption ends")
+    c.add_argument("--skip", action="append", metavar="START-END", help="cut this stretch out; repeat for several")
+    c.add_argument("--target-length", type=float, help="speed the whole cut up (at most 2x) to last about this many seconds")
+    c.add_argument("--duration", type=float, help="footage length in seconds (default: ffprobe, or the capture stop record with --emit-dir)")
+    c.add_argument("--emit-dir", help="write panel stills, cards, graph and command.json here instead of running ffmpeg, "
+                   "to run on the host that holds the footage; --footage is then that host's path")
     options = parser.parse_args(argv)
     if options.part:
         return compose_parts(options)

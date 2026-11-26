@@ -18,6 +18,7 @@ from ..smoke import ACTIVE, WindowsHost
 
 KEEPALIVE_SECONDS = 15
 START_RETRIES = 2
+VANITY_OFF_SECONDS = 86400.0
 EVENT_BUFFER = 5000
 # console lines are already returned by the console tool, so subscribing would only add noise
 QUIET_EVENTS = {"console"}
@@ -206,10 +207,19 @@ class GameManager:
                 await self._close_link()
                 await asyncio.sleep(1)
         await observe(self._snapshot_raw, lambda s: any(m["name"] == "Main Menu" for m in s["menus"]), "Main menu", 60)
+        await self._quiet_vanity_camera()
         self.phase = "running"
         self.keepalive_task = asyncio.create_task(self._keepalive())
         if save:
             await self._load_save_locked(save)
+
+    async def _quiet_vanity_camera(self):
+        """The idle orbit camera starts after a couple of minutes without input, which is most of an agent's
+        thinking time, and turns screenshots and recordings into a slow spin. Config vanityCamera=true keeps it."""
+        if self.config.get("vanityCamera") or "Setting.set" not in self.methods:
+            return
+        with contextlib.suppress(RpcError, TimeoutError, asyncio.TimeoutError):
+            await self.session.call("Setting.set", name="fAutoVanityModeDelay:Camera", value=VANITY_OFF_SECONDS)
 
     async def _get_info(self):
         info = await self.session.call("Session.getInfo")

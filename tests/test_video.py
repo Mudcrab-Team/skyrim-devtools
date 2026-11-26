@@ -116,3 +116,52 @@ class ComposeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HighlightTests(unittest.TestCase):
+    def test_parse_interval_accepts_seconds_and_clock(self):
+        self.assertEqual(video.parse_interval("90-1:45"), (90.0, 105.0))
+        self.assertEqual(video.parse_interval("1:00:00-1:00:30.5"), (3600.0, 3630.5))
+        with self.assertRaises(ValueError):
+            video.parse_interval("50-40")
+        with self.assertRaises(ValueError):
+            video.parse_interval("50")
+
+    def test_narration_windows_pad_and_merge(self):
+        t = video.Timeline(footage_start_ms=0)
+        t.captions = [(10, 15, "a"), (18, 22, "b"), (100, 104, "c")]
+        self.assertEqual(video.narration_windows(t, before=2, after=3), [[8, 25], [98, 107]])
+
+    def test_subtract_cuts_holes(self):
+        self.assertEqual(video.subtract([[0, 100]], [(10, 20), (50, 60)]), [[0, 10], [20, 50], [60, 100]])
+        self.assertEqual(video.subtract([[0, 10]], [(0, 10)]), [])
+
+    def test_restrict_keeps_only_windows_and_their_speeds(self):
+        segments = [(0, 10, 1.0), (10, 40, 5.0), (40, 50, 1.0)]
+        self.assertEqual(video.restrict(segments, [[5, 15], [45, 60]]),
+                         [(5, 10, 1.0), (10, 15, 5.0), (45, 50, 1.0)])
+
+    def test_fit_length_caps_the_speed_up(self):
+        segments = [(0, 100, 1.0), (100, 200, 2.0)]
+        fitted, factor = video.fit_length(segments, 75)
+        self.assertAlmostEqual(factor, 2.0)
+        self.assertAlmostEqual(sum((e - s) / sp for s, e, sp in fitted), 75)
+        same, factor = video.fit_length(segments, 500)
+        self.assertEqual((same, factor), (segments, 1.0))
+
+    def test_jumps_fade_but_continuous_segments_do_not(self):
+        graph = video.filter_script([(0, 10, 1.0), (10, 20, 4.0), (50, 60, 1.0)], 0, 0, fade=0.25)
+        lines = [line for line in graph.split(";\n") if "trim=" in line]
+        self.assertNotIn("fade", lines[0])
+        self.assertIn("fade=t=out", lines[1])
+        self.assertIn("fade=t=in", lines[2])
+
+    def test_capture_stop_gives_the_footage_length(self):
+        import tempfile, pathlib
+        records = [{"t": "capture", "action": "start", "startEpochMs": 1000, "ms": 1000},
+                   {"t": "narrate", "ms": 5000, "text": "x"},
+                   {"t": "capture", "action": "stop", "startEpochMs": 1000, "stopEpochMs": 61000, "ms": 61000}]
+        with tempfile.TemporaryDirectory() as folder:
+            path = pathlib.Path(folder) / "t.jsonl"
+            path.write_text("\n".join(json.dumps(r) for r in records))
+            self.assertEqual(video.load_timeline(path).footage_seconds, 60.0)
