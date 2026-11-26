@@ -149,13 +149,20 @@ HEARTBEAT_SECONDS = 240
 UNLOCK_ATTEMPTS = 3
 LOCK_ARGS = ""  # set from --lock-file
 RETRY_DELAY = 2
+HELD_ENV = "PC_BUILD_HELD_AS"
 
 
-def supervise(argv, max_seconds):
+def agent_name(name):
+    """The lock name of an enclosing hold with this --name, else the name itself."""
+    held = os.environ.get(HELD_ENV, "")
+    return held if held.rpartition(".")[0] == name else name
+
+
+def supervise(argv, max_seconds, env=None):
     """Run a command in its own process group and stop the whole group when the time limit passes.
 
     A grandchild left running (a game driver spawning helpers) would otherwise outlive the hold."""
-    child = subprocess.Popen(argv, start_new_session=True)
+    child = subprocess.Popen(argv, start_new_session=True, env=env)
 
     def stop_group(sig):
         try:
@@ -199,7 +206,9 @@ def hold(host, options, argv):
     """Own agent.lock around a long command: refresh it in the background, always release it."""
     import threading
 
-    name = options.name
+    # The remote lock is re-entrant by agent name, so two holds sharing --name would both run at once; each hold
+    # takes it under its own name and hands that name to nested pc-build calls (a --deploy inside the command).
+    name = f"{options.name}.{os.getpid()}"
     wait = f"-Action lock -Agent {name} -LockWait {options.lock_wait}{LOCK_ARGS}"
     code = run_remote(host, wait)
     if code:
@@ -222,7 +231,7 @@ def hold(host, options, argv):
     thread.start()
     status = 1
     try:
-        status = supervise(argv, options.max_minutes * 60)
+        status = supervise(argv, options.max_minutes * 60, dict(os.environ, **{HELD_ENV: name}))
     finally:
         stop.set()
         release_lock(host, name)
@@ -274,7 +283,7 @@ def main():
 
     if options.command in {"lock", "unlock"}:
         refresh = " -Refresh" if options.refresh and options.command == "lock" else ""
-        sys.exit(run_remote(host, f"-Action {options.command} -Agent {options.name} -LockWait {options.lock_wait}{refresh}{LOCK_ARGS}"))
+        sys.exit(run_remote(host, f"-Action {options.command} -Agent {agent_name(options.name)} -LockWait {options.lock_wait}{refresh}{LOCK_ARGS}"))
 
     t = time.monotonic()
     changed, removed = sync(host, options.name, options.full)
@@ -285,7 +294,7 @@ def main():
     else:
         flags += " -Action build"
         if options.deploy:
-            flags += f" -Deploy -Agent {options.name} -LockWait {options.lock_wait}"
+            flags += f" -Deploy -Agent {agent_name(options.name)} -LockWait {options.lock_wait}"
             if options.keep_lock:
                 flags += " -KeepLock"
         if options.reconfigure:

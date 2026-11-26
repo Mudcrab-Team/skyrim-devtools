@@ -1,5 +1,6 @@
 import importlib.machinery
 import importlib.util
+import os
 from pathlib import Path
 import sys
 import time
@@ -41,12 +42,21 @@ class HoldTests(unittest.TestCase):
         status, calls = self.hold([sys.executable, "-c", "import time; time.sleep(60)"], 0.03)
         self.assertEqual(status, 124)
         self.assertLess(time.monotonic() - started, 20)
-        self.assertEqual([c for c in calls if "unlock" in c], ["-Action unlock -Agent tester -LockWait 0"])
+        self.assertEqual([c for c in calls if "unlock" in c], [f"-Action unlock -Agent tester.{os.getpid()} -LockWait 0"])
 
     def test_child_exit_releases_the_lock_with_its_status(self):
         status, calls = self.hold([sys.executable, "-c", "raise SystemExit(3)"], 1)
         self.assertEqual(status, 3)
         self.assertEqual(len([c for c in calls if "unlock" in c]), 1)
+
+    def test_each_hold_locks_under_its_own_name_and_passes_it_down(self):
+        script = f"import os, sys; sys.exit(0 if os.environ.get('{pc_build.HELD_ENV}') == 'tester.{os.getpid()}' else 7)"
+        status, calls = self.hold([sys.executable, "-c", script], 1)
+        self.assertEqual(status, 0)
+        self.assertIn(f"-Agent tester.{os.getpid()} ", calls[0])
+        with mock.patch.dict(os.environ, {pc_build.HELD_ENV: "tester.42"}):
+            self.assertEqual(pc_build.agent_name("tester"), "tester.42")
+            self.assertEqual(pc_build.agent_name("other"), "other")
 
     def test_a_failed_release_is_retried(self):
         status, calls = self.hold([sys.executable, "-c", "pass"], 1, unlock_codes=(255, 255, 0))
