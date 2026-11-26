@@ -46,21 +46,58 @@ function Test-LockStale {
     return ($age.TotalMinutes -gt 25) -and -not (Get-Process SkyrimSE -ErrorAction SilentlyContinue)
 }
 
+# Waiting agents take a ticket (a file named by arrival time) next to agent.lock and are served oldest
+# first. A ticket nobody has touched for a minute belongs to a dead waiter and is dropped. The lock itself
+# is still created atomically, so the queue only decides who may try.
+$queuePath = Join-Path $root 'agent.queue'
+$ticketTtlSeconds = 60
+
+function Get-Queue {
+    if (-not (Test-Path $queuePath)) { return @() }
+    $live = @()
+    foreach ($file in (Get-ChildItem $queuePath -Filter '*.ticket' | Sort-Object Name)) {
+        if (((Get-Date) - $file.LastWriteTime).TotalSeconds -gt $ticketTtlSeconds) {
+            Remove-Item $file.FullName -Force -ErrorAction SilentlyContinue
+        } else {
+            $live += [pscustomobject]@{ Name = $file.Name; Agent = ($file.BaseName -replace '^\d+_', ''); Path = $file.FullName }
+        }
+    }
+    return $live
+}
+
 function Acquire-Lock([string]$who, [int]$waitSeconds) {
     $deadline = (Get-Date).AddSeconds($waitSeconds)
-    while ($true) {
-        if ((Get-LockOwner) -eq $who) { return $true }
-        if (Test-LockStale) { Write-Host "lock held by '$(Get-LockOwner)' is stale; taking it"; Remove-Item $lockPath -Force }
-        try {
-            $stream = [IO.File]::Open($lockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
-            $bytes = [Text.Encoding]::ASCII.GetBytes($who)
-            $stream.Write($bytes, 0, $bytes.Length)
-            $stream.Close()
-            Write-Host "lock acquired by $who"
-            return $true
-        } catch [IO.IOException] {
+    $ticket = $null
+    try {
+        while ($true) {
+            if ((Get-LockOwner) -eq $who) { return $true }
+            if (Test-LockStale) { Write-Host "lock held by '$(Get-LockOwner)' is stale; taking it"; Remove-Item $lockPath -Force }
+            $queue = @(Get-Queue)
+            $mine = $queue | Where-Object { $_.Agent -eq $who } | Select-Object -First 1
+            $ahead = @($queue | Where-Object { $_.Agent -ne $who -and (-not $mine -or $_.Name -lt $mine.Name) })
+            if ($ahead.Count -eq 0) {
+                try {
+                    $stream = [IO.File]::Open($lockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+                    $bytes = [Text.Encoding]::ASCII.GetBytes($who)
+                    $stream.Write($bytes, 0, $bytes.Length)
+                    $stream.Close()
+                    Write-Host "lock acquired by $who"
+                    return $true
+                } catch [IO.IOException] { }
+            }
             if ((Get-Date) -ge $deadline) { return $false }
+            New-Item -ItemType Directory -Force $queuePath | Out-Null
+            if ($mine) { $ticket = $mine.Path; (Get-Item $ticket).LastWriteTime = Get-Date }
+            else {
+                $ticket = Join-Path $queuePath ('{0:D19}_{1}.ticket' -f [DateTime]::UtcNow.Ticks, $who)
+                Set-Content $ticket $who
+                Write-Host "queued as $who behind $($ahead.Count) waiting agent(s); lock held by '$(Get-LockOwner)'"
+            }
             Start-Sleep -Seconds 5
+        }
+    } finally {
+        foreach ($file in @(Get-ChildItem $queuePath -Filter "*_$who.ticket" -ErrorAction SilentlyContinue)) {
+            Remove-Item $file.FullName -Force -ErrorAction SilentlyContinue
         }
     }
 }

@@ -332,7 +332,8 @@ def build_server(manager, recorder=None):
     @mcp.tool()
     async def world_nearby(radius: float | None = None, types: list[str] | None = None, limit: int | None = None) -> str:
         """References around the player (World.nearby). radius in game units (default 1000, max 20000; ~70
-        units is 1 m); types filters by reference kind (e.g. ["Actor", "Door"]); limit 1-200 (default 20)."""
+        units is 1 m); types filters by reference kind (lower case: actor, container, door, item, activator, furniture, flora);
+        doors carry locked, lockLevel and destination {cell, location, interior}; limit 1-200 (default 20)."""
         return dumps(await native("World.nearby", radius=radius, types=types, limit=limit))
 
     @mcp.tool()
@@ -342,10 +343,29 @@ def build_server(manager, recorder=None):
 
     @mcp.tool()
     async def quest_get(editor_id: str | None = None, form_id: str | None = None, all_objectives: bool = False) -> str:
-        """One quest's stage, running/completed flags and objectives (Quest.get); give editor_id (e.g.
-        MQ101) or form_id (hex). all_objectives includes finished and hidden ones."""
+        """One quest's stage, status and objectives (Quest.get); give editor_id (e.g. MQ101) or form_id (hex).
+        `status` is running, completed, failed, stopped (stopped without finishing) or not-started;
+        `finished` is true for completed or failed. The raw `completed` flag only
+        reflects a script's CompleteQuest and `running` stays true after a quest stops, so assert on `status` or
+        `finished` instead. all_objectives includes finished and hidden ones."""
         return dumps(await native("Quest.get", editorID=editor_id, formID=form_id,
                                   allObjectives=True if all_objectives else None))
+
+    @mcp.tool()
+    async def quest_find(text: str, limit: int | None = None) -> str:
+        """Find quests whose display name or editor ID contains `text` (Quest.find), with their editor IDs,
+        running flag and stage. Use it to get the editor_id for quest_get."""
+        return dumps(await native("Quest.find", text=text, limit=limit))
+
+    @mcp.tool()
+    async def activate(ref_id: str, max_distance: float | None = None, force: bool = False) -> str:
+        """Activate a reference (door, container, NPC, item, switch) as the player's activate key would,
+        without aiming the crosshair (Ref.activate). ref_id is hex from world_nearby. Checks that the player
+        is within reach (default 300 units, measured to the nearer of the origin and the bounds centre) and
+        answers activated:false, reason "out of reach" otherwise; walls in between are NOT checked
+        (lineOfSightChecked:false). force=true skips the reach check. A door starts a load: wait_for
+        playable afterwards."""
+        return dumps(await native("Ref.activate", refID=ref_id, maxDistance=max_distance, force=True if force else None))
 
     @mcp.tool()
     async def quest_active(limit: int | None = None) -> str:
@@ -395,7 +415,10 @@ def build_server(manager, recorder=None):
     async def dialogue_close() -> str:
         """Leave the conversation like the player's exit button (Dialogue.close); closes a menu opened from it
         first. Idempotent: already closed answers status closed."""
-        return dumps(await native("Dialogue.close"))
+        result = await native("Dialogue.close")
+        if isinstance(result, dict):
+            result.pop("state", None)
+        return dumps(result)
 
     @mcp.tool()
     async def ui_list_items(menu: str) -> str:

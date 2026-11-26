@@ -32,6 +32,8 @@ namespace devtools::view
     // Compact reference view; actor extras are included for actors.
     [[nodiscard]] Json DescribeRef(RE::TESObjectREFR* ref, RE::TESObjectREFR* from);
     [[nodiscard]] Json DescribeCell(RE::TESObjectCELL* cell);
+    // Adds locked/lockLevel and, for teleport doors, the destination (doors.cpp).
+    void AddDoorDetails(RE::TESObjectREFR* ref, Json& out);
 
     [[nodiscard]] RE::PlayerCharacter& RequirePlayer();
 }

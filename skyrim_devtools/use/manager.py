@@ -8,6 +8,7 @@ dead one is reported with the host's phase and reason so the caller can decide t
 import asyncio
 from collections import deque
 import contextlib
+from pathlib import Path
 import re
 import subprocess
 import time
@@ -29,6 +30,29 @@ HINTS = {
     -32008: "the game did not answer in time (it may be loading or stalled)",
     -32010: "not found (unknown menu name or save name)",
 }
+
+
+def curated_methods():
+    """Native methods the curated MCP tools call, read from the tool sources so the list cannot go stale."""
+    names = set()
+    for source in Path(__file__).parent.glob("*.py"):
+        names.update(re.findall(r'\bnative\(\s*"([A-Za-z]+\.[A-Za-z]+)"', source.read_text(encoding="utf-8")))
+    return sorted(names)
+
+
+def plugin_report(info, methods):
+    """Identify the plugin build and say plainly when it cannot serve the tools of this client."""
+    build = info.get("pluginBuild")
+    missing = [name for name in curated_methods() if name not in methods]
+    report = {"buildId": build, "missingMethods": missing, "stale": bool(missing) or build is None}
+    if build is None:
+        report["warning"] = ("the plugin DLL on the host predates build identification: it is older than this client. "
+                             "Redeploy it with tools/pc-build --deploy")
+    if missing:
+        report["warning"] = (f"the plugin DLL is older than this client: {len(missing)} curated method(s) are missing "
+                             f"({', '.join(missing[:8])}{', ...' if len(missing) > 8 else ''}); tools that wrap them fail "
+                             "and tools that exist in both builds may behave differently. Redeploy the plugin")
+    return report
 
 
 class GameError(RuntimeError):
@@ -324,6 +348,9 @@ class GameManager:
             result["info"] = {key: self.info.get(key) for key in
                               ("protocol", "dataLoaded", "loadEpoch", "headless", "capabilities") if key in self.info}
             result["methodCount"] = len(self.methods)
+            result["plugin"] = plugin_report(self.info, self.methods)
+            if result["plugin"].get("warning"):
+                result["warning"] = result["plugin"]["warning"]
             result["bufferedEvents"] = self.event_total - self.drain_cursor
         return result
 

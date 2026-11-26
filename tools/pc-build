@@ -5,6 +5,8 @@
   tools/pc-build --config mac.json --deploy          build, then copy the DLL while holding agent.lock
   tools/pc-build --config mac.json commonlib         (re)build the shared CommonLibSSE-NG once
   tools/pc-build --config mac.json lock|unlock       hold agent.lock around a live run
+
+With --lock-wait, waiting agents queue by ticket next to agent.lock and are served oldest first.
 """
 
 import argparse
@@ -67,6 +69,17 @@ def scan():
     return files
 
 
+def build_id(files):
+    """Git sha, a dirty marker and a hash of native/, so the DLL says which sources it was built from."""
+    def git(*args):
+        return subprocess.run(["git", "-C", str(REPO), *args], capture_output=True, text=True).stdout.strip()
+
+    sha = git("rev-parse", "--short=10", "HEAD") or "nogit"
+    dirty = "-dirty" if git("status", "--porcelain", "--", "native") else ""
+    digest = hashlib.sha1("".join(f"{f}={d}" for f, d in sorted(files.items())).encode()).hexdigest()[:10]
+    return f"{sha}{dirty}:{digest}"
+
+
 def sync(host, name, full):
     """Ship only files whose content changed; unchanged files keep their remote mtime so Ninja skips them."""
     state_file = REPO / "build" / f"pc-build-{name}.json"
@@ -74,6 +87,8 @@ def sync(host, name, full):
     if state_file.exists() and not full:
         previous = json.loads(state_file.read_text())
     current = scan()
+    stamp = f'#define DEVTOOLS_BUILD_ID "{build_id(current)}"\n'
+    current["native/build_id.h"] = hashlib.sha1(stamp.encode()).hexdigest()
     changed = [f for f, digest in current.items() if previous.get(f) != digest]
     removed = [f for f in previous if f not in current]
     if changed or removed or full or not previous:
@@ -83,7 +98,12 @@ def sync(host, name, full):
             manifest.write_text("\n".join(r.removeprefix("native/") for r in removed))
             with tarfile.open(archive, "w") as tar:
                 for relative in changed:
-                    tar.add(REPO / relative, arcname=relative.removeprefix("native/"))
+                    if relative != "native/build_id.h":
+                        tar.add(REPO / relative, arcname=relative.removeprefix("native/"))
+                if "native/build_id.h" in changed:
+                    header = Path(tmp) / "build_id.h"
+                    header.write_text(stamp)
+                    tar.add(header, arcname="build_id.h")
                 tar.add(manifest, arcname="removed.txt")
             host.put(archive, rf"{REMOTE_ROOT}\pc-build-{name}.tar")
         wipe = " -Wipe" if (full or not previous) else ""

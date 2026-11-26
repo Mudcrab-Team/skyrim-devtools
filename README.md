@@ -142,7 +142,7 @@ Set `sshConfig` if the alias is in a separate SSH config file.
 ~~~sh
 python3.13 -m venv .venv
 . .venv/bin/activate
-python -m pip install -e .
+python -m pip install -e '.[video]'   # [video] adds Pillow for skyrim-devtools-video
 skyrim-devtools-smoke --config .local/devtools-mac.json --cycles 5 --tab-trials 20 --mode headless
 python -m unittest discover -s tests
 ~~~
