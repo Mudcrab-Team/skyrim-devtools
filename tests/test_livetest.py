@@ -130,6 +130,20 @@ class LiveTest(unittest.TestCase):
         self.assertEqual(batch.outcomes["s"][0]["details"], {"x": 3})
         self.assertEqual(batch.outcomes["s"][0]["status"], "pass")
 
+    def test_command_line_script_gets_config_and_own_game(self):
+        write(self.dir, "tests/live/cli.py", "import json, sys\nprint(json.dumps({'pass': '--config' in sys.argv, 'argv': sys.argv[1:]}))\n")
+        path = write(self.dir / "q", "cli.yaml", "id: cli\ncases:\n  - name: c\n    script: tests/live/cli.py --phases a,b --config <mac.json>\n  - name: d\n    script: tests/live/cli.py\n")
+        request = livetest.load_request(path)
+        manager = FakeManager()
+        manager.alive = True
+        batch = livetest.Batch(manager, self.dir / "q/results", self.dir, config_path="/x/mac.json", perf_seconds=0.01)
+        asyncio.run(batch.run([request]))
+        first, second = batch.outcomes["cli"]
+        self.assertEqual(first["details"]["argv"], ["--phases", "a,b", "--config", "/x/mac.json"])
+        self.assertEqual(second["status"], "pass")
+        self.assertEqual(manager.stops, 1)
+        self.assertEqual(livetest.split_command("a.py x", "/c"), ("a.py", ["x", "--config", "/c"]))
+
     def test_script_error_and_timeout_are_errors(self):
         manager, batch = self.run_batch([self.req("e", script="tests/live/boom.py")])
         self.assertEqual(batch.outcomes["e"][0]["status"], "error")
