@@ -17,6 +17,16 @@ CASTER_STYLES = {"mage", "caster"}
 PASSIVE_MENUS = {"HUD Menu", "Cursor Menu"}
 
 
+def blocks_play(menu):
+    """An open menu blocks play when it pauses the game or takes input; HUD widgets from mods do neither.
+    An older plugin reports no flags, so only the known passive menus are skipped then."""
+    if not menu.get("open"):
+        return False
+    if "pausesGame" in menu or "usesMenuContext" in menu:
+        return bool(menu.get("pausesGame") or menu.get("usesMenuContext"))
+    return menu["name"] not in PASSIVE_MENUS
+
+
 def dumps(value):
     return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
 
@@ -236,7 +246,7 @@ def register(mcp, native, manager):
                 break
             # a tutorial popup ("Health Low") pauses the game, so every swing after it would do nothing
             menus = await manager.call("UI.listMenus")
-            blocking = [m["name"] for m in menus if m.get("open") and m["name"] not in PASSIVE_MENUS]
+            blocking = [m["name"] for m in menus if blocks_play(m)]
             if blocking:
                 if blocking == ["Tutorial Menu"]:
                     await native("UI.closeMenu", name="Tutorial Menu")
