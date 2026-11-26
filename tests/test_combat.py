@@ -1,13 +1,13 @@
 import json
 import unittest
 
-from skyrim_devtools.use.combat import assess, decide, healing_spells
+from skyrim_devtools.use.combat import assess, decide, healing_potions, healing_spells
 import test_use
 from test_use import Harness, run
 
 COMBAT_METHODS = ["Combat.state", "Combat.target", "Combat.face", "Combat.draw", "Combat.equip", "Combat.unequip",
                   "Combat.attack", "Combat.block", "Combat.cast", "Combat.drink", "Move.walk", "Player.equipped", "Quest.targets", "Nav.goto",
-                  "Player.spells"]
+                  "Player.spells", "Player.inventory"]
 
 
 def hostile(distance=100, attack="none", pct=100, chosen=False):
@@ -183,6 +183,29 @@ class ToolTests(unittest.TestCase):
             self.assertEqual(result["outcome"], "outmatched")
             self.assertIn("enemy strength", result["assessment"])
             self.assertFalse([c for c in socket.calls if c[0] == "Combat.attack"])
+            await h.text("game_stop")
+        run(scenario())
+
+    def test_fight_warns_at_the_start_when_nothing_can_heal(self):
+        async def scenario():
+            h = Harness()
+            await h.text("game_start")
+            socket = h.sockets[0]
+            socket.menus = set()
+            player = {"dead": False, "health": {"cur": 100, "max": 100, "pct": 100}, "stamina": {"pct": 100}}
+            socket.results["Combat.state"] = {"player": player, "hostileTotal": 0, "hostiles": []}
+            socket.results["Player.spells"] = {"spells": []}
+            socket.results["Player.inventory"] = {"total": 1, "items": [{"name": "Iron Dagger", "type": "WEAP", "count": 1}]}
+            result = json.loads(await h.text("combat_fight"))
+            self.assertIn("no healing potion", result["warnings"][0])
+            self.assertEqual(result["healingPotions"], 0)
+            events, _, _ = h.manager.drain_events(types={"warning"})
+            self.assertEqual(events[0]["data"]["code"], "noHealingPotion")
+            socket.results["Player.inventory"] = {"total": 1, "items": [
+                {"name": "Potion of Minor Healing", "type": "ALCH", "count": 3}, {"name": "Poison", "count": 9}]}
+            fine = json.loads(await h.text("combat_fight"))
+            self.assertNotIn("warnings", fine)
+            self.assertEqual(fine["healingPotions"], 3)
             await h.text("game_stop")
         run(scenario())
 

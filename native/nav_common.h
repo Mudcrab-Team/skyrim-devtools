@@ -5,6 +5,7 @@
 
 #include "game.h"
 #include "input.h"
+#include "stuck.h"
 
 #include <cmath>
 #include <format>
@@ -155,6 +156,19 @@ namespace devtools::nav
 
     // The active navigation process, summarised for recordings (null when idle).
     Json NavSummary();
+
+    namespace stuck
+    {
+        // Options from a request's `stuck` member: false, or an object overriding the defaults.
+        Config ParseConfig(const Json& params);
+        DoorLog& Doors();
+        // A loading screen, menu or dialogue is up, so standing still means nothing.
+        bool Paused();
+        // Position, facing, blocker guess and a screenshot hint for a stopped command; goal may be null.
+        Json Report(const Verdict& verdict, RE::PlayerCharacter& player, const RE::NiPoint3* goal);
+        void EmitStuck(const char* source, const Verdict& verdict, Json report);
+        void EmitUnstuck(const char* source, const Verdict& verdict, const RE::NiPoint3& pos);
+    }
 
     // Where a plugin run keeps its files (rpc.jsonl, screens/, recordings/).
     std::filesystem::path RunDir();

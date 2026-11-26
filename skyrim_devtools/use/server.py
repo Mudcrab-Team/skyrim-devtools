@@ -11,8 +11,9 @@ import time
 
 from mcp.server.fastmcp import FastMCP, Image
 
-from . import capture, combat, perception, profile_tools, saves
-from .manager import GameError, GameManager
+from . import capture, combat, modtest, perception, profile_tools, saves
+from .alerts import AlertBoard
+from .manager import STUCK_CODE, GameError, GameManager
 from .timeline import Recorder
 
 INSTRUCTIONS = """\
@@ -25,6 +26,12 @@ Anything the plugin can do that has no curated tool is reachable via rpc_methods
 # Curated wrappers for native methods that older plugin builds lack.
 UNAVAILABLE = "method {} is not available in this plugin build (see rpc_methods); update the plugin or use another tool"
 
+
+# No MCP movement call may keep pushing without getting anywhere for longer than this; the plugin
+# detects it first, this is the backstop for plugin builds without the detector or a stalled one.
+MOVE_HARD_CAP_S = 20.0
+MOVE_CAP_DISPLACEMENT = 40.0
+MOVE_CAP_POLL_S = 2.0
 
 FPS_WARN = 30.0
 P99_WARN_MS = 100.0
@@ -121,8 +128,75 @@ def is_busy_error(error):
     return "did not answer in time" in text or "-32008" in text
 
 
-def build_server(manager, recorder=None):
+def stuck_result(error):
+    """The tool result for a movement call the plugin stopped as stuck, or None for other errors."""
+    if getattr(error, "rpc_code", None) != STUCK_CODE:
+        return None
+    return {"stuck": True, "error": "stuck", **(error.rpc_data or {})}
+
+
+class MovementCap:
+    """Backstop for a blocking movement call: samples the player and stops the movement when it has
+    gone MOVE_HARD_CAP_S without covering MOVE_CAP_DISPLACEMENT units."""
+
+    def __init__(self, manager):
+        self.manager = manager
+        self.tripped = None
+        self.task = None
+
+    async def __aenter__(self):
+        if self.manager.has_method("Player.state"):
+            self.task = asyncio.create_task(self.watch())
+        return self
+
+    async def __aexit__(self, *exc):
+        if self.task:
+            self.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self.task
+
+    @staticmethod
+    def position(state):
+        pos = state.get("pos")
+        if isinstance(pos, dict):
+            return pos.get("x", 0.0), pos.get("y", 0.0)
+        if isinstance(pos, list) and len(pos) >= 2:
+            return pos[0], pos[1]
+        return None
+
+    async def watch(self):
+        samples = []
+        while True:
+            await asyncio.sleep(MOVE_CAP_POLL_S)
+            try:
+                state = await self.manager.call("Player.state", timeout=5)
+            except Exception:
+                samples.clear()  # a load or a busy game is not a wall
+                continue
+            here = self.position(state)
+            if here is None:
+                continue
+            now = time.monotonic()
+            samples.append((now, here))
+            while len(samples) > 1 and now - samples[1][0] >= MOVE_HARD_CAP_S:
+                samples.pop(0)
+            if now - samples[0][0] < MOVE_HARD_CAP_S:
+                continue
+            if all(((x - here[0]) ** 2 + (y - here[1]) ** 2) ** 0.5 < MOVE_CAP_DISPLACEMENT for _, (x, y) in samples):
+                self.tripped = {"stuck": True, "error": "stuck", "reason": "hardCap", "pos": list(here),
+                                "capS": MOVE_HARD_CAP_S, "screenshotHint": "Call screenshot to see what blocks the player"}
+                for method in ("Move.stop", "Nav.cancel"):
+                    if self.manager.has_method(method):
+                        with contextlib.suppress(Exception):
+                            await self.manager.call(method, timeout=5)
+                return
+
+
+def build_server(manager, recorder=None, board=None):
     recorder = recorder or Recorder()
+    recorder.attach(manager)
+    board = board or AlertBoard(write=recorder.write)
+    manager.event_listeners.append(board.on_event)
 
     @contextlib.asynccontextmanager
     async def lifespan(_server):
@@ -136,7 +210,7 @@ def build_server(manager, recorder=None):
                 await manager.stop()
 
     mcp = FastMCP("skyrim-use", instructions=INSTRUCTIONS, lifespan=lifespan)
-    recorder.instrument(mcp)
+    recorder.instrument(mcp, board)
 
     async def native(method, **params):
         """Call a method that may be missing from the running plugin build."""
@@ -144,6 +218,28 @@ def build_server(manager, recorder=None):
         if manager.alive and manager.methods and not manager.has_method(method):
             raise GameError(UNAVAILABLE.format(method))
         return await manager.call(method, **params)
+
+    async def sync_alerts(history=False, limit=50):
+        """Fetch the plugin's own view (also after lost events); returns it, or None without the alerts module."""
+        if not manager.alive or not manager.has_method("Alerts.state"):
+            return None
+        try:
+            state = await manager.call("Alerts.state", history=history, limit=limit)
+        except GameError:
+            return None
+        board.sync(state)
+        return state
+
+    def resync_after_load(event):
+        """A load clears every alert; those the plugin still holds come back from its own list."""
+        if event.get("type") != "loadGame":
+            return
+        try:
+            asyncio.get_running_loop().create_task(sync_alerts())
+        except RuntimeError:
+            pass
+
+    manager.event_listeners.append(resync_after_load)
 
     # ---- lifecycle ----------------------------------------------------------------------------
 
@@ -154,14 +250,19 @@ def build_server(manager, recorder=None):
         Idempotent: if a game is already running its status is returned. A crashed game is reported
         by game_status/any tool; call game_start again to relaunch. With a window (headless=false), call
         perf_check next: a slideshow game wastes the whole session."""
-        return dumps(await manager.start(headless=headless, save=save))
+        board.forget_native()
+        status = await manager.start(headless=headless, save=save)
+        await sync_alerts()
+        return dumps(status)
 
     @mcp.tool()
     async def game_stop(grace_seconds: int = 12) -> str:
         """Close the game and release the connection. Always call this when finished. The game is asked to quit
         and killed if it has not exited after grace_seconds (1-120); `path` in the result says which way it
         ended (graceful, killed-after-Ns, closing-crashed) and `crash` carries the crash log's top frames."""
-        return dumps(await manager.stop(grace=max(1, min(120, grace_seconds))))
+        result = await manager.stop(grace=max(1, min(120, grace_seconds)))
+        board.forget_native()
+        return dumps(result)
 
     @mcp.tool()
     async def game_status() -> str:
@@ -170,6 +271,8 @@ def build_server(manager, recorder=None):
         link, so it notices a crash that happened while you were idle. `daemon.stale` is true when this MCP
         process started before its own source files were last changed: restart it to pick the changes up."""
         status = await manager.status()
+        if not manager.alive:
+            board.forget_native()
         status["daemon"] = daemon_state()
         return dumps(status)
 
@@ -266,7 +369,8 @@ def build_server(manager, recorder=None):
 
     @mcp.tool()
     async def center_on_cell(cell: str) -> str:
-        """Teleport the player to a cell by editor id (console `coc`), e.g. WhiterunBanneredMare. Returns console lines."""
+        """Teleport the player to a cell by editor id (console `coc`), e.g. WhiterunBanneredMare. Returns console lines and `combatCleared`: how many actors
+        fighting the player were stopped, because the combat state would otherwise follow the player away."""
         return dumps(await manager.call("World.centerOnCell", cell=cell))
 
     # ---- waiting and events -------------------------------------------------------------------
@@ -542,7 +646,48 @@ def build_server(manager, recorder=None):
         if parts is None:
             return [dumps(result)]
         meta = {k: v for k, v in result.items() if k not in {"data", "image", "base64", "png", "jpeg"}}
+        board.observe_screenshot(meta)
         return [Image(data=parts[0], format=parts[1]), dumps(meta)]
+
+    @mcp.tool()
+    async def agent_alerts(history: bool = False, limit: int = 20, dismiss: str | None = None,
+                           dismiss_seconds: float = 300, configure: dict | None = None) -> str:
+        """Alerts say when you are wasting time; every other tool reply carries the active ones in `alerts`
+        (kind, severity, since, a hint of what to try). This returns them in full: kind, sinceMs, ageS, detail
+        and, with history=true, the last `limit` raised/cleared entries. Kinds: questStalled, actionLoop,
+        combatStalemate, deathLoop, fellOrOutOfBounds, blindCamera, menuLeftOpen, paused, lowFps,
+        overEncumbered, crime, targetDead, targetUnreachable, lowHealthNoHeal, moveStuck. dismiss=<kind> hides
+        an alert you have dealt with for dismiss_seconds. configure={"thresholds": {name: number},
+        "disable": [kinds], "enable": [kinds]} changes thresholds (names in the reply and docs/skyrim-use.md,
+        e.g. questStalledMin, combatStalemateS, lowFpsS, actionLoopCount, actionLoopWindowS). `cost` reports
+        what the detectors take from the game thread per tick."""
+        extra = {}
+        if configure:
+            native_part = {key: value for key, value in configure.items() if key in ("thresholds", "disable", "enable", "reset")}
+            unknown = set(configure) - set(native_part)
+            if unknown:
+                raise GameError(f"configure takes thresholds, disable, enable and reset, not {sorted(unknown)}")
+            remaining = board.configure(native_part.get("thresholds"), native_part.get("disable", ()), native_part.get("enable", ()))
+            native_part = {key: value for key, value in native_part.items() if key != "thresholds"}
+            if remaining:
+                native_part["thresholds"] = remaining
+            if native_part:
+                extra["configured"] = await native("Alerts.configure", **native_part)
+        if dismiss:
+            alert = board.active.get(dismiss)
+            if manager.alive and manager.has_method("Alerts.dismiss") and (alert is None or alert.get("source") == "native"):
+                await manager.call("Alerts.dismiss", kind=dismiss, forS=dismiss_seconds)
+            extra["dismissed"] = board.dismiss(dismiss, dismiss_seconds)
+        state = await sync_alerts(history=history, limit=limit)
+        out = board.full(history=history, limit=limit)
+        if state:
+            out["cost"] = state.get("cost")
+            out["thresholds"]["native"] = state.get("thresholds")
+            out["disabled"] = sorted(set(state.get("disabled", [])) | board.disabled)
+        else:
+            out["disabled"] = sorted(board.disabled)
+        out.update(extra)
+        return dumps(out)
 
     @mcp.tool()
     async def perf_frame_stats(window: float | None = None) -> str:
@@ -583,20 +728,34 @@ def build_server(manager, recorder=None):
     perception.register(mcp, native, manager)
     saves.register(mcp, manager, native)
     profile_tools.register(mcp, native, manager)
+    modtest.register(mcp, native, manager, recorder)
 
     # ---- movement, camera, navigation, recording ----------------------------------------------
 
     @mcp.tool()
     async def walk(direction: str = "forward", duration_ms: int | None = None, distance: float | None = None,
-                   run: bool | None = None, sprint: bool | None = None) -> str:
+                   run: bool | None = None, sprint: bool | None = None, stuck: dict | bool | None = None) -> str:
         """Move the player by holding a movement key (Move.walk): direction forward/back/left/right, for
         duration_ms (max 60000) OR until `distance` game units are covered (max 20000; 1 unit ~ 1.4 cm,
         a walking stride ~ 70). run/sprint override the run toggle for this walk. Blocks until done and
-        returns the distance actually moved and the displacement; walls stop the player, so compare."""
+        returns the distance actually moved and the displacement. A wall that stops the player ends the walk
+        within about 15 s with {"stuck": true, "error": "stuck", reason, pos, facingDeg, blockers,
+        screenshotHint}: the plugin steps back, jumps and tries again first. `stuck` tunes the detector, e.g.
+        {"distance": 40, "windowS": 3, "maxFailures": 3, "totalS": 20}, or false to turn it off."""
         limit = (duration_ms / 1000 + 15) if duration_ms else 135
-        return dumps(await manager.call("Move.walk", timeout=limit, **{k: v for k, v in dict(
-            direction=direction, durationMs=duration_ms, distance=distance, run=run, sprint=sprint).items()
-            if v is not None}))
+        params = {k: v for k, v in dict(direction=direction, durationMs=duration_ms, distance=distance, run=run,
+                                        sprint=sprint, stuck=stuck).items() if v is not None}
+        async with MovementCap(manager) as cap:
+            try:
+                result = await manager.call("Move.walk", timeout=limit, **params)
+            except GameError as error:
+                found = stuck_result(error)
+                if found is None:
+                    raise
+                return dumps(found)
+        if cap.tripped:
+            return dumps({**cap.tripped, "partial": result})
+        return dumps(result)
 
     @mcp.tool()
     async def turn_to(heading_deg: float | None = None, x: float | None = None, y: float | None = None,
@@ -654,7 +813,7 @@ def build_server(manager, recorder=None):
                        sprint: bool | None = None, on_combat: str | None = None, on_dialogue: str | None = None,
                        on_message_box: str | None = None, on_menu: str | None = None,
                        invulnerable: bool | None = None, via: list | None = None, route: str | None = None,
-                       activate: bool | None = None) -> str:
+                       activate: bool | None = None, stuck: dict | bool | None = None) -> str:
         """Start walking the player to a goal in the background (Nav.goto); returns at once. goal is one of
         {"refID": "0001A2B3"}, {"x":..,"y":..,"z":..}, {"cell": "<editor id>"}, {"place": "Riverwood"} (a
         location name or id from nav_places), {"questTarget": "<quest editor id, id or name>"} (where the compass
@@ -673,14 +832,19 @@ def build_server(manager, recorder=None):
         ignore; on_dialogue close (default; Cancel, then hide, then the last topic for forced greetings), stop or
         wait; on_message_box firstButton (default), stop or wait; on_menu close (default), stop or wait. Loading,
         knockdown and paralysis are waited out; death fails the trip. A trip resumes from wherever the player is
-        once the interruption clears; 20 s without progress triggers recovery and, after 4 rounds, failure.
+        once the interruption clears.
         invulnerable: true turns on god mode for the trip and restores it after. via: [[x,y,z], ...] waypoints; route: "global",
         "local" or a recording name to follow (input mode). Follow with nav_status / nav_wait; stop with nav_cancel. Speed long
-        trips with the console: `sgtm 4` (also speeds everything else; set back with `sgtm 1`)."""
+        trips with the console: `sgtm 4` (also speeds everything else; set back with `sgtm 1`).
+        Stuck handling: the trip steps back, jumps and replans (marking the spot and any door as blocked) when
+        it stops getting anywhere, when the distance to the goal stops shrinking (15 s) or when it keeps
+        re-entering the same door, and then fails with `stuck` (nav_wait shows it under "stuck"). `stuck`
+        tunes it: {"distance": 40, "windowS": 3, "maxFailures": 3, "totalS": 20, "progressWindowS": 15,
+        "progressGain": 100, "doorRepeat": 2, "doorWindowS": 60}, or false to turn it off."""
         return dumps(await native("Nav.goto", goal=goal, mode=mode, timeoutS=timeout_s, run=run, sprint=sprint,
                                   onCombat=on_combat, onDialogue=on_dialogue, onMessageBox=on_message_box,
                                   onMenu=on_menu, invulnerable=invulnerable, via=via, route=route,
-                                  activate=True if activate else None))
+                                  activate=True if activate else None, stuck=stuck))
 
     @mcp.tool()
     async def nav_plan(ref_id: str | None = None, x: float | None = None, y: float | None = None,
@@ -700,7 +864,8 @@ def build_server(manager, recorder=None):
     @mcp.tool()
     async def nav_wait(timeout_s: float = 120, poll_s: float = 2) -> str:
         """Block until the running navigation ends (arrived/failed/cancelled) or timeout_s (max 300)
-        passes; returns the final summary or the current status. Call again to keep waiting. A cell load
+        passes; returns the final summary or the current status; a trip that ended stuck has "error": "stuck" and
+        the details under "stuck" (reason, pos, facingDeg, blockers). Call again to keep waiting. A cell load
         (the game cannot answer for a while) counts as progress: that time is not counted against timeout_s."""
         began = time.monotonic()
         loading_s = 0.0
@@ -716,7 +881,10 @@ def build_server(manager, recorder=None):
                 loading_s += time.monotonic() - tick
                 continue
             if not status.get("active"):
-                return dumps({"done": True, **(status.get("last") or {})})
+                last = status.get("last") or {}
+                if last.get("stuck"):
+                    return dumps({"done": True, "error": "stuck", **last})
+                return dumps({"done": True, **last})
             if status["nav"].get("loading"):
                 loading_s += time.monotonic() - tick + max(poll_s, 0.25)
             if time.monotonic() - began - loading_s >= timeout_s:

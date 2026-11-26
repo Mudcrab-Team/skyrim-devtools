@@ -228,6 +228,7 @@ class Profile:
                 if key not in self.function_index:
                     self.function_index[key] = len(self.functions)
                     self.functions.append(key)
+                    self.function_meta.append({"rva": None, "source": "collapsed"})
                 out.append(self.function_index[key])
             else:
                 out.append(functions[i])

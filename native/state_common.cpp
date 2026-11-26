@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <format>
+#include <vector>
 
 namespace devtools::view
 {
@@ -247,5 +248,51 @@ namespace devtools::view
             throw RpcError(code::notReady, "No playable world is loaded");
         }
         return *player;
+    }
+
+    namespace
+    {
+        template <class F>
+        void ForEachFightingActor(RE::PlayerCharacter& player, F&& visit)
+        {
+            const auto lists = RE::ProcessLists::GetSingleton();
+            if (!lists) {
+                return;
+            }
+            for (auto& handle : lists->highActorHandles) {
+                const auto actor = handle.get();
+                if (!actor || actor.get() == &player || actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+                    continue;
+                }
+                if (actor->GetActorRuntimeData().currentCombatTarget.get().get() == &player) {
+                    visit(*actor);
+                }
+            }
+        }
+    }
+
+    int ActiveCombatants(RE::PlayerCharacter& player)
+    {
+        if (!player.IsInCombat()) {
+            return 0;
+        }
+        int count = 0;
+        ForEachFightingActor(player, [&](RE::Actor& actor) { count += actor.IsInCombat() ? 1 : 0; });
+        return count;
+    }
+
+    int ClearPlayerCombat(RE::PlayerCharacter& player)
+    {
+        const auto lists = RE::ProcessLists::GetSingleton();
+        std::vector<RE::Actor*> fighters;
+        ForEachFightingActor(player, [&](RE::Actor& actor) { fighters.push_back(&actor); });
+        if (lists) {
+            for (const auto actor : fighters) {
+                lists->StopCombatAndAlarmOnActor(actor, false);
+            }
+            lists->StopCombatAndAlarmOnActor(&player, false);
+        }
+        player.StopCombat();
+        return static_cast<int>(fighters.size());
     }
 }

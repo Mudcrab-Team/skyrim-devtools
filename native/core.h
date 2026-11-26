@@ -27,6 +27,7 @@ namespace devtools
         constexpr int timeout = -32008;
         constexpr int busy = -32009;
         constexpr int notFound = -32010;
+        constexpr int stuck = -32011;
     }
 
     struct RpcError : std::runtime_error

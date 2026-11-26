@@ -6,7 +6,9 @@ that `capture_start` records:
   {"t":"tool","name":..,"args":{..},"startMs":..,"endMs":..,"ok":bool,"summary":"..","error":".."}
   {"t":"narrate","ms":..,"text":".."}                      caption the agent wants on screen
   {"t":"status","ms":..,"cell":..,"pos":[x,y,z],"health":[cur,max],"quest":{..},"nav":".."}
+  {"t":"event","ms":..,"type":"moveStuck"|"moveUnstuck","data":{..}}   movement trouble reported by the plugin
   {"t":"capture","ms":..,"action":"start"|"stop","startEpochMs":..,"file":".."}
+  {"t":"alert","ms":..,"action":"raised"|"cleared","kind":..,"severity":..,"hint":..,"detail":..}
 """
 
 import asyncio
@@ -22,6 +24,8 @@ SUMMARY_LIMIT = 220
 ARG_LIMIT = 120
 # tools whose own arguments or results carry nothing worth reading on screen
 QUIET_TOOLS = {"narrate"}
+# the alerts tool shows the alerts itself
+NO_ALERT_FIELD = {"agent_alerts"}
 
 
 def now_ms():
@@ -76,11 +80,21 @@ class Recorder:
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
 
+    MOVE_EVENTS = ("moveStuck", "moveUnstuck")
+
+    def attach(self, manager):
+        """Write the plugin's movement-trouble events into the timeline as they arrive."""
+        def on_event(event):
+            if event.get("type") in self.MOVE_EVENTS:
+                self.write({"t": "event", "ms": now_ms(), "type": event["type"], "data": event.get("data")})
+
+        manager.listeners.append(on_event)
+
     def narrate(self, text):
         self.write({"t": "narrate", "ms": now_ms(), "text": text.strip()})
 
-    def instrument(self, mcp):
-        """Make every tool registered on `mcp` afterwards log itself."""
+    def instrument(self, mcp, board=None):
+        """Make every tool registered on `mcp` afterwards log itself and, with a board, carry its active alerts."""
         register = mcp.tool
 
         def tool(*dargs, **dkwargs):
@@ -96,15 +110,25 @@ class Recorder:
                 @functools.wraps(function)
                 async def logged(*args, **kwargs):
                     start = now_ms()
+                    if board is not None:
+                        board.call_started(name)
                     record = {"t": "tool", "name": name, "args": compact_args(kwargs, defaults), "startMs": start}
                     try:
                         result = await function(*args, **kwargs)
                     except BaseException as error:
                         record.update(endMs=now_ms(), ok=False, error=clip(f"{type(error).__name__}: {error}", SUMMARY_LIMIT))
                         self.write(record)
+                        if board is not None and isinstance(error, Exception):
+                            # a call that fails the same way again and again is a loop too
+                            board.observe_call(name, kwargs, f"error: {error}")
                         raise
                     record.update(endMs=now_ms(), ok=True, summary=summarize_result(result))
                     self.write(record)
+                    if board is not None:
+                        board.observe_call(name, kwargs, result)
+                        board.expire()
+                        if name not in NO_ALERT_FIELD:
+                            result = board.attach(result)
                     return result
 
                 return decorate(logged)
@@ -160,9 +184,9 @@ class Recorder:
                 health = state.get("health")
                 if isinstance(health, dict):
                     sample["health"] = [health.get("cur"), health.get("max")]
+                # a flag that is off is written as false: an absent key would leave the panel on the last true value
                 for flag in ("inCombat", "dead", "sneaking"):
-                    if state.get(flag):
-                        sample[flag] = True
+                    sample[flag] = bool(state.get(flag))
         quest = None
         if self.track_quest and manager.has_method("Quest.get"):
             with contextlib.suppress(Exception):

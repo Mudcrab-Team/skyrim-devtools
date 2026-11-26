@@ -161,6 +161,8 @@ async def run_cases(manager, symbols, cases, seconds, out):
                 details[name] = await profile_case(manager, symbols, name, CASES[name], seconds, out)
         except Exception as error:  # noqa: BLE001 - one broken case must not hide the others
             details[name] = {"pass": False, "failed": [f"{type(error).__name__}: {error}"[:300]]}
+            import traceback
+            details[name]["trace"] = traceback.format_exc()[-900:]
             for method, params in (("Profile.stop", {}), ("Profile.watch", {"enabled": False})):
                 try:
                     await manager.call(method, **params)

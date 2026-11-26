@@ -55,7 +55,7 @@ finishes later, its result is dropped. Server notifications have no `id`:
 | Input.control | any | name, phase?, holdMs? | ControlMap user event (`Journal`, `Tween Menu`, `Activate` ...), resolved to its bound key in the innermost active input context |
 | Input.mouse | any | dx, dy or button, phase?, holdMs? | Relative motion, or button `left`, `right`, `middle` or 0-7 |
 | Input.releaseAll / Input.stats | any | | Releases held keys / `{hooked, polls, msSinceLastPoll, injectedButtons, injectedMoves}` |
-| Player.state | main | avs? | Position, rotation (deg), cell, worldspace, health/magicka/stamina, level, gold, carry weight, stance flags, active effects. `avs` adds named actor values. |
+| Player.state | main | avs? | Position, rotation (deg), cell, worldspace, health/magicka/stamina, level, gold, carry weight, stance flags, active effects. `inCombat` is true only while a living, loaded actor has the player as its combat target; `combatFlag` is the engine's raw flag (it can outlive a fight after a teleport or load) and `combatants` the count. `avs` adds named actor values. |
 | Player.inventory | main | filter?, limit? | `{total, items:[{formID, name, type, count, value, weight, equipped}]}`. Filter: weapon, armor, ammo, potion, ingredient, book, misc, key, scroll, soulgem, note, or a 4-letter record type. |
 | Player.equipped / Player.spells | main | kind?, limit? (spells) | Hands, worn armor with slots; known spells, powers and shouts |
 | World.nearby | main | radius?, types?, limit? | References sorted by distance: actor, container, door, item, activator, furniture, flora. Actors carry level, healthPct, hostile, dead, inCombat, race. Doors carry `locked`, `lockLevel` and, for teleport doors, `destination` {cell, cellEditorID, interior, location, worldspace, doorRefID, pos}. |
@@ -70,7 +70,7 @@ finishes later, its result is dropped. Server notifications have no `id`:
 | Player.teleport | main | x,y,z or refID, yawDeg? | Position set, or MoveTo a reference (queued by the engine, so the reply carries the target) |
 | Player.setAV / addItem / removeItem | main | av,value / formID,count | Return before and after values |
 | Player.look | main | yawDeg?, pitchDeg? | Turns the player by the given amount, relative to the current view. Pitch is clamped to ±85°. |
-| World.centerOnCell | main | cell, loadEpoch? | `coc <cell>`, returns the console lines |
+| World.centerOnCell | main | cell, loadEpoch? | Stops combat on the player and on everyone fighting them (`combatCleared` = actors stopped), then `coc <cell>`; returns the console lines |
 | Screen.capture | any (deferred) | maxWidth? (1024), format? (`png` or `jpeg`), quality? (85, jpeg), includeUI? (true), path?, crop? ({x, y, w, h}, fractions 0-1) | Reads the game's own swap-chain back buffer on the render thread just before Present, so it works headless and off-screen and never uses desktop capture. Scales down (never up) and encodes with WIC. Returns `{frame, width, height, sourceWidth, sourceHeight, format, bytes, data, readbackMs, encodeMs, totalMs}` with base64 `data`. With `path` (a plain file name) the image is written to the run's `screens/` directory and `path` replaces `data`. `includeUI: false` hides menus and the HUD for a few frames and restores them. `crop` cuts that part of the full-resolution frame before scaling, so a crop of a distant carving keeps its detail. |
 | Screen.project | main | refID or x, y, z | Where a reference's world bound (or a point) lands on screen: `{center:[x,y], rect:{x,y,w,h}, onScreen, inFront, worldCenter, radius, ref?, note?}` in fractions of the frame, for cropping a capture |
 | World.inspect | main | refID, nodes? (true), graph? (true), scripts? (false) | One reference in depth: base form (type, name, editorID), model, position and angles, open state (`open`, `opening`, `closed`, `closing` or null), locked, disabled, linked refs, enable parent, activation parents and children, world bound, line of sight from the player, named 3D nodes with `localRotDeg` and `localPos`, behaviour-graph variables, and with `scripts` the attached Papyrus scripts with their state and variables |
@@ -137,6 +137,24 @@ logs `main thread has not run a queued task ... frames: module+offset ...` to th
 source=plugin`), at most six times per run.
 `host.ps1 stop <session> -Grace N` asks the game to quit and kills it after N seconds (default 12);
 state.json then carries `stopPath`: `graceful`, `killed-after-Ns` or `closing-crashed`.
+`host.ps1 reset` ends the `SkyrimDevTools` scheduled task and removes the `active` lease marker when no game
+process runs (with `-Force` it first kills a leftover game or loader). The Python host calls it after every stop,
+with `-Force` when the session never ended, and `host.ps1 start` runs the same cleanup itself for a lease older
+than 90 s, listing what it removed as `staleCleared` in its reply. `host.ps1 health` prints the game process as
+JSON (`threads`, `handles`, `privateBytes`, `workingSetBytes`, `cpuSeconds`, `cpuCores`, `responding`,
+`uptimeSeconds`), read from the operating system so it works while the main thread is hung.
+
+### Dialogue records and coverage
+
+| Method | Thread | Params | Result and meaning |
+| --- | --- | --- | --- |
+| Dialogue.topics | main | refID, includeGeneric? (false), onlyPassing? (false), plugins?, quest? (substring of editor ID or name), kinds? (`player`, `command`, `scene`, `combat`, `favors`, `detection`, `service`, `misc`), limit? (300), responses? (true) | Topics the actor could say or offer: `{speaker, topicTotal, infoTotal, passing, saidOnce, truncated, topics:[{formID, editorID, text, kind, subtype, plugin, quest:{formID, editorID, name, plugin, running}, offeredNow, infos:[{formID, plugin, passes, sayOnce, said, addressed, failing?, questFailing?, text?}]}]}`. Conditions are evaluated by the engine with the actor as subject and the player as target; `failing` lists the function indexes of false items. Lines whose info or quest conditions name another speaker are left out; `includeGeneric` adds lines with no speaker condition. |
+| Dialogue.offered | ui | | `{open, currentInfo, topics:[{index, text, neverSaid, topic, info, quest}]}`: the dialogue menu's list with record ids. |
+| Coverage.start | main | plugins? (plugin file names, case-insensitive) | Resets and starts a session; `{started, plugins, unknownPlugins, infosAlreadySaid, papyrusHooked}`. |
+| Coverage.report | main | limit? (100), stop? | `{active, plugins, durationS, stages:{hit, defined, covered, quests, missed}, infos:{said, defined, covered, missed}, scenes:{started, defined}, questsStarted, papyrus:{errors, errorCount, warnings, warningCount, scriptsLogging}}`, filtered to the plugins by the plugin that created each record. |
+
+Events: `dialogueInfo {info, topic, topicText, quest, questEditorID, plugin}` when an NPC begins a dialogue info
+and `papyrusError {severity, text, script, form}` for each Papyrus warning, error or fatal log line.
 
 ### Movement, camera, navigation and recording
 
@@ -146,15 +164,15 @@ would press, so animation, collision, stamina and encumbrance all apply.
 
 | Method | Thread | Params | Result and meaning |
 | --- | --- | --- | --- |
-| Move.walk | main (deferred) | direction? (`forward`, `back`, `left`, `right`), durationMs? (≤ 60000) or distance? (≤ 20000), run?, sprint? | Holds the movement control until the time or the distance is used up. `{distance, displacement, durationMs, start, end, stoppedByLimit}`; distance is the path actually walked, so a wall shows as a short distance. |
+| Move.walk | main (deferred) | direction? (`forward`, `back`, `left`, `right`), durationMs? (≤ 60000) or distance? (≤ 20000), run?, sprint?, stuck? | Holds the movement control until the time or the distance is used up. `{distance, displacement, durationMs, start, end, stoppedByLimit}`; distance is the path actually walked, so a wall shows as a short distance. |
 | Move.turnTo | main (deferred) | headingDeg or x, y or refID; smooth? (true), degPerSec? (180) | Turns the player; replies when done with `{headingDeg, pitchDeg}` |
 | Move.jump / Move.stop | main | | Taps Jump / stops a running walk or turn |
 | Move.sneak | main (deferred) | on | Toggles sneak until `IsSneaking` matches; `{sneaking}` |
 | Camera.state | main | | `{mode, stateId, pos, yawDeg, pitchDeg, worldFov, firstPersonFov, zoom, targetZoom, freeRotationDeg, player:{headingDeg, pitchDeg}}`; mode is `firstPerson`, `thirdPerson`, `free`, `furniture`, ... |
 | Camera.set | main | mode? (`first`, `third`), yawDeg?, pitchDeg?, zoom? (0-1, third person), fov? (5-150) | Applies the given fields in that order; read Camera.state a frame later for the result |
 | Camera.lookAt | main | refID or x, y, z | Turns the player's view at a reference (actors at chest height, other references at the centre of their world bound) or a point |
-| Nav.plan | main | refID or x, y, z; from?; route? (`local`, `global`) | Path over the loaded navmeshes, `{found, complete, goalOnMesh, points, triangles, meshes, expanded, ms}`; an incomplete path adds `blockers` (see Nav.status). With `route: "global"` it is the local path to the first gate plus `global {available, world, file, found, cost, length, expanded, startLinks, goalLinks, ms, note, points}` from the worldspace graph (see below). For debugging Nav.goto. |
-| Nav.goto | main | goal, mode? (`input`), timeoutS? (300), run? (true), sprint?, onCombat? (`flee`, `fight`, `stop`, `ignore`), onDialogue? (`close`, `stop`, `wait`), onMessageBox? (`firstButton`, `stop`, `wait`), onMenu? (`close`, `stop`, `wait`), invulnerable? (false), via? ([[x,y,z]...]), route? (`global`, `local` or a recording name), routeSpacing? (600), activate? (false) | Starts a background navigation and replies at once with `{id, mode, goal, goalPos, straightDistance, route, globalLength?, globalNote?}`. Goals: `{refID}`, `{x, y, z, worldspace?}`, `{cell}` (editor id), `{place}` (a location's displayed name or form id, see Nav.places) `{questTarget: <quest>}` (the reference Quest.targets reports for the quest; empty string takes any running quest) or `{near: refID, radius}`. `activate` walks up to activation reach (radius 90 unless given) and activates the goal reference on arrival. Loading screens do not count against `timeoutS`; Nav.status reports `loading` and `loadingS`. A door just arrived through is not taken back (Nav.status `lastDoor`), the way out of an interior is used when no door leads to the goal, and after a door into an exterior a far goal takes the global route. When a door, gate or web within 2500 units changes open/locked/disabled state, dead ends and traps are forgotten and the route is planned again (event `navReplan`, Nav.status `openStateResets`). Fails with `-32009` while one runs. |
+| Nav.plan | main | refID or x, y, z; from?; route? (`local`, `global`) | Path over the loaded navmeshes, `{found, complete, goalOnMesh, startLevelZ, goalLevelZ, points, triangles, meshes, expanded, ms}`; an incomplete path adds `blockers` (see Nav.status). With `route: "global"` it is the local path to the first gate plus `global {available, world, file, found, cost, length, expanded, startLinks, goalLinks, ms, note, points}` from the worldspace graph (see below). For debugging Nav.goto. |
+| Nav.goto | main | goal, mode? (`input`), timeoutS? (300), run? (true), sprint?, onCombat? (`flee`, `fight`, `stop`, `ignore`), onDialogue? (`close`, `stop`, `wait`), onMessageBox? (`firstButton`, `stop`, `wait`), onMenu? (`close`, `stop`, `wait`), invulnerable? (false), via? ([[x,y,z]...]), route? (`global`, `local` or a recording name), routeSpacing? (600), activate? (false), stuck? | Starts a background navigation and replies at once with `{id, mode, goal, goalPos, straightDistance, route, globalLength?, globalNote?}`. Goals: `{refID}`, `{x, y, z, worldspace?}`, `{cell}` (editor id), `{place}` (a location's displayed name or form id, see Nav.places) `{questTarget: <quest>}` (the reference Quest.targets reports for the quest; empty string takes any running quest) or `{near: refID, radius}`. `activate` walks up to activation reach (radius 90 unless given) and activates the goal reference on arrival. Loading screens do not count against `timeoutS`; Nav.status reports `loading` and `loadingS`. A door just arrived through is not taken back (Nav.status `lastDoor`), the way out of an interior is used when no door leads to the goal, and after a door into an exterior a far goal takes the global route. When a door, gate or web within 2500 units changes open/locked/disabled state, dead ends and traps are forgotten and the route is planned again (event `navReplan`, Nav.status `openStateResets`). With `activate` on a load door the trip ends `arrived` only after the destination cell has loaded (the activation is repeated up to 3 times, then it fails). When the loaded navmeshes end at a shut way (a dead end or a stuck verdict in `input` mode), up to 4 levers, chains, switches or activators linked to a nearby gate, portcullis or drawbridge are walked to and pulled, then the route is planned again (`navReplan` with `why: leverPulled`, Nav.status `leversPulled`); torches and other loose fixtures are never taken as blockers or levers. Fails with `-32009` while one runs. |
 | Nav.status | main | | `{active: true, nav:{id, state, mode, goal, elapsedS, distanceRemaining, etaS, waypoint, stuckCount, replans, travelled, combat, interruption, interruptions:{count, recent}, stalls:{count, totalS, offPathCount, offPathTotalS, offPathNow, recent}, ...}}`, or `{active: false, last}` whose `state` is the outcome (`arrived`, `failed`, `cancelled`) with a `reason`. A dead end also sets `blockers {stop, gap:{horizontal, vertical}, refs:[{refID, name, model, type, state, distance, fromStop, offLine, ...}], likely}`: doors, gates, webs, levers and other activators near the stop or between it and the goal, and a one-line guess at the cause (a heuristic; confirm with World.inspect). |
 | Nav.cancel | main | | Stops the navigation and releases controls |
 | Nav.places | main | contains? (substring, case-sensitive), limit? (50) | Locations with a world map marker: `{count, places:[{name, location, marker, pos, world, distance}]}`. Names are in the game's language; `{place}` goals accept the name or the location id. |
@@ -216,10 +234,10 @@ Cancel, then hiding); `firstButton` (selects option 0, then Accept, then hides);
 (keep to the route by input at a sprint; engine legs stop in combat), `fight` (draw, close in and
 attack the nearest enemy, then carry on) or `ignore`; `stop` fails with the reason. When the
 interruption clears the trip resumes from wherever the player is, replanning or dispatching a
-new engine leg. A watchdog recovers after 20 s without 150 units of movement and fails after 4
-rounds. A round in which the player moved under 40 units at all (wedged in collision, which no
-key press undoes) instead puts it back on its own trail at least 300 units behind, up to 10
-times a trip; each is a `navStuck` with `action: "unstick"` and counted in `unsticks`. Caught
+new engine leg. The stuck detector (below) covers
+every way of getting nowhere; as a last resort on a global route, a trip stuck by displacement puts the
+player back on its own trail at least 300 units behind, up to 10 times a trip; each is a `navStuck` with
+`action: "unstick"` and counted in `unsticks`. Caught
 again at the same spot on a global route, it also skips the current gate. `invulnerable: true` turns god mode on for the trip and restores it afterwards.
 
 **Clearance and levels.** Local paths keep clear of walls: a navmesh portal end that touches a wall
@@ -236,6 +254,34 @@ containing the point in plan view whose plane is nearest the actor's height (so 
 and standing under it is the ground), waypoints and goals count as reached only on the same level (120 and
 150 units of height), and a player more than 150 units off the height of the segment it is following
 replans. `tests/live/nav_clearance.py` measures stall time per pass for doors, a bridge, stairs and a tunnel.
+
+**Stuck detector.** One detector (native/stuck.h) serves `Move.walk` and `Nav.goto` (both modes);
+it is skipped during loading screens, menus, dialogue and interruptions. It reports four reasons:
+`stuck` (while input is held, displacement under `distance` units over `windowS`), `noProgress` (the
+best distance to the goal improved by less than `progressGain` in `progressWindowS`, even though the
+player moves), `oscillation` (goal-less `Move.walk`: net displacement under `oscRatio` of the path
+walked over `oscWindowS`, or the same 100-unit cell entered 4 times) and `doorLoop` (arrival through the
+same load door `doorRepeat` times within `doorWindowS`). Escalation for `stuck`: step back and strafe,
+jump, then replan; after more than `maxFailures` recoveries, or `totalS` in one episode, the command
+stops. The other reasons replan once and stop on the next detection (a trip with no progress ends within about 20 s: the progress clock is not restarted by a recovery). A replan in `Nav.goto` records the
+spot, skips the gate or waypoint whose corridor runs through it and refuses a looped-through door (and
+its partner) for the rest of the trip; the local navmesh planner has no per-edge avoidance. `Move.walk`
+has no route, so its replan step is a longer step back. A walk ends with error `-32011` message
+`stuck` and `data` `{reason, failures, stuckS, pos, facingDeg, blockers, screenshotHint, direction,
+distance, displacement, durationMs, start}`; a trip ends `failed` with `reason` `stuck (<why>): ...`,
+and Nav.status `stuck` holds the same report (null otherwise). Options go in a `stuck` member of the
+request: `false` turns detection off, or an object with `distance` (40), `windowS` (3), `maxFailures`
+(3), `totalS` (20), `progressWindowS` (10), `progressGain` (100), `oscWindowS` (10), `oscRatio` (0.2),
+`oscMinPath` (400), `doorRepeat` (2), `doorWindowS` (60). Events: `moveStuck {source: walk|nav, reason,
+step, failures, stuckS, pos, facingDeg, blockers, door?}` at every detection, and `moveUnstuck {source,
+failures, stuckS, pos}` when the player gets going again (250 units clear of a `stuck` spot, or a full
+window with no further detection for the other reasons). `skyrim-use` writes both into the timeline JSONL
+as `{"t":"event","type":...}`.
+
+**Plan levels.** `Nav.plan` reports `startLevelZ` and `goalLevelZ`, the height of the navmesh plane the start
+and goal resolved to at their x, y (null off the mesh): a goal on a bridge deck resolves to the deck, and one
+over a floor with no navmesh at its height resolves to the floor or nothing, never to the wrong level
+silently. `tests/live/nav_levels.py` checks this in Embershard Mine.
 
 **Stalls.** A stall is speed under 40 units/s over 0.5 s (ending above 80); off-path, in input
 mode, is more than 120 units from the planned segment (ending under 60). Each episode gets a
@@ -267,6 +313,26 @@ call into the engine. The chosen target is remembered between calls.
 | Combat.block | main (deferred) | holdMs? (1500), face?, refID? | Holds the left-hand control. |
 | Combat.cast | main (deferred) | hand?, holdMs? (concentration 2000, otherwise 250), face?, refID? | Casts the spell in that hand; refuses a spell the magicka cannot pay for. |
 | Combat.drink | main | kind? (`health`, `magicka`, `stamina`) or name or formID | Drinks the weakest potion that covers the missing amount, else the strongest; skips poisons and food. |
+| Ranged.loadout | main | equip? (true), spell? | The best bow (or crossbow) and matching ammunition in the inventory, equipped unless `equip: false`: `{weapon, ready, missing[], bow{formID,name,speed,crossbow,damage,reach}, ammo{formID,name,kind,count,damage,projectile{speed,gravity,range}}, bowEquipped, ammoEquipped, equipQueued}`. With `spell: true` it describes the projectile spell in the right hand instead (`spell`, `projectile`, `concentration`, `cost`, `magicka`). |
+| Ranged.los | main | refID, part? (`torso`, `head`), from? [x,y,z], points? [[x,y,z]...] | Engine ray (collision layer LOS) from the player's eye, or `from`, to the target's torso or head: `{clear, hitDistance?, hitLayer?, hitPoint?, from, torso, head, target, distance, health, dead, points?:[{clear, hitDistance?, distance}]}`. An actor hit within the last tenth of the line counts as the target. `points` are candidate standing positions (feet; the eye height is added) tested against the same aim point. |
+| Ranged.aim | main | headingDeg, pitchDeg | Absolute aim: heading clockwise from north, pitch in degrees above the horizon (clamped to +-80). Replies with the attack and weapon state ints and the eye position. |
+| Ranged.arrows | main | | The player's own projectiles in the manager: `{arrows:[{refID, pos, velocity, distance, power, destroyed}]}` (velocity in units per second), for flight tracking and calibration. |
+| Ranged.state | main | | `{attackState, weaponState, drawn, eye, position, headingDeg, ammoLeft?}`. |
+
+### Alerts
+
+| Method | Thread | Params | Result |
+|---|---|---|---|
+| Alerts.state | any | history? (bool), limit? (history entries, default 50, max 200) | `{active[], history?[], cost, thresholds, disabled[]}`; an alert is `{kind, severity (info\|warn\|error), sinceMs, ageS, hint, detail}`; a history entry `{action: raised\|cleared, ms, kind, ...}`; `cost` is `{ticks, mainMeanUs, mainMaxUs, mainLastUs, pollerMeanUs, pollerMaxUs}` |
+| Alerts.configure | any | thresholds? (name to number), disable? / enable? (kind lists), reset? | Current `{thresholds, disabled}`. Names: pollMs, questStalledMin, combatStalemateS, deathCount, deathWindowMin, deathNearDist, fallDrop, fallTimeS, swimStallS, swimProgressDist, pitchLimitDeg, pitchBlindS, menuOpenS, notFocusedS, lowFpsBelow, lowFpsS, hitchMs, lowHealthPct, targetCheckS, questCheckS, healCheckS |
+| Alerts.dismiss | any | kind, forS? (default 300) | Clears the alert and suppresses re-raising it for that long |
+
+Events: `alertRaised {kind, severity, sinceMs, ageS, hint, detail}` and `alertCleared {kind, sinceMs, durationMs, why}`.
+Kinds the plugin raises: questStalled, combatStalemate, deathLoop, fellOrOutOfBounds, blindCamera (pitch),
+menuLeftOpen, paused, lowFps, overEncumbered, crime, targetDead, targetUnreachable, lowHealthNoHeal; the skyrim-use
+server adds actionLoop, a screenshot-based blindCamera and moveStuck (from `moveStuck`/`moveUnstuck`).
+`Screen.capture` replies also carry `meanLuma` (0-255) and `dominantShare` of the encoded frame. See
+docs/skyrim-use.md, Alerts.
 
 ## Errors
 
@@ -280,6 +346,7 @@ call into the engine. The chosen target is remembered between calls.
 | -32008 | Timed out waiting for the game; `data` names the method, thread and timeout |
 | -32009 | Too many calls in flight |
 | -32010 | Not found (unknown menu or save) |
+| -32011 | Stuck: `Move.walk` stopped by the stuck detector; `data` has reason, pos, facingDeg, blockers |
 
 ## Adding a method
 

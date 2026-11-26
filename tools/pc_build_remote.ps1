@@ -10,14 +10,16 @@ param(
     [switch]$NoPrebuilt,
     [int]$LockWait = 0,
     [switch]$KeepLock,
-    [switch]$Refresh
+    [switch]$Refresh,
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}\.lock$')][string]$LockFile = 'agent.lock'
 )
 $ErrorActionPreference = 'Continue'
 $root = Join-Path $env:USERPROFILE '.local\skyrim-devtools'
 $deps = Join-Path $root 'deps'
 $cmake = Join-Path $deps 'cmake\data\bin\cmake.exe'
 $prefix = Join-Path $root 'commonlib-install'
-$lockPath = Join-Path $root 'agent.lock'
+# A probe lock (-LockFile other.lock) lets tests exercise lock handling while a real session holds agent.lock.
+$lockPath = Join-Path $root $LockFile
 $clock = [Diagnostics.Stopwatch]::StartNew()
 
 function Step($label, [scriptblock]$body) {
@@ -50,7 +52,7 @@ function Test-LockStale {
 # Waiting agents take a ticket (a file named by arrival time) next to agent.lock and are served oldest
 # first. A ticket nobody has touched for a minute belongs to a dead waiter and is dropped. The lock itself
 # is still created atomically, so the queue only decides who may try.
-$queuePath = Join-Path $root 'agent.queue'
+$queuePath = Join-Path $root $(if ($LockFile -eq 'agent.lock') { 'agent.queue' } else { "$LockFile.queue" })
 $ticketTtlSeconds = 60
 
 function Get-Queue {

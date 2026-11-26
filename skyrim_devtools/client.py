@@ -8,6 +8,7 @@ timed-out call raises RpcError(-32008) and leaves the session usable.
 import asyncio
 import base64
 import json
+import re
 from pathlib import Path
 
 
@@ -172,6 +173,11 @@ class Session:
 
     async def console(self, command, target="selected"):
         return (await self.call("Console.execute", command=command, target=target))["lines"]
+
+    async def console_ref(self, ref, command):
+        """Run a console command on one reference. The selection `prid` makes does not carry over to the next
+        Console.execute call, so the reference goes in front of the command every time."""
+        return await self.console(ref_command(ref, command), target="none")
 
     async def center_on_cell(self, cell):
         return await self.call("World.centerOnCell", cell=cell, loadEpoch=self.epoch)
@@ -434,6 +440,14 @@ class Session:
 def _params(**values):
     """Drops unset optional parameters so the plugin applies its own defaults."""
     return {key: value for key, value in values.items() if value is not None}
+
+
+def ref_command(ref, command):
+    """`<ref>.<command>`; the reference is a form id as an int or a hex string such as `000a1b2c`."""
+    text = f"{ref:08x}" if isinstance(ref, int) else str(ref).strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{1,8}", text):
+        raise ValueError(f"not a reference id: {ref!r}")
+    return f"{text}.{command}"
 
 
 async def observe(read, predicate, label, timeout):

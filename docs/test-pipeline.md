@@ -83,9 +83,11 @@ deterministic; they never sleep for fixed long times when an event or a poll can
 
 1. **Collect.** The Tester takes every request in the queue at start. Requests that arrive during a batch wait
    for the next one.
-2. **Integrate.** Make an integration branch from `origin/main` and merge each request's SHA in. A request
-   that conflicts or breaks the build is dropped from the batch and reported right away with the error;
-   the rest continue. Build the plugin once and deploy it.
+2. **Integrate.** Make an integration branch from `origin/main` and merge each request's SHA in. Most conflicts
+   are additive (two branches each add a registration line, an include, a capability name, a docs row): resolve
+   those by keeping both sides and note it in the report. Drop a request from the batch, and report it right away
+   with the error, only when the conflict is semantic (the same function changed two ways) or the merged build
+   fails; the rest continue. Build the plugin once and deploy it.
 3. **Order.** Group cases by `setup` so each save or scenario loads once per group. Run `needs_fresh_game`
    requests last, or restart the game before them.
 4. **Run.** For each case: reset to its setup, run, collect artifacts, and record pass/fail with the measured
@@ -150,3 +152,38 @@ scripts should run.
 
 `setup` must be a real save name (or `scenario:<name>`) for session-style cases; for standalone scripts it is only a label,
 since the script loads its own save. The harness takes perf readings with `--perf-save NAME` loaded.
+
+## Known friction
+
+- Game starts are guarded: a start first waits until the previous game's process and session lease are gone (host
+  `idle` action), and a launch that does not reach the main menu within 45 s (`menuTimeout` in the config) is stopped,
+  released and restarted once; the start result lists it under `startRetries`. A refused start is still retried by the
+  harness after 25 s. Read-only host calls (`status`, `evidence`, `crashes`, `active`, `idle`) retry with a short settle,
+  so a script that starts its own game right after the harness stopped one no longer fails on the first status call.
+  A case that still fails only with `close_menu` timeouts on `LoadWaitSpinner` should be rerun alone before it is blamed
+  on the feature.
+- A standalone script that crashes, times out or is interrupted no longer leaves its game running: the harness stops
+  whatever session holds the host lease (and kills the script) after every standalone script, on errors, on timeouts
+  and on Ctrl-C, even with `--keep`. Only a finished run keeps the game under `--keep`.
+- `pc-build --deploy --keep-lock` only works when `--name` matches the lock holder; use one name for the lock, the
+  build and the deploy.
+- Console commands on a placed reference must be ref-prefixed (`<ref>.setpos x 0`): the selection made by `prid`
+  does not carry over to the next `Console.execute` call. Use `<ref>.cmd` by hand, or
+  `ctx.console_ref(ref, "setpos x 0")` / `Session.console_ref(ref, ...)`, which prefix the reference (an int or a hex
+  form id) and send it with `target: none`.
+- Every helper sends remote PowerShell as `-EncodedCommand` (UTF-16LE base64; `smoke.powershell_argv`, and the same
+  in `tools/pc-build`), so `$variables` are never expanded by the host's login shell. Do not hand-write
+  `ssh host powershell -Command "..."`; build the argv with `powershell_argv`.
+
+## Unit-test environment
+
+The unit tests need `websockets`, `mcp`, `pyyaml` and `Pillow`; a machine without them fails at import. Bootstrap once
+from the checkout (Python 3.13 or newer):
+
+~~~sh
+python3.13 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python -m unittest discover -s tests
+~~~
+
+On Windows use `py -3.13 -m venv .venv`, then `.venv\Scripts\pip install -r requirements.txt` and
+`.venv\Scripts\python -m unittest discover -s tests`.

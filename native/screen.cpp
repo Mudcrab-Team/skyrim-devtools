@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <deque>
 #include <fstream>
 #include <mutex>
@@ -92,7 +93,9 @@ namespace
             Json result{ { "frame", number }, { "width", image.width }, { "height", image.height },
                 { "sourceWidth", frame.width }, { "sourceHeight", frame.height },
                 { "format", request.jpeg ? "jpeg" : "png" }, { "bytes", image.bytes.size() },
-                { "readbackMs", readbackMs }, { "encodeMs", encodeMs } };
+                { "readbackMs", readbackMs }, { "encodeMs", encodeMs },
+                { "meanLuma", std::round(image.meanLuma * 10.0f) / 10.0f },
+                { "dominantShare", std::round(image.dominantShare * 1000.0f) / 1000.0f } };
             if (request.path.empty()) {
                 auto data = gfx::Base64(image.bytes);
                 if (data.size() > maxReplyBytes) {

@@ -28,6 +28,7 @@ class FakeSocket:
         self.dead = False
         self.closed = False
         self.results = {}
+        self.errors = {}
 
     def __aiter__(self):
         return self
@@ -56,7 +57,9 @@ class FakeSocket:
         method, params = request["method"], request["params"]
         self.calls.append((method, params))
         reply = {"jsonrpc": "2.0", "id": request["id"]}
-        if method in self.results:
+        if method in self.errors:
+            reply["error"] = self.errors[method]
+        elif method in self.results:
             reply["result"] = self.results[method]
         elif method == "Session.getInfo":
             reply["result"] = {"protocol": 2, "dataLoaded": True, "loadEpoch": self.epoch, "headless": True,
@@ -110,11 +113,20 @@ class FakeHost:
         self.stop_result = {"phase": "stopped", "exitCode": 0, "reason": ""}
         self.crash_logs = []
         self.grace = None
+        self.health = {"running": False}
+        self.stale = []
 
-    async def command(self, action, session_id="", mode="", grace=None):
+    async def command(self, action, session_id="", mode="", grace=None, force=False):
         self.commands.append((action, mode))
         if action == "start":
-            return {"sessionId": SESSION, "token": TOKEN, "port": 4000}
+            started = {"sessionId": SESSION, "token": TOKEN, "port": 4000}
+            if self.stale:
+                started["staleCleared"] = list(self.stale)
+            return started
+        if action == "health":
+            if isinstance(self.health, Exception):
+                raise self.health
+            return dict(self.health)
         if action == "crashes":
             return list(self.crash_logs)
         if action == "evidence":

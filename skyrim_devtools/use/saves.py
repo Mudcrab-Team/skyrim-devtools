@@ -6,11 +6,11 @@ file into the fixtures folder so a later session can load_save it by name.
 """
 
 import asyncio
-import base64
 import json
 import re
 import subprocess
 
+from ..smoke import powershell_argv
 from .manager import GameError
 
 NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,40}")
@@ -53,10 +53,8 @@ def register(mcp, manager, native):
 
 async def _run(manager, script):
     host = manager.host
-    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
     process = await asyncio.create_subprocess_exec(
-        *host.ssh, "-T", host.destination, "powershell", "-NoProfile", "-NonInteractive",
-        "-ExecutionPolicy", "RemoteSigned", "-EncodedCommand", encoded,
+        *host.ssh, "-T", host.destination, *powershell_argv(script),
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     out, err = await process.communicate()
     if process.returncode:

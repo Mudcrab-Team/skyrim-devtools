@@ -151,6 +151,17 @@ namespace devtools::gfx
             }
         }
 
+        double lumaSum = 0.0;
+        std::vector<std::uint32_t> bins(4096, 0);
+        for (std::uint32_t y = 0; y < outHeight; ++y) {
+            const std::uint8_t* row = rgb.data() + y * stride;
+            for (std::uint32_t x = 0; x < outWidth; ++x, row += 3) {
+                lumaSum += 0.114 * row[0] + 0.587 * row[1] + 0.299 * row[2];
+                ++bins[(row[2] >> 4) << 8 | (row[1] >> 4) << 4 | (row[0] >> 4)];
+            }
+        }
+        const double pixelCount = static_cast<double>(outWidth) * outHeight;
+
         const HRESULT init = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         struct Uninit
         {
@@ -193,6 +204,8 @@ namespace devtools::gfx
         Encoded result;
         result.width = outWidth;
         result.height = outHeight;
+        result.meanLuma = static_cast<float>(lumaSum / pixelCount);
+        result.dominantShare = static_cast<float>(*std::ranges::max_element(bins) / pixelCount);
         result.bytes.resize(static_cast<std::size_t>(stat.cbSize.QuadPart));
         LARGE_INTEGER zero{};
         Check(stream->Seek(zero, STREAM_SEEK_SET, nullptr), "Stream Seek");
