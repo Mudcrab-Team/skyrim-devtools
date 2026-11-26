@@ -418,6 +418,83 @@ class IoTrace:
         return out
 
 
+HITCH_BUDGET_MS = 1000.0 / 60.0
+OP_GROUP = {1: "open", 2: "read", 3: "read", 4: "read", 9: "read", 5: "seek", 6: "map", 7: "map", 8: "close",
+            10: "dll", 11: "dll", 12: "stat", 13: "enum", 14: "stat"}
+
+
+def main_thread_index(trace):
+    """The thread that made the most attribute and listing calls: the game's main thread walks the Data tree."""
+    counts = Counter(e.thread for e in trace.events if e.op in (12, 13))
+    if not counts:
+        counts = Counter(e.thread for e in trace.events)
+    return counts.most_common(1)[0][0] if counts else 0
+
+
+def hitch_io(trace, hitches, main_index=None, budget_ms=HITCH_BUDGET_MS):
+    """Lines frame hitches (Perf.hitches entries: epochMs at the end of the frame, ms) up with the I/O trace. A hitch
+    counts as I/O-caused when top-level I/O on the main thread inside the frame covers at least half of the time
+    over the frame budget."""
+    armed = trace.meta.get("armedEpochMs")
+    if armed is None:
+        raise ValueError("the dump has no armedEpochMs")
+    main = main_thread_index(trace) if main_index is None else main_index
+    rows = []
+    for h in hitches:
+        end = (h["epochMs"] - armed) / 1000.0
+        begin = end - h["ms"] / 1000.0
+        lo = bisect.bisect_left(trace._times, begin - 5.0)
+        hi = bisect.bisect_left(trace._times, end)
+        main_ms = Counter()
+        other_ms = 0.0
+        files = Counter()
+        other_files = Counter()
+        callers = Counter()
+        for e in trace.events[lo:hi]:
+            if e.flags & FLAG_NESTED or e.op == 8:
+                continue
+            overlap = min(end, e.t + e.dur) - max(begin, e.t)
+            if overlap <= 0:
+                continue
+            if e.thread == main:
+                group = OP_GROUP.get(e.op, "other")
+                main_ms[group] += overlap * 1000.0
+                files[e.file] += overlap * 1000.0
+                callers[trace.callers.get(e.stack, ("?",))[0]] += overlap * 1000.0
+            else:
+                other_ms += overlap * 1000.0
+                other_files[e.file] += overlap * 1000.0
+        total = sum(main_ms.values())
+        over = max(h["ms"] - budget_ms, 0.0)
+        def named(counter):
+            return [{"file": trace.files[fid][0] if fid < len(trace.files) else "?", "ms": round(ms, 2)}
+                    for fid, ms in counter.most_common(3)]
+        top_files = named(files)
+        counters = trace.counter_delta(begin, end)
+        rows.append({"epochMs": h["epochMs"], "t": round(end, 3), "ms": h["ms"], "mainIoMs": round(total, 2),
+                     "mainIoByOp": {k: round(v, 2) for k, v in main_ms.most_common()},
+                     "otherThreadsIoMs": round(other_ms, 2), "ioCaused": total >= 0.5 * over and total > 0,
+                     # The main thread may be waiting on a loader thread; overlap is a lead, not a cause.
+                     "otherIoCovers": other_ms >= 0.5 * over and other_ms > 0, "otherTopFiles": named(other_files),
+                     "pageFaultsNear": counters.get("pageFaults"), "topFiles": top_files,
+                     "topCallers": [{"caller": c, "ms": round(ms, 2)} for c, ms in callers.most_common(3)]})
+    caused = [r for r in rows if r["ioCaused"]]
+    by_file = Counter()
+    by_kind = Counter()
+    for r in caused:
+        for f in r["topFiles"][:1]:
+            by_file[f["file"]] += 1
+            by_kind[file_kind(f["file"])] += 1
+    summary = {"mainThread": trace.thread_ids[main] if main < len(trace.thread_ids) else None,
+               "hitches": len(rows), "ioCaused": len(caused),
+               "ioCausedShare": round(len(caused) / len(rows), 3) if rows else None,
+               "hitchMsTotal": round(sum(r["ms"] for r in rows), 1),
+               "mainIoMsInHitches": round(sum(r["mainIoMs"] for r in rows), 1),
+               "otherIoCovers": sum(1 for r in rows if r["otherIoCovers"] and not r["ioCaused"]),
+               "topFilesInIoHitches": by_file.most_common(15), "kindsInIoHitches": by_kind.most_common()}
+    return summary, rows
+
+
 def _read(path, binary=False):
     path = Path(path)
     if not path.exists() and Path(str(path) + ".gz").exists():
@@ -610,12 +687,26 @@ def main(argv=None):
     parser.add_argument("--symbols", default=None, help="skyrim-research checkout with the symbol tables")
     parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--hitches", type=Path, default=None,
+                        help="Perf.hitches reply (or a list of them) to line up with the trace; writes hitch-io.json")
+    parser.add_argument("--main-thread", type=int, default=None, help="OS thread id of the main thread (default: the reply's mainThread, else guessed)")
     args = parser.parse_args(argv)
     config = json.loads(args.config.read_text()) if args.config else None
     symbols = GameSymbols(research_root(args.symbols, config), address_library_path(args.addrlib, config))
     trace = IoTrace.load(args.dump, symbols)
     out = Path(args.out) if args.out else Path(args.dump).with_suffix("")
     paths, report = save_outputs(trace, out)
+    if args.hitches:
+        loaded = json.loads(args.hitches.read_text())
+        replies = loaded if isinstance(loaded, list) else [loaded]
+        hitches = [h for reply in replies for h in (reply.get("hitches", []) if isinstance(reply, dict) else [reply])]
+        main_tid = args.main_thread
+        if main_tid is None:
+            main_tid = next((r["mainThread"] for r in replies if isinstance(r, dict) and r.get("mainThread")), None)
+        index = trace.thread_ids.index(main_tid) if main_tid in trace.thread_ids else None
+        summary, rows = hitch_io(trace, hitches, index)
+        (out / "hitch-io.json").write_text(json.dumps({"summary": summary, "hitches": rows}, indent=1), encoding="utf-8")
+        report += "\nhitches: " + json.dumps(summary)
     print(json.dumps(trace.summary(), indent=1) if args.json else report)
     return 0
 

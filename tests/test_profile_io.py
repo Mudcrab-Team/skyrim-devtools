@@ -131,6 +131,20 @@ class IoTraceTest(unittest.TestCase):
         report = profile_io.render_text({**profile_io.IoTrace(meta, blob).summary(), "plugins": [], "dlls": []})
         self.assertIn("listed entries 40", report)
 
+    def test_hitch_io(self):
+        trace = self.trace()
+        hitches = [{"epochMs": 1.0 + 2150.0, "ms": 100.0}, {"epochMs": 1.0 + 5250.0, "ms": 50.0}]
+        summary, rows = profile_io.hitch_io(trace, hitches)
+        self.assertEqual(summary["mainThread"], 111)
+        self.assertEqual((summary["hitches"], summary["ioCaused"]), (2, 1))
+        self.assertTrue(rows[0]["ioCaused"])
+        self.assertAlmostEqual(rows[0]["mainIoMs"], 50.0, places=1)
+        self.assertEqual(rows[0]["topFiles"][0]["file"], "Data\\Mod.esp")
+        self.assertFalse(rows[1]["ioCaused"])
+        self.assertGreater(rows[1]["otherThreadsIoMs"], 0)
+        self.assertTrue(rows[1]["otherTopFiles"])
+        self.assertEqual(summary["topFilesInIoHitches"], [("Data\\Mod.esp", 1)])
+
     def test_plugins_and_dlls(self):
         trace = self.trace()
         plugins = trace.plugin_times()
