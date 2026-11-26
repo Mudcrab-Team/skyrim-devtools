@@ -160,6 +160,25 @@ copy of the profile rather than the profile you play, and start the game through
 `SKYRIM_DEVTOOLS_IMAGE` to the hash of the executable the profile runs. The plugin then works as in the
 pinned setup; mod DLLs appear as `skse-plugin` modules, named from the PDBs they ship.
 
+### Profiles with local saves
+
+When the profile uses local saves, MO2 redirects the game's save path to the virtual folder `__MO_Saves`; the
+files live in `<instance>/profiles/<profile>/saves`. The game cannot say which profile that is, so name the
+folder to the plugin with `SKYRIM_DEVTOOLS_SAVES_DIR=<instance>\profiles\<profile>\saves` in the launching
+process. `Session.listSaves` and `Session.loadSave` then work on that folder, provided it passes the isolation
+rule below.
+
+Tests must never touch a user's real saves, so the folder is accepted only when all of these hold:
+
+* the game's `sLocalSavePath` is `__MO_Saves`;
+* the folder is an absolute path of the form `.../profiles/<profile>/saves`;
+* the profile is recognisably a test profile: its name ends in `-devtools` (a cloned copy such as
+  `<modlist>-devtools`), or its folder contains an empty file named `skyrim-devtools-profile`, for a profile
+  with another name.
+
+Anything else, including a played profile with local saves, is refused with a not-ready error. The same rule
+applies to `Session.listSaves`, so a refused profile's saves are not listed either.
+
 ## Limits
 
 * User-mode stacks only; time inside the kernel is attributed to the system-call stub (`NtWaitFor...`).
