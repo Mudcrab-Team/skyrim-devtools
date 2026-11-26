@@ -1,7 +1,7 @@
 #!/usr/bin/env python3.13
 """Live check of the stuck detector on the test PC (SPDX-License-Identifier: GPL-3.0-or-later).
 
-  tools/stuck_session.py --config mac.json --save NAME [--phases wall,nav,navai,pingpong,doorloop]
+  tests/live/stuck_detector.py --config mac.json --save NAME [--phases wall,nav,navai,pingpong,doorloop]
 
 One visible game session. Each phase provokes one kind of trouble and prints whether the plugin noticed
 and how fast (seconds from the start of the command to the first moveStuck, and to the final stop).
@@ -10,7 +10,7 @@ and how fast (seconds from the start of the command to the first moveStuck, and 
   navai     the same in ai mode
   pingpong  Nav.goto with via points alternating between two spots (moves, never gets closer)
   doorloop  Nav.goto into an interior, out again and in again within a minute
-Run it while holding agent.lock (tools/pc-build hold ... -- tools/stuck_session.py ...).
+Prints one JSON line {"pass": bool, "details": {...}} last. Run it while holding agent.lock.
 """
 import argparse
 import asyncio
@@ -20,7 +20,7 @@ from pathlib import Path
 import sys
 import time
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
 from skyrim_devtools.use.manager import GameError, GameManager  # noqa: E402
@@ -45,10 +45,39 @@ class Probe:
         return [{**e, "t": round(e.pop("at") - began, 1)} for e in [dict(x) for x in self.events if x["at"] >= began]]
 
 
+RESULTS = {}
+
+
 def summarize(label, began, ended, probe, result):
     events = probe.since(began)
     first = next((e["t"] for e in events if e["type"] == "moveStuck"), None)
+    RESULTS[label] = {"firstDetectionS": first, "totalS": round(ended - began, 1), "events": events, "result": result}
     out(phase=label, firstDetectionS=first, totalS=round(ended - began, 1), events=events, result=result)
+
+
+def verdict():
+    """Pass criteria: a wall is noticed within 5 s and the command stops within 20 s with `stuck`; a trip
+    toward a point behind a wall ends within 25 s (stuck, or a dead end that never pushed on); a ping-pong
+    is flagged noProgress and stopped; a door re-entered inside a minute is flagged doorLoop."""
+    checks = {}
+    wall = RESULTS.get("wall")
+    if wall:
+        data = (wall["result"] or {}).get("data") or {}
+        checks["wall"] = bool(wall["firstDetectionS"] is not None and wall["firstDetectionS"] <= 5.0 and wall["totalS"] <= 20.0
+                              and (wall["result"] or {}).get("code") == -32011 and data.get("pos") and "blockers" in data)
+    for name in ("nav", "navai"):
+        item = RESULTS.get(name)
+        if item:
+            result = item["result"] or {}
+            checks[name] = bool(item["totalS"] <= 25.0 and result.get("state") in ("failed", "arrived") and not result.get("timedOut"))
+    ping = RESULTS.get("pingpong")
+    if ping:
+        reasons = {e.get("reason") for e in ping["events"] if e["type"] == "moveStuck"}
+        checks["pingpong"] = bool("noProgress" in reasons and ping["totalS"] <= 45.0 and (ping["result"] or {}).get("state") == "failed")
+    loop = RESULTS.get("doorloop")
+    if loop:
+        checks["doorloop"] = any(e.get("reason") == "doorLoop" for e in loop["events"])
+    return {"pass": bool(checks) and all(checks.values()), "details": {"checks": checks, "results": RESULTS}}
 
 
 async def attempt(manager, method, **params):
@@ -156,6 +185,7 @@ async def main():
             else:
                 await phase(manager, probe, name, start, wall, args)
     finally:
+        print(json.dumps(verdict(), default=str), flush=True)
         if not args.keep:
             await manager.stop()
 
