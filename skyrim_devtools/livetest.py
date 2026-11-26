@@ -217,6 +217,18 @@ async def run_script(ctx, script, root, timeout):
     return result
 
 
+def uses_session(case, root, config_path=None):
+    """True for a case that runs against the shared session: a module with `async def run` and no arguments,
+    or a manual case (the harness takes its screenshot)."""
+    if "script" not in case:
+        return True
+    name, args = split_command(case["script"], config_path)
+    path = Path(root) / name
+    if args or not path.is_file():
+        return False
+    return "async def run(" in path.read_text(encoding="utf-8", errors="replace")
+
+
 def looks_like_crash(error):
     return any(marker in str(error) for marker in CRASH_MARKERS)
 
@@ -297,9 +309,7 @@ class Batch:
     def new_context(self, request):
         return Context(self.manager, self.results / "artifacts", request.id, self.config_path)
 
-    async def ensure_game(self, fresh=False):
-        if fresh and self.manager.alive:
-            await self.manager.stop()
+    async def ensure_game(self):
         if not self.manager.alive:
             await self.manager.start(headless=False)
             self.last_perf = None
@@ -323,11 +333,16 @@ class Batch:
             order.setdefault(request.setup, len(order))
         return sorted(normal, key=lambda r: order[r.setup]) + [r for r in requests if r.fresh]
 
+    def perf_due(self):
+        return self.last_perf is None or time.monotonic() - self.last_perf >= self.perf_interval
+
     async def run(self, requests, only_case=None, case_timeout=None):
+        """The shared session is started only for cases that use it and for due perf readings; standalone
+        scripts bring their own game."""
         loaded = None
         for request in self.plan(requests):
-            await self.ensure_game(request.fresh)
-            if request.fresh:
+            if request.fresh and self.manager.alive:
+                await self.manager.stop()
                 loaded = None
             ctx = self.new_context(request)
             self.timelines[request.id] = ctx.timeline
@@ -336,28 +351,27 @@ class Batch:
             for case in request.cases:
                 if only_case and case["name"] != only_case:
                     continue
-                if request.setup and loaded != request.setup:
+                needs_game = uses_session(case, self.root, self.config_path) or self.perf_due()
+                if needs_game:
                     try:
-                        await ctx.setup(request.setup)
-                        loaded = request.setup
+                        await self.ensure_game()
+                        if request.setup and (loaded != request.setup or not self.manager.alive):
+                            await ctx.setup(request.setup)
+                            loaded = request.setup
                     except Exception as error:
                         loaded = None
                         self.note(request.id, f"setup {request.setup} failed: {error}")
                         results.append({"name": case["name"], "expect": case.get("expect", ""), "status": "error",
                                         "details": {}, "error": f"setup failed: {error}", "seconds": 0})
                         continue
-                await self.maybe_perf(ctx, f"before {request.id}/{case['name']}")
+                    await self.maybe_perf(ctx, f"before {request.id}/{case['name']}")
                 outcome = await run_case(ctx, case, self.root, case_timeout)
                 results.append(outcome)
                 if not self.manager.alive:
                     loaded = None
                 if outcome["status"] == "crash":
-                    self.note(request.id, f"case {case['name']}: game lost ({outcome.get('error')}); restarting")
-                    try:
-                        await self.ensure_game(fresh=True)
-                    except Exception as error:
-                        self.note(request.id, f"restart failed: {error}")
-                        raise
+                    self.note(request.id, f"case {case['name']}: game lost ({outcome.get('error')}); restarting for the next case")
+                    await self.manager.stop()
                     loaded = None
         return self.outcomes
 
