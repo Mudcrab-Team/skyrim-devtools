@@ -13,6 +13,7 @@
 #include <deque>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 namespace
@@ -36,7 +37,26 @@ namespace
         std::filesystem::path path;  // empty: return the bytes inline
         int skipFrames;
         bool restoreUi;
+        std::optional<std::array<double, 4>> crop;  // x, y, w, h as fractions of the frame
     };
+
+    // Cuts a sub-rectangle out of a frame; every readable format is four bytes a pixel.
+    gfx::Frame Crop(const gfx::Frame& frame, const std::array<double, 4>& rect)
+    {
+        const auto px = [](double v, std::uint32_t size) {
+            return static_cast<std::uint32_t>(std::clamp(v, 0.0, 1.0) * size + 0.5);
+        };
+        const auto left = px(rect[0], frame.width), top = px(rect[1], frame.height);
+        const auto right = std::max(left + 1, std::min(frame.width, px(rect[0] + rect[2], frame.width)));
+        const auto bottom = std::max(top + 1, std::min(frame.height, px(rect[1] + rect[3], frame.height)));
+        gfx::Frame out{ right - left, bottom - top, frame.format, {} };
+        out.pixels.resize(static_cast<std::size_t>(out.width) * out.height * 4);
+        for (std::uint32_t row = 0; row < out.height; ++row) {
+            const auto from = frame.pixels.data() + (static_cast<std::size_t>(top + row) * frame.width + left) * 4;
+            std::copy_n(from, static_cast<std::size_t>(out.width) * 4, out.pixels.data() + static_cast<std::size_t>(row) * out.width * 4);
+        }
+        return out;
+    }
 
     std::mutex queueMutex;
     std::deque<Request> queue;
@@ -64,6 +84,9 @@ namespace
     {
         try {
             const auto encodeStart = Clock::now();
+            if (request.crop && frame.width > 0 && frame.height > 0 && frame.pixels.size() >= std::size_t{ frame.width } * frame.height * 4) {
+                frame = Crop(frame, *request.crop);
+            }
             auto image = gfx::Encode(frame, request.maxWidth, request.jpeg, request.quality);
             const double encodeMs = Ms(Clock::now() - encodeStart);
             Json result{ { "frame", number }, { "width", image.width }, { "height", image.height },
@@ -168,7 +191,7 @@ namespace devtools::screen
 DEVTOOLS_MODULE(Screen)
 {
     RegisterDeferred("Screen.capture", [](const Json& params, ReplyPtr reply) {
-        AllowOnly(params, { "maxWidth", "format", "quality", "includeUI", "path" });
+        AllowOnly(params, { "maxWidth", "format", "quality", "includeUI", "path", "crop" });
         if (!perf::PresentHooked()) {
             throw RpcError(code::notReady, "The Present hook is not installed");
         }
@@ -192,6 +215,19 @@ DEVTOOLS_MODULE(Screen)
             path = TargetPath(Require<std::string>(params, "path"), jpeg);
         }
 
+        std::optional<std::array<double, 4>> crop;
+        if (params.contains("crop") && !params["crop"].is_null()) {
+            const auto& c = params["crop"];
+            if (!c.is_object() || !c.contains("x") || !c.contains("y") || !c.contains("w") || !c.contains("h")) {
+                throw RpcError(code::invalidParams, "crop is {x, y, w, h} as fractions 0..1 of the frame");
+            }
+            std::array<double, 4> rect{ c["x"].get<double>(), c["y"].get<double>(), c["w"].get<double>(), c["h"].get<double>() };
+            if (rect[2] <= 0.0 || rect[3] <= 0.0 || rect[0] < 0.0 || rect[1] < 0.0 || rect[0] >= 1.0 || rect[1] >= 1.0) {
+                throw RpcError(code::invalidParams, "crop needs 0 <= x, y < 1 and positive w, h");
+            }
+            crop = rect;
+        }
+
         bool restoreUi = false;
         if (!includeUi) {
             if (const auto ui = RE::UI::GetSingleton(); ui && ui->IsShowingMenus()) {
@@ -212,7 +248,7 @@ DEVTOOLS_MODULE(Screen)
                 throw RpcError(code::busy, "Too many captures are waiting for a frame");
             }
             queue.push_back({ std::move(reply), Clock::now(), maxWidth, jpeg, quality, std::move(path),
-                restoreUi ? hiddenUiFrames : 0, restoreUi });
+                restoreUi ? hiddenUiFrames : 0, restoreUi, crop });
             pending.store(true, std::memory_order_relaxed);
         }
     }, { .thread = Thread::Any, .timeout = 15s });

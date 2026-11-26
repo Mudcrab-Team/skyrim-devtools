@@ -3,6 +3,7 @@
 // The engine keeps its own pathfinder behind types CommonLib leaves undefined, so input-mode
 // navigation plans on a graph of its own: every triangle of every loaded navmesh, joined
 // inside a mesh by neighbour indices and across meshes by edge portals.
+#include "inspect.h"
 #include "methods.h"
 #include "nav_graph.h"
 #include "nav_path.h"
@@ -244,6 +245,11 @@ DEVTOOLS_MODULE(NavPath)
             out["global"] = GlobalJson(global);
             return out;
         }
-        return PlanJson(PlanPath(from, to));
+        const auto plan = PlanPath(from, to);
+        auto out = PlanJson(plan);
+        if (plan.found && !plan.complete && !plan.points.empty()) {
+            out["blockers"] = inspect::Blockers(plan.points.back(), to);
+        }
+        return out;
     }, { .thread = Thread::Main, .timeout = std::chrono::seconds(10) });
 }

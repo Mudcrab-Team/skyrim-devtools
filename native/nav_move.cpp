@@ -419,8 +419,8 @@ DEVTOOLS_MODULE(NavMove)
         }
         if (params.contains("fov")) {
             const auto fov = Require<float>(params, "fov");
-            if (fov < 20.0F || fov > 150.0F) {
-                throw RpcError(code::invalidParams, "fov is 20 to 150 degrees");
+            if (fov < 5.0F || fov > 150.0F) {
+                throw RpcError(code::invalidParams, "fov is 5 to 150 degrees");
             }
             camera->GetRuntimeData2().worldFOV = fov;
         }
@@ -437,8 +437,13 @@ DEVTOOLS_MODULE(NavMove)
         if (params.contains("refID")) {
             const auto ref = RequireRef(params["refID"]);
             target = ref->GetPosition();
-            // Aim at roughly chest height of an actor, or the reference's origin otherwise.
-            target.z += ref->Is(RE::FormType::ActorCharacter) ? 90.0F : 0.0F;
+            // Chest height for an actor; the middle of the visible model for anything else,
+            // since many origins sit on the floor or at a corner of the mesh.
+            if (ref->Is(RE::FormType::ActorCharacter)) {
+                target.z += 90.0F;
+            } else if (const auto root = ref->Get3D(); root && root->worldBound.radius > 0.0F) {
+                target = root->worldBound.center;
+            }
             describe = DescribeRef(ref);
         } else {
             target = { Require<float>(params, "x"), Require<float>(params, "y"), Require<float>(params, "z") };

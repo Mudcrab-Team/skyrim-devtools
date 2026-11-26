@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 from skyrim_devtools.use.manager import GameError, GameManager
+from skyrim_devtools.use.perception import crop_rect, zoomed_fov
 from skyrim_devtools.use.server import build_server, dig
 from skyrim_devtools.use.timeline import Recorder
 
@@ -12,7 +13,9 @@ SESSION = "a" * 32
 TOKEN = "b" * 64
 METHODS = ["Console.execute", "Events.list", "Events.snapshot", "Events.subscribe", "Events.unsubscribe",
            "Input.key", "Session.close", "Session.getInfo", "Session.listSaves", "Session.loadSave",
-           "Session.ping", "UI.closeMenu", "UI.listMenus", "UI.openMenu", "Screen.capture", "Player.state"]
+           "Session.ping", "UI.closeMenu", "UI.listMenus", "UI.openMenu", "Screen.capture", "Player.state",
+           "World.inspect", "Screen.project", "Camera.lookAt", "Camera.state", "Camera.set", "Setting.set",
+           "Setting.get"]
 
 
 class FakeSocket:
@@ -367,6 +370,61 @@ class UseTests(unittest.TestCase):
             self.assertEqual(started["startRetries"][0]["exitCode"], 1)
             await h.text("game_stop")
         run(scenario())
+
+    def test_vanity_camera_is_switched_off_at_start(self):
+        async def scenario():
+            h = Harness()
+            await h.text("game_start")
+            calls = [c for c in h.sockets[0].calls if c[0] == "Setting.set"]
+            self.assertEqual(calls, [("Setting.set", {"name": "fAutoVanityModeDelay:Camera", "value": 86400.0})])
+            await h.text("game_stop")
+        run(scenario())
+
+    def test_world_inspect_passes_the_reference(self):
+        async def scenario():
+            h = Harness()
+            await h.text("game_start")
+            h.sockets[0].results["World.inspect"] = {"refID": "000AA8CB", "openState": None, "angleDeg": {"z": 120.0}}
+            text = await h.text("world_inspect", ref_id="000AA8CB")
+            self.assertEqual(json.loads(text)["angleDeg"]["z"], 120.0)
+            self.assertIn(("World.inspect", {"refID": "000AA8CB"}), h.sockets[0].calls)
+            await h.text("game_stop")
+        run(scenario())
+
+    def test_screen_capture_zooms_crops_and_restores_fov(self):
+        async def scenario():
+            h = Harness()
+            await h.text("game_start")
+            socket = h.sockets[0]
+            socket.results["Camera.state"] = {"worldFov": 80.0}
+            socket.results["Screen.project"] = {"center": [0.5, 0.5], "inFront": True, "onScreen": True,
+                                                "rect": {"x": 0.4, "y": 0.45, "w": 0.2, "h": 0.1}}
+            socket.results["Screen.capture"] = {"format": "png", "width": 2, "height": 2,
+                                                "data": base64.b64encode(b"\x89PNG-fake").decode()}
+            content = await h.tool("screen_capture", ref_id="000AA8CB", zoom=4)
+            self.assertEqual(content[0].type, "image")
+            methods = [c[0] for c in socket.calls]
+            self.assertEqual(methods[-6:], ["Camera.lookAt", "Camera.state", "Camera.set", "Screen.project",
+                                            "Screen.capture", "Camera.set"])
+            fovs = [c[1]["fov"] for c in socket.calls if c[0] == "Camera.set"]
+            self.assertEqual(fovs, [20.0, 80.0])
+            capture = next(c[1] for c in socket.calls if c[0] == "Screen.capture")
+            self.assertFalse(capture["includeUI"])
+            self.assertAlmostEqual(capture["crop"]["w"], 0.26)
+            await h.tool("screen_capture", region={"x": 0.1, "y": 0.1, "w": 0.3, "h": 0.3}, include_ui=True)
+            capture = [c[1] for c in socket.calls if c[0] == "Screen.capture"][-1]
+            self.assertTrue(capture["includeUI"])
+            self.assertEqual(capture["crop"], {"x": 0.1, "y": 0.1, "w": 0.3, "h": 0.3})
+            await h.text("game_stop")
+        run(scenario())
+
+    def test_crop_rect_and_zoom(self):
+        rect = crop_rect({"center": [0.98, 0.5], "inFront": True, "rect": {"x": 0.96, "y": 0.49, "w": 0.04, "h": 0.02}})
+        self.assertEqual(rect["w"], 0.06)
+        self.assertAlmostEqual(rect["x"] + rect["w"], 1.0)
+        self.assertIsNone(crop_rect({"inFront": False, "rect": {}}))
+        self.assertEqual(zoomed_fov(80, 1), 80)
+        self.assertEqual(zoomed_fov(80, 100), 5.0)
 
     def test_dig(self):
         self.assertEqual(dig({"a": [{"b": 5}]}, "a.0.b"), 5)
