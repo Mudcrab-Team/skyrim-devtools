@@ -81,6 +81,8 @@ def register(mcp, manager, recorder, host=None):
         recorder.capture = {"startEpochMs": state["startEpochMs"], "remote": state["path"], "file": state["file"]}
         recorder.write({"t": "capture", "ms": now_ms(), "action": "start", "startEpochMs": state["startEpochMs"],
                         "file": state["file"], "encoder": state.get("encoder")})
+        recorder.start_sampler(manager)
+        await recorder.sample_now(manager)
         return json.dumps({"recording": True, "encoder": state.get("encoder"), "fps": state.get("fps"),
                            "startEpochMs": state["startEpochMs"]})
 
@@ -120,4 +122,6 @@ def register(mcp, manager, recorder, host=None):
         """Choose the quest (editor id, e.g. MQ101) whose stage and current objective appear in the video's
         status panel; omit to fall back to the first active quest."""
         recorder.track_quest = editor_id
+        if manager.alive:
+            await recorder.sample_now(manager)
         return json.dumps({"trackedQuest": editor_id})

@@ -227,6 +227,9 @@ def current_status(timeline, t):
         if when > t:
             break
         status.update(sample)
+    if not status and timeline.statuses:
+        # before the first sample the panel shows that sample rather than an empty block
+        status = dict(timeline.statuses[0][1])
     return status
 
 
@@ -293,16 +296,16 @@ def draw_frame(state, title):
     draw.text((x0, top), "STATUS", font=font("bold", 20), fill=DIM)
     top += 32
     lines = []
-    if status.get("cell"):
-        lines.append(("Location", str(status["cell"])))
     quest = status.get("quest")
     if quest:
         lines.append(("Quest", f"{quest.get('name')}  (stage {quest.get('stage')})"))
         if quest.get("objective"):
             lines.append(("Goal", quest["objective"]))
+    else:
+        lines.append(("Quest", "none tracked yet"))
     health = status.get("health")
-    if health and health[1]:
-        lines.append(("Health", f"{health[0]:g} / {health[1]:g}"))
+    lines.append(("Health", f"{health[0]:g} / {health[1]:g}" if health and health[1] else "unknown"))
+    lines.append(("Location", str(status["cell"]) if status.get("cell") else "unknown"))
     state_flags = [name for name, on in (("in combat", status.get("inCombat")), ("walking", status.get("walking")),
                                          ("sneaking", status.get("sneaking"))) if on]
     if state_flags:

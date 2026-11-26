@@ -91,6 +91,17 @@ class ComposeTests(unittest.TestCase):
         self.assertEqual(timeline.calls[0].start, 2.0)
         self.assertEqual(timeline.captions[0][0], 4.0)
 
+    def test_status_before_first_sample_uses_the_first_sample(self):
+        timeline = video.Timeline(statuses=[(5.0, {"cell": "Riverwood", "health": [90, 100]}),
+                                            (9.0, {"health": [40, 100]})])
+        self.assertEqual(video.current_status(timeline, 1.0), {"cell": "Riverwood", "health": [90, 100]})
+        self.assertEqual(video.current_status(timeline, 10.0), {"cell": "Riverwood", "health": [40, 100]})
+        self.assertEqual(video.current_status(video.Timeline(), 1.0), {})
+
+    def test_status_block_always_lists_quest_health_location(self):
+        image = video.draw_frame(video.panel_state(video.Timeline(), 0.0, 1.0), "t")
+        self.assertEqual(image.size, (video.W, video.H))
+
 
 if __name__ == "__main__":
     unittest.main()

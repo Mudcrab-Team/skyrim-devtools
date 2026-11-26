@@ -11,7 +11,7 @@ import time
 
 from mcp.server.fastmcp import FastMCP, Image
 
-from . import capture
+from . import capture, combat
 from .manager import GameError, GameManager
 from .timeline import Recorder
 
@@ -496,6 +496,7 @@ def build_server(manager, recorder=None):
         return dumps(await native("Papyrus.log", since=since, level=level, limit=limit, contains=contains))
 
     capture.register(mcp, manager, recorder)
+    combat.register(mcp, native, manager)
 
     # ---- movement, camera, navigation, recording ----------------------------------------------
 
