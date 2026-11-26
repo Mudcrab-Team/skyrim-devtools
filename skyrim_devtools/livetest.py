@@ -16,6 +16,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import time
@@ -91,6 +92,7 @@ class Context:
         self.screenshots = []
         self._started = time.monotonic()
         self._cursor = manager.event_total
+        self.current_setup = ""
 
     @property
     def client(self):
@@ -106,6 +108,7 @@ class Context:
     async def setup(self, name):
         """Load a save by name, or `scenario:<name>` to apply a scenario through Scenario.setup."""
         self.mark(f"setup {name}")
+        self.current_setup = name
         if name.startswith("scenario:"):
             result = await self.call("Scenario.setup", timeout=120, name=name.split(":", 1)[1])
         else:
@@ -167,18 +170,39 @@ def last_json(text):
     return None
 
 
+def split_command(script, config_path):
+    """A case script is a path, optionally followed by arguments; `<mac.json>` stands for the config path
+    and `--config` is appended when the script line has none."""
+    words = shlex.split(script)
+    config = str(config_path or "")
+    words = [config if word in {"<mac.json>", "<config>"} else word for word in words]
+    if config and "--config" not in words:
+        words += ["--config", config]
+    return words[0], words[1:]
+
+
 async def run_script(ctx, script, root, timeout):
-    path = (Path(root) / script).resolve()
+    name, args = split_command(script, ctx.config_path)
+    path = (Path(root) / name).resolve()
     if not path.is_file():
-        raise FileNotFoundError(f"script {script} not found under {root}")
-    spec = importlib.util.spec_from_file_location(f"livetest_{path.stem}", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    if hasattr(module, "run"):
+        raise FileNotFoundError(f"script {name} not found under {root}")
+    module = None
+    if not args:
+        spec = importlib.util.spec_from_file_location(f"livetest_{path.stem}", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    if module is not None and hasattr(module, "run"):
+        if not ctx.manager.alive:
+            await ctx.manager.start(headless=False)
+            if ctx.current_setup:
+                await ctx.setup(ctx.current_setup)
         return await asyncio.wait_for(module.run(ctx), timeout)
+    # a standalone program launches and stops its own game, so the shared session must be closed first
+    if ctx.manager.alive:
+        await ctx.manager.stop()
     env = {**os.environ, "SKYRIM_LIVETEST_CONFIG": str(ctx.config_path or "")}
     process = await asyncio.create_subprocess_exec(
-        sys.executable, str(path), env=env, cwd=str(root), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        sys.executable, str(path), *args, env=env, cwd=str(root), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     try:
         data, _ = await asyncio.wait_for(process.communicate(), timeout)
     except asyncio.TimeoutError:
@@ -187,7 +211,9 @@ async def run_script(ctx, script, root, timeout):
     text = data.decode("utf-8", "replace")
     result = last_json(text)
     if result is None:
-        return {"pass": False, "details": {"error": "script printed no JSON object", "output": text[-400:]}}
+        return {"pass": False, "details": {"error": "script printed no JSON object", "output": text[-600:]}}
+    if "details" not in result:
+        result = {"pass": bool(result.get("pass")), "details": {k: v for k, v in result.items() if k != "pass"}}
     return result
 
 
@@ -323,6 +349,8 @@ class Batch:
                 await self.maybe_perf(ctx, f"before {request.id}/{case['name']}")
                 outcome = await run_case(ctx, case, self.root, case_timeout)
                 results.append(outcome)
+                if not self.manager.alive:
+                    loaded = None
                 if outcome["status"] == "crash":
                     self.note(request.id, f"case {case['name']}: game lost ({outcome.get('error')}); restarting")
                     try:
