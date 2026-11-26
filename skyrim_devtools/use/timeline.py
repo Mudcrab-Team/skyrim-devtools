@@ -105,6 +105,9 @@ class Recorder:
                     except BaseException as error:
                         record.update(endMs=now_ms(), ok=False, error=clip(f"{type(error).__name__}: {error}", SUMMARY_LIMIT))
                         self.write(record)
+                        if board is not None and isinstance(error, Exception):
+                            # a call that fails the same way again and again is a loop too
+                            board.observe_call(name, kwargs, f"error: {error}")
                         raise
                     record.update(endMs=now_ms(), ok=True, summary=summarize_result(result))
                     self.write(record)
