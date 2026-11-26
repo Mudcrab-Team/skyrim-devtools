@@ -176,6 +176,25 @@ namespace devtools::nav
         return plan;
     }
 
+    std::vector<double> CostsTo(const RE::NiPoint3& from, const std::vector<RE::NiPoint3>& targets, double maxCost)
+    {
+        Refresh();
+        const auto& graph = State().graph;
+        const int start = g::Locate(graph, V(from), 400.0);
+        if (start < 0) {
+            return {};
+        }
+        const auto costs = g::Costs(graph, start, maxCost);
+        std::vector<double> out;
+        out.reserve(targets.size());
+        for (const auto& target : targets) {
+            const int t = g::Locate(graph, V(target), 150.0);
+            out.push_back(t < 0 ? std::numeric_limits<double>::infinity()
+                                : costs[t] + g::Len3(V(target) - graph.Center(t)) * graph.costScale[t]);
+        }
+        return out;
+    }
+
     Json PlanJson(const Plan& plan)
     {
         Json points = Json::array();
@@ -196,7 +215,11 @@ namespace devtools::nav
 DEVTOOLS_MODULE(NavPath)
 {
     Register("Nav.plan", [](const Json& params) {
-        AllowOnly(params, { "refID", "x", "y", "z", "from", "loadEpoch" });
+        AllowOnly(params, { "refID", "x", "y", "z", "from", "route", "loadEpoch" });
+        const auto route = Optional<std::string>(params, "route", "local");
+        if (route != "local" && route != "global") {
+            throw RpcError(code::invalidParams, "route is local or global");
+        }
         RequirePlayable(params);
         std::lock_guard lock(Lock());
         auto& player = Player();
@@ -213,6 +236,13 @@ DEVTOOLS_MODULE(NavPath)
                 throw RpcError(code::invalidParams, "from is [x, y, z]");
             }
             from = { f[0].get<float>(), f[1].get<float>(), f[2].get<float>() };
+        }
+        if (route == "global") {
+            // The long-range route over the worldspace graph, and the local plan to its first gate.
+            const auto global = PlanGlobal(player.GetWorldspace(), from, to);
+            auto out = PlanJson(PlanPath(from, global.route.points.size() > 1 ? P(global.route.points[1]) : to));
+            out["global"] = GlobalJson(global);
+            return out;
         }
         return PlanJson(PlanPath(from, to));
     }, { .thread = Thread::Main, .timeout = std::chrono::seconds(10) });

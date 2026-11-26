@@ -568,19 +568,31 @@ def build_server(manager, recorder=None):
         {"refID": "0001A2B3"}, {"x":..,"y":..,"z":..}, {"cell": "<editor id>"}, {"place": "Riverwood"} (a
         location name or id from nav_places) or {"near": "<refID>", "radius": 300}. mode "input" steers with real key presses
         over the loaded navmesh (replans as cells stream in, jumps/strafes/backs up when stuck, uses a load
-        door one hop away); mode "ai" hands the player to the engine's pathfinder (best for long trips).
+        door one hop away); mode "ai" hands the player to the engine's pathfinder. Long trips: input mode
+        takes a long-range route over the worldspace graph (built offline by skyrim-devtools-navgraph on the
+        test PC) for goals over 8000 units away in the player's worldspace and walks it gate by gate;
+        route "global" insists on it, route "local" turns it off.
         Interruptions are handled per policy and reported as navInterrupted/navResumed events: on_combat flee
         (default: keep to the route at a sprint), fight (draw, attack the nearest enemy, then resume), stop or
         ignore; on_dialogue close (default; Cancel, then hide, then the last topic for forced greetings), stop or
         wait; on_message_box firstButton (default), stop or wait; on_menu close (default), stop or wait. Loading,
         knockdown and paralysis are waited out; death fails the trip. A trip resumes from wherever the player is
         once the interruption clears; 20 s without progress triggers recovery and, after 4 rounds, failure.
-        invulnerable: true turns on god mode for the trip and restores it after. via: [[x,y,z], ...] waypoints; route: a recording
-        name to follow (input mode). Follow with nav_status / nav_wait; stop with nav_cancel. Speed long
+        invulnerable: true turns on god mode for the trip and restores it after. via: [[x,y,z], ...] waypoints; route: "global",
+        "local" or a recording name to follow (input mode). Follow with nav_status / nav_wait; stop with nav_cancel. Speed long
         trips with the console: `sgtm 4` (also speeds everything else; set back with `sgtm 1`)."""
         return dumps(await native("Nav.goto", goal=goal, mode=mode, timeoutS=timeout_s, run=run, sprint=sprint,
                                   onCombat=on_combat, onDialogue=on_dialogue, onMessageBox=on_message_box,
                                   onMenu=on_menu, invulnerable=invulnerable, via=via, route=route))
+
+    @mcp.tool()
+    async def nav_plan(ref_id: str | None = None, x: float | None = None, y: float | None = None,
+                       z: float | None = None, route: str = "local") -> str:
+        """Plan without moving: the path over the loaded navmeshes from the player to a reference or point.
+        route "global" adds the long-range route over the worldspace graph (global.points, length, cost),
+        and the local plan then runs to its first gate. Save the reply to a file and pass it to
+        trajectory_plot as route to draw it under a recording."""
+        return dumps(await native("Nav.plan", refID=ref_id, x=x, y=y, z=z, route=route))
 
     @mcp.tool()
     async def nav_status() -> str:
@@ -639,14 +651,18 @@ def build_server(manager, recorder=None):
         return dumps(result)
 
     @mcp.tool()
-    async def trajectory_plot(file: str, output: str | None = None, color_by: str = "speed") -> str:
+    async def trajectory_plot(file: str, output: str | None = None, color_by: str = "speed",
+                              route: str | None = None) -> str:
         """Plot a fetched local recording as a top-down SVG (north up) coloured by speed or frame time,
-        with start/end and stuck markers. Returns the SVG path and a summary."""
+        with start/end and stuck markers. route: a local file with a nav_plan reply or navRoute events,
+        drawn under the path as a dashed line. Returns the SVG path and a summary."""
         from .. import trajectory
 
         samples = trajectory.load(file)
+        routes = trajectory.load_routes(route) if route else ()
         out = Path(output) if output else Path(file).with_suffix(".svg")
-        out.write_text(trajectory.plot_svg(samples, color_by=color_by, title=Path(file).stem), encoding="utf-8")
+        out.write_text(trajectory.plot_svg(samples, color_by=color_by, title=Path(file).stem, routes=routes),
+                       encoding="utf-8")
         return dumps({"plot": str(out), "summary": trajectory.summarize(samples)})
 
     @mcp.tool()

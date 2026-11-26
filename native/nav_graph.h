@@ -159,6 +159,40 @@ namespace devtools::nav::graph
         return out;
     }
 
+    // Walking cost from `start` to every triangle within maxCost (infinity elsewhere), with the
+    // same step costs as AStar; for joining a point to many destinations at once.
+    inline std::vector<double> Costs(const Graph& g, int start, double maxCost)
+    {
+        std::vector<double> cost(g.Size(), std::numeric_limits<double>::infinity());
+        if (start < 0 || start >= static_cast<int>(g.Size())) {
+            return cost;
+        }
+        using Item = std::pair<double, int>;
+        std::priority_queue<Item, std::vector<Item>, std::greater<>> open;
+        cost[start] = 0.0;
+        open.push({ 0.0, start });
+        while (!open.empty()) {
+            const auto [c, t] = open.top();
+            open.pop();
+            if (c > cost[t] || c > maxCost) {
+                continue;
+            }
+            for (int i = 0; i < 3; ++i) {
+                const int u = g.nbr[t][i];
+                if (u < 0) {
+                    continue;
+                }
+                const auto mid = g.EdgeMid(t, i);
+                const auto next = c + Len3(mid - g.Center(t)) * g.costScale[t] + Len3(g.Center(u) - mid) * g.costScale[u];
+                if (next < cost[u]) {
+                    cost[u] = next;
+                    open.push({ next, u });
+                }
+            }
+        }
+        return cost;
+    }
+
     // The shared edge from triangle a to its neighbour b as (left, right) seen when walking
     // from a into b, each end pulled inwards by up to `shrink` units to keep clear of walls.
     inline bool Portal(const Graph& g, int a, int b, double shrink, V3& left, V3& right)

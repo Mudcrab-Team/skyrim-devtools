@@ -3,6 +3,7 @@
 #pragma once
 
 #include "nav_common.h"
+#include "nav_global.h"
 
 #include <cstdint>
 #include <vector>
@@ -28,4 +29,24 @@ namespace devtools::nav
     std::uint64_t GraphGeneration();
 
     Json PlanJson(const Plan& plan);
+
+    // Walking cost over the loaded navmeshes from `from` to each target (infinity when a target
+    // is off the loaded navmeshes, unreachable or dearer than maxCost); empty when `from` is off them.
+    std::vector<double> CostsTo(const RE::NiPoint3& from, const std::vector<RE::NiPoint3>& targets, double maxCost);
+
+    // A long-range route over the worldspace's offline graph (see nav_global.h).
+    struct GlobalPlan
+    {
+        global::Route route;
+        bool available = false;  // a graph file exists for the worldspace
+        std::string world;
+        std::string file;
+        std::string note;
+        double ms = 0.0;
+    };
+
+    // Whether a graph file exists for the worldspace (loaded on first use).
+    bool HasGlobalGraph(RE::TESWorldSpace* world);
+    GlobalPlan PlanGlobal(RE::TESWorldSpace* world, const RE::NiPoint3& from, const RE::NiPoint3& to);
+    Json GlobalJson(const GlobalPlan& plan, bool points = true);
 }

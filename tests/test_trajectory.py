@@ -6,7 +6,7 @@ from pathlib import Path
 from skyrim_devtools import trajectory
 from test_use import METHODS, Harness, run
 
-NAV_METHODS = ["Move.walk", "Move.turnTo", "Camera.state", "Camera.set", "Camera.lookAt", "Nav.goto",
+NAV_METHODS = ["Move.walk", "Move.turnTo", "Camera.state", "Camera.set", "Camera.lookAt", "Nav.goto", "Nav.plan",
                "Nav.status", "Nav.cancel", "Record.start", "Record.stop", "Record.list", "Record.replayCamera"]
 
 
@@ -92,6 +92,30 @@ class TrajectoryTests(unittest.TestCase):
             self.assertEqual(trajectory.main(["plot", str(recording), "-o", str(out), "--episodes", str(path)]), 0)
             self.assertIn("rings:", out.read_text())
 
+    def test_routes_load_and_plot(self):
+        plan = {"found": True, "points": [[0, 0, 0], [50, 0, 0]],
+                "global": {"found": True, "points": [[0, 0, 0], [400, 300, 0], [700, 0, 0]]}}
+        events = [{"id": 1, "why": "start", "global": {"points": [[0, 0, 0], [700, 0, 0]]}},
+                  {"id": 1, "why": "offRoute", "global": {"points": [[300, 0, 0], [500, -200, 0], [700, 0, 0]]}},
+                  {"id": 1, "why": "start", "global": {"found": False, "points": []}}]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "plan.json"
+            path.write_text(json.dumps(plan), encoding="utf-8")
+            self.assertEqual(trajectory.load_routes(path), [plan["global"]["points"]])
+            log = Path(folder) / "routes.jsonl"
+            log.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+            routes = trajectory.load_routes(log)
+            self.assertEqual(len(routes), 2)
+            samples = [sample(i, i * 100, 0) for i in range(8)]
+            svg = trajectory.plot_svg(samples, routes=routes)
+            self.assertEqual(svg.count("<polyline"), 2)
+            self.assertEqual(svg.count('r="2.5"'), 1)  # the gate of the latest route
+            self.assertIn("planned route", svg)
+            recording = write(folder, samples)
+            out = Path(folder) / "out.svg"
+            self.assertEqual(trajectory.main(["plot", str(recording), "-o", str(out), "--route", str(path)]), 0)
+            self.assertIn("dashed: planned route", out.read_text())
+
     def test_scp_command(self):
         command = trajectory.scp_command({"sshDestination": "pc", "sshConfig": "~/x.conf"},
                                          "C:\\Users\\u\\rec.jsonl", "out.jsonl")
@@ -128,7 +152,9 @@ class NavToolTests(unittest.TestCase):
             await h.text("nav_goto", goal={"refID": "0001A2B3"}, mode="ai", timeout_s=60, on_dialogue="stop",
                          invulnerable=True)
             await h.text("camera_set", mode="third", zoom=0.5)
+            await h.text("nav_plan", ref_id="0001BDF3", route="global")
             calls = dict(socket.calls)
+            self.assertEqual(calls["Nav.plan"], {"refID": "0001BDF3", "route": "global"})
             self.assertEqual(calls["Move.walk"], {"direction": "forward", "durationMs": 2000})
             self.assertEqual(calls["Nav.goto"], {"goal": {"refID": "0001A2B3"}, "mode": "ai", "timeoutS": 60,
                                                  "onDialogue": "stop", "invulnerable": True})

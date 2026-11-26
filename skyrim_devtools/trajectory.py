@@ -101,6 +101,36 @@ def load_episodes(path):
     return [e for e in data if isinstance(e, dict)]
 
 
+def load_routes(path):
+    """Planned routes from a JSON file: a Nav.plan reply (its global.points, else points), or
+    JSONL navRoute events (one route each, in the order planned)."""
+    text = Path(path).read_text(encoding="utf-8").strip()
+    try:
+        items = [json.loads(text)]
+    except ValueError:
+        items = [json.loads(line) for line in text.splitlines() if line.strip()]
+    routes = []
+
+    def points_of(item):
+        if not isinstance(item, dict):
+            return None
+        for key in ("global", "data", "params"):
+            found = points_of(item.get(key))
+            if found:
+                return found
+        points = item.get("points")
+        if isinstance(points, list):
+            return [p for p in points if isinstance(p, list) and len(p) >= 2]
+        return None
+
+    for item in items:
+        if isinstance(item, list):
+            routes.append([p for p in item if isinstance(p, list) and len(p) >= 2])
+        elif (points := points_of(item)):
+            routes.append(points)
+    return [r for r in routes if len(r) >= 2]
+
+
 def episode_summary(episodes):
     """Count and total time per episode kind, plus the longest stall."""
     out = {}
@@ -150,23 +180,25 @@ def _nice_step(length):
 EPISODE_STYLE = {"stall": "#7b3294", "offPath": "#e7298a", "interruption": "#0571b0"}
 
 
-def plot_svg(samples, color_by="speed", width=900, title=None, episodes=()):
+def plot_svg(samples, color_by="speed", width=900, title=None, episodes=(), routes=()):
     """Top-down SVG of a recording: the path coloured by speed or frame time, a green start, a red
     end, orange crosses where navigation was stuck, and breaks where the player teleported.
     `episodes` (from load_episodes) adds rings sized by duration: purple stalls, pink off-path
-    stretches and blue interruptions, each with its cause in a tooltip."""
+    stretches and blue interruptions, each with its cause in a tooltip. `routes` (from load_routes)
+    draws planned routes under the path as dashed grey lines with their gates as dots; the last
+    one darker, earlier ones (replaced by a replan) lighter."""
     if color_by not in {"speed", "frame"}:
         raise ValueError("color_by is speed or frame")
     points = [(s, position(s)) for s in samples]
     points = [(s, p) for s, p in points if p is not None]
     if len(points) < 2:
         raise ValueError("the recording has fewer than two positions")
-    xs = [p[0] for _, p in points]
-    ys = [p[1] for _, p in points]
+    xs = [p[0] for _, p in points] + [q[0] for r in routes for q in r]
+    ys = [p[1] for _, p in points] + [q[1] for r in routes for q in r]
     min_x, max_x, min_y, max_y = min(xs), max(xs), min(ys), max(ys)
     span = max(max_x - min_x, max_y - min_y, 1.0)
     margin = 40
-    legend = 75 if episodes else 60
+    legend = 75 if episodes or routes else 60
     scale = (width - 2 * margin) / span
     height = int((max_y - min_y) * scale + 2 * margin + legend)
     plot_w = (max_x - min_x) * scale + 2 * margin
@@ -189,6 +221,16 @@ def plot_svg(samples, color_by="speed", width=900, title=None, episodes=()):
     ]
     if title:
         parts.append(f'<text x="{margin}" y="22" font-size="14">{_escape(title)}</text>')
+    for i, route in enumerate(routes):
+        last = i == len(routes) - 1
+        color = "#555555" if last else "#bbbbbb"
+        line = " ".join(f"{x:.1f},{y:.1f}" for x, y in (xy(q) for q in route))
+        parts.append(f'<polyline points="{line}" fill="none" stroke="{color}" stroke-width="{2 if last else 1.5}" '
+                     f'stroke-dasharray="6,4"><title>planned route {i + 1}</title></polyline>')
+        if last:
+            for q in route[1:-1]:
+                x, y = xy(q)
+                parts.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="2.5" fill="{color}"/>')
     for (_, a), (s, b) in zip(points, points[1:]):
         if s.get("teleport"):
             continue
@@ -238,8 +280,12 @@ def plot_svg(samples, color_by="speed", width=900, title=None, episodes=()):
     parts.append(f'<text x="{lx}" y="{base + 16}">{low:.0f}</text>')
     parts.append(f'<text x="{lx + len(PALETTE) * 18}" y="{base + 16}" text-anchor="end">{high:.0f}</text>')
     parts.append(f'<text x="{lx + len(PALETTE) * 18 + 10}" y="{base}">{label}; north is up</text>')
+    lead = "dashed: planned route, dots its gates" if routes else ""
+    if routes and not episodes:
+        parts.append(f'<text x="{margin}" y="{base + 32}">{lead}</text>')
     if episodes:
-        parts.append(f'<text x="{margin}" y="{base + 32}">rings: <tspan fill="{EPISODE_STYLE["stall"]}">stall</tspan>, '
+        lead = f"{lead}; " if lead else ""
+        parts.append(f'<text x="{margin}" y="{base + 32}">{lead}rings: <tspan fill="{EPISODE_STYLE["stall"]}">stall</tspan>, '
                      f'<tspan fill="{EPISODE_STYLE["offPath"]}">off path</tspan>, '
                      f'<tspan fill="{EPISODE_STYLE["interruption"]}">interruption</tspan>; size is duration</text>')
     parts.append("</svg>")
@@ -293,6 +339,7 @@ def main(argv=None):
     plot.add_argument("--width", type=int, default=900)
     plot.add_argument("--title")
     plot.add_argument("--episodes", help="Nav.status JSON or navStall/navInterrupted events to mark on the plot")
+    plot.add_argument("--route", help="Nav.plan JSON (route global) or navRoute events to draw under the path")
     summary = commands.add_parser("summary", help="print counts and distances as JSON")
     summary.add_argument("file")
     options = parser.parse_args(argv)
@@ -303,7 +350,8 @@ def main(argv=None):
         return 0
     try:
         svg = plot_svg(samples, color_by=options.color, width=options.width,
-                       title=options.title or Path(options.file).stem, episodes=episodes)
+                       title=options.title or Path(options.file).stem, episodes=episodes,
+                       routes=load_routes(options.route) if getattr(options, "route", None) else ())
     except ValueError as error:
         print(f"skyrim-devtools-trajectory: {error}", file=sys.stderr)
         return 2

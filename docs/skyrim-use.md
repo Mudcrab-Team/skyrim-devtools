@@ -42,8 +42,8 @@ server speaks plain stdio. When the client exits the server stops the game, so a
 | Saves and world | `list_saves`, `load_save`, `reload`, `center_on_cell` |
 | State (newer plugin builds) | `player_state`, `player_inventory`, `world_nearby`, `world_crosshair`, `quest_get`, `quest_find`, `quest_active`, `activate`, `message_box`, `message_box_select`, `dialogue_state`, `dialogue_select`, `dialogue_wait`, `dialogue_advance`, `dialogue_close`, `ui_list_items`, `ui_select_item`, `ui_dump`, `ui_get`, `ui_set`, `ui_invoke`, `ui_list`, `dialogue_start`, `screenshot` (image), `perf_frame_stats`, `papyrus_log` |
 | Move and camera | `walk {direction, duration_ms or distance, run?, sprint?}`, `turn_to {heading_deg or x,y or ref_id}`, `jump`, `sneak {on}`, `camera_state`, `camera_set {mode, yaw_deg, pitch_deg, zoom, fov}`, `camera_look_at {ref_id or x,y,z}` |
-| Navigate | `nav_nearby {radius, kind}`, `nav_places {contains}`, `nav_goto {goal, mode=input\|ai, timeout_s, on_combat, on_dialogue, on_message_box, on_menu, invulnerable, via, route}`, `nav_status`, `nav_wait {timeout_s}`, `nav_cancel` |
-| Record | `record_start {hz, fields, name}`, `record_stop`, `record_fetch {name, dest_dir?, plot}`, `trajectory_plot {file, color_by}`, `record_replay_camera {name, speed}` |
+| Navigate | `nav_nearby {radius, kind}`, `nav_places {contains}`, `nav_goto {goal, mode=input\|ai, timeout_s, on_combat, on_dialogue, on_message_box, on_menu, invulnerable, via, route}`, `nav_plan {ref_id \| x, y, z, route}`, `nav_status`, `nav_wait {timeout_s}`, `nav_cancel` |
+| Record | `record_start {hz, fields, name}`, `record_stop`, `record_fetch {name, dest_dir?, plot}`, `trajectory_plot {file, color_by, route}`, `record_replay_camera {name, speed}` |
 | Generic | `rpc_methods`, `rpc_call {method, params}` |
 
 `game_start` and `game_status` report `plugin` {buildId, missingMethods, stale} and, when the plugin DLL on the host is older than this client, a top-level `warning`; redeploy with `tools/pc-build --deploy` rather than debugging tools that silently do nothing.
@@ -58,7 +58,9 @@ for example `method=Player.state path=location.cell equals=WhiterunBanneredMare`
 `nav_goto` returns at once; follow it with `nav_wait` (blocks up to 300 s per call) or `wait_for
 event_type=navArrived`. Use `mode=ai` for long overland trips (the engine pathfinder handles cell
 streaming and roads) and `mode=input` for short, precise walks that behave like a player pressing
-keys. `record_fetch` copies a recording over scp using the host config (`recordingsDir` there, or
+keys. With a worldspace graph built by `skyrim-devtools-navgraph build` (see docs/protocol.md,
+"Global routes"), `mode=input` also crosses the map: far goals follow a gate-to-gate route and
+`nav_plan route=global` shows it. `record_fetch` copies a recording over scp using the host config (`recordingsDir` there, or
 `./recordings`) and writes an SVG next to it; the same plot is available offline as
 `skyrim-devtools-trajectory plot <file> -o out.svg [--color speed|frame]`. A long trip can be
 sped up with `console sgtm 4` (and `sgtm 1` afterwards); see docs/protocol.md for the navigation
