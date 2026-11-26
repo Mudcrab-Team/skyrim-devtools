@@ -11,6 +11,7 @@ param(
     [int]$LockWait = 0,
     [switch]$KeepLock,
     [switch]$Refresh,
+    [switch]$Lease,
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}\.lock$')][string]$LockFile = 'agent.lock'
 )
 $ErrorActionPreference = 'Continue'
@@ -43,23 +44,43 @@ function Import-VcVars {
 
 function Get-LockOwner { if (Test-Path $lockPath) { (Get-Content $lockPath -Raw).Trim() } else { $null } }
 
+# A lock taken with -Lease (tools/pc-build hold) has a sidecar naming its owner and is stale once its file has
+# not been touched for $leaseSeconds: the holder's session heartbeats every few seconds, so silence means the
+# session died. A lock without a matching sidecar (manual lock, older client) keeps the slow rule, since its
+# holder only refreshes every few minutes.
+$leaseSeconds = 90
+$leasePath = "$lockPath.lease"
+
+function Get-LockAge { ((Get-Date) - (Get-Item $lockPath).LastWriteTime).TotalSeconds }
+
+function Test-LeaseLock {
+    (Test-Path $leasePath) -and ((Get-Content $leasePath -Raw).Trim() -eq (Get-LockOwner))
+}
+
 function Test-LockStale {
     if (-not (Test-Path $lockPath)) { return $false }
-    $age = (Get-Date) - (Get-Item $lockPath).LastWriteTime
-    return ($age.TotalMinutes -gt 25) -and -not (Get-Process SkyrimSE -ErrorAction SilentlyContinue)
+    if (Test-LeaseLock) { return (Get-LockAge) -gt $leaseSeconds }
+    return ((Get-LockAge) -gt (25 * 60)) -and -not (Get-Process SkyrimSE -ErrorAction SilentlyContinue)
+}
+
+function Remove-Lock {
+    Remove-Item $lockPath -Force -ErrorAction SilentlyContinue
+    Remove-Item $leasePath -Force -ErrorAction SilentlyContinue
 }
 
 # Waiting agents take a ticket (a file named by arrival time) next to agent.lock and are served oldest
-# first. A ticket nobody has touched for a minute belongs to a dead waiter and is dropped. The lock itself
+# first. A ticket nobody has touched for $leaseSeconds belongs to a dead waiter and is dropped. The lock itself
 # is still created atomically, so the queue only decides who may try.
 $queuePath = Join-Path $root $(if ($LockFile -eq 'agent.lock') { 'agent.queue' } else { "$LockFile.queue" })
-$ticketTtlSeconds = 60
+$ticketTtlSeconds = $leaseSeconds
 
 function Get-Queue {
     if (-not (Test-Path $queuePath)) { return @() }
     $live = @()
     foreach ($file in (Get-ChildItem $queuePath -Filter '*.ticket' | Sort-Object Name)) {
-        if (((Get-Date) - $file.LastWriteTime).TotalSeconds -gt $ticketTtlSeconds) {
+        $idle = ((Get-Date) - $file.LastWriteTime).TotalSeconds
+        if ($idle -gt $ticketTtlSeconds) {
+            Write-Host ("dropping stale queue entry '{0}' (no heartbeat for {1:N0}s)" -f ($file.BaseName -replace '^\d+_', ''), $idle)
             Remove-Item $file.FullName -Force -ErrorAction SilentlyContinue
         } else {
             $live += [pscustomobject]@{ Name = $file.Name; Agent = ($file.BaseName -replace '^\d+_', ''); Path = $file.FullName }
@@ -68,22 +89,39 @@ function Get-Queue {
     return $live
 }
 
+# When the SSH session that started this script dies, the script may outlive it; a waiter must not go on
+# queueing (and then take the lock) for a client that is gone.
+function Get-ParentId {
+    try { (Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction Stop).ParentProcessId } catch { $null }
+}
+
+function Test-ParentAlive($parentId) {
+    if (-not $parentId) { return $true }
+    return [bool](Get-Process -Id $parentId -ErrorAction SilentlyContinue)
+}
+
 function Acquire-Lock([string]$who, [int]$waitSeconds) {
+    $parentId = Get-ParentId
     $deadline = (Get-Date).AddSeconds($waitSeconds)
     $ticket = $null
     try {
         while ($true) {
             if ((Get-LockOwner) -eq $who) { return $true }
-            if (Test-LockStale) { Write-Host "lock held by '$(Get-LockOwner)' is stale; taking it"; Remove-Item $lockPath -Force }
+            if (-not (Test-ParentAlive $parentId)) { Write-Host "client session of $who is gone; giving up"; return $false }
             $queue = @(Get-Queue)
             $mine = $queue | Where-Object { $_.Agent -eq $who } | Select-Object -First 1
             $ahead = @($queue | Where-Object { $_.Agent -ne $who -and (-not $mine -or $_.Name -lt $mine.Name) })
             if ($ahead.Count -eq 0) {
+                if (Test-LockStale) {
+                    Write-Host ("lock held by '{0}' is stale (no heartbeat for {1:N0}s); taking it" -f (Get-LockOwner), (Get-LockAge))
+                    Remove-Lock
+                }
                 try {
                     $stream = [IO.File]::Open($lockPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
                     $bytes = [Text.Encoding]::ASCII.GetBytes($who)
                     $stream.Write($bytes, 0, $bytes.Length)
                     $stream.Close()
+                    if ($Lease) { Set-Content $leasePath $who }
                     Write-Host "lock acquired by $who"
                     return $true
                 } catch [IO.IOException] { }
@@ -107,7 +145,7 @@ function Acquire-Lock([string]$who, [int]$waitSeconds) {
 
 if ($Action -eq 'lock' -and $Refresh) {
     # Heartbeat: staleness counts from the lock file's last write, so a holder between game launches
-    # touches it to keep the lock. A holder that already lost it learns so from the exit code.
+    # touches it to keep the lock (a leased hold must do so within $leaseSeconds). A holder that already lost it learns so from the exit code.
     if (-not $Agent) { Write-Output 'lock --refresh needs an agent name'; exit 2 }
     if ((Get-LockOwner) -eq $Agent) { (Get-Item $lockPath).LastWriteTime = Get-Date; Write-Output 'lock refreshed'; exit 0 }
     Write-Output "agent.lock is held by '$(Get-LockOwner)', not '$Agent'; refresh failed"
@@ -122,7 +160,7 @@ if ($Action -eq 'lock') {
 if ($Action -eq 'unlock') {
     if (-not $Agent) { Write-Output 'unlock needs an agent name'; exit 2 }
     $owner = Get-LockOwner
-    if ($owner -eq $Agent) { Remove-Item $lockPath -Force; Write-Output 'lock released' }
+    if ($owner -eq $Agent) { Remove-Lock; Write-Output 'lock released' }
     elseif ($owner) { Write-Output "agent.lock belongs to '$owner'; left alone"; exit 4 }
     exit 0
 }
@@ -205,7 +243,7 @@ if ($Deploy) {
         $dest = Join-Path $root 'game\Data\SKSE\Plugins'
         Step 'deploy' { Copy-Item $dll (Join-Path $dest 'SkyrimDevTools.dll') -Force }
     } finally {
-        if (-not $KeepLock -and -not $heldBefore) { Remove-Item $lockPath -Force -ErrorAction SilentlyContinue; Write-Output 'lock released' }
+        if (-not $KeepLock -and -not $heldBefore) { Remove-Lock; Write-Output 'lock released' }
     }
 }
 Write-Output ("[time] remote total {0:N1}s" -f $clock.Elapsed.TotalSeconds)

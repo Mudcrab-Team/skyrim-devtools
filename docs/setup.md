@@ -43,10 +43,12 @@ tools/pc-build                    # incremental build, prints timings
 tools/pc-build --deploy --lock-wait 900   # build, then copy the DLL while holding agent.lock
 tools/pc-build lock --lock-wait 900       # hold agent.lock for a live run, release with: tools/pc-build unlock
 tools/pc-build lock --refresh             # heartbeat while holding it (non-zero exit if the lock is no longer yours)
-tools/pc-build hold --lock-wait 900 -- CMD...  # lock, run CMD with an automatic heartbeat every 4 min, unlock; stops CMD after 20 min
+tools/pc-build hold --lock-wait 900 -- CMD...  # lock, run CMD with an automatic 20 s heartbeat (a silent hold is taken over after 90 s), unlock; stops CMD after 20 min
 ~~~
 
-`agent.lock` counts as stale 25 minutes after its last write when no game is running, and the next waiter
+A `hold` lock is a lease: its heartbeat lapses after 90 s of silence (a dead SSH session), and the next
+waiter takes it over and logs the stale holder; queue entries of dead waiters are dropped the same way.
+A manual `lock` (no lease) counts as stale 25 minutes after its last write when no game is running, and the next waiter
 takes it. A holder that works longer than that, or idles between game launches, must run
 `lock --refresh` at least every few minutes (`tools/soak.py` does so every cycle) and stop when it
 fails. Check the exit code of `lock`: 0 means held, anything else means not held.
