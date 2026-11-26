@@ -1,7 +1,7 @@
 # skyrim-devtools
 
 **skyrim-use**: an SKSE plugin, a Python client and an MCP server that let AI agents play, test mods in and
-profile Skyrim Special Edition 1.7.104. The plugin exposes a JSON-RPC API inside the game; the MCP server turns it
+profile Skyrim Special Edition 1.7.104 (1.6.1170 also loads; see [profiling](docs/profiling.md#other-runtimes)). The plugin exposes a JSON-RPC API inside the game; the MCP server turns it
 into tools Claude can call, the way browser-use does for a browser.
 
 [![skyrim-use teaser](docs/media/teaser.jpg)](https://github.com/Mudcrab-Team/skyrim-devtools/releases/download/showcase-teaser/skyrim-use-teaser-public.mp4)

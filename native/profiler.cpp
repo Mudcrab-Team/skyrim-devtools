@@ -1157,7 +1157,8 @@ namespace
             { "durationS", seconds }, { "ticks", s.ticks }, { "lateTicks", s.lateTicks }, { "truncated", s.truncated },
             { "samplerCpuMs", std::round(s.samplerCpuSeconds * 1e5) / 100.0 },
             { "mainThread", mainThreadId }, { "frameThread", frameThreadId.load() },
-            { "pluginBuild", std::string(BuildId()) },
+            { "pluginBuild", std::string(BuildId()) }, { "build", GetConfig().build },
+            { "imageSha256", GetConfig().imageSha256 },
             { "frames", std::move(frames) }, { "stacks", std::move(stacks) }, { "threads", std::move(threads) },
             { "frameMarks", std::move(marks) }, { "hitchThresholdMs", hitchThresholdMs.load() },
             { "hitches", std::move(kept) }, { "hitchFrames", std::move(hitchJson["frames"]) } };

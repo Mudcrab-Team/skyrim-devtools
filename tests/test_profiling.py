@@ -103,6 +103,63 @@ class SymbolTests(unittest.TestCase):
         self.assertEqual([profiling.module_kind(m) for m in MODULES], ["game", "kernel", "plugin"])
         self.assertEqual(profiling.module_kind({"name": "nvwgf2umx.dll", "path": "C:\\x\\nvwgf2umx.dll"}), "gpu-driver")
         self.assertEqual(profiling.module_kind({"name": "kernel32.dll", "path": "C:\\Windows\\System32\\kernel32.dll"}), "system")
+        mod = {"name": "po3_Tweaks.dll", "path": "C:\\Game\\Data\\SKSE\\Plugins\\po3_Tweaks.dll"}
+        self.assertEqual(profiling.module_kind(mod), "skse-plugin")
+
+
+def write_address_library(path, offsets):
+    """A format-5 Address Library table: a 0x60-byte header, then one u32 offset per id."""
+    count = max(offsets) + 1
+    header = bytearray(0x60)
+    header[0:4] = (5).to_bytes(4, "little")
+    header[0x54:0x58] = (8).to_bytes(4, "little")
+    header[0x5C:0x60] = count.to_bytes(4, "little")
+    body = b"".join(offsets.get(i, 0).to_bytes(4, "little") for i in range(count))
+    path.write_bytes(bytes(header) + body)
+
+
+class ForeignBuildTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        write_symbols(self.root)
+        table = self.root / "versionlib.bin"
+        write_address_library(table, {5: 0x1000, 6: 0x2008, 9: 0x7000})
+        self.symbols = profiling.GameSymbols(self.root, table)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def labels(self, frames):
+        raw = raw_profile(RUNS)
+        raw["build"] = "sse-steam-1-6-1170"
+        raw["frames"] = frames
+        profile = profiling.Profile(raw, self.symbols)
+        return profile, [profile.functions[f][0] for f in profile.frame_function]
+
+    def test_table_formats(self):
+        self.assertEqual(self.symbols.ids, {5: 0x1000, 6: 0x2008, 9: 0x7000})
+
+    def test_names_come_through_ids_never_rvas(self):
+        profile, labels = self.labels([
+            {"m": 0, "rva": 0x9010, "start": 0x9000, "id": 5, "idOff": 0x10},   # id 5 is Alpha::Run here
+            {"m": 0, "rva": 0x8020, "start": 0x8000, "id": 6, "idOff": 0x18},   # id 6 lies inside Beta::Tick
+            {"m": 0, "rva": 0x1010, "start": 0x1000, "id": 9, "idOff": 0x10},   # same RVA as Alpha, unnamed id
+            {"m": 0, "rva": 0x4010, "start": 0x4000},                           # no id
+            {"m": 0, "rva": 0x6010, "start": 0x6000, "id": 5, "idOff": 0x20},   # id before the function start
+        ])
+        self.assertEqual(labels, ["Alpha::Run", "Beta::Tick (guess)", "id:9+0x10", "sub_4000", "sub_6000"])
+        self.assertEqual(profile.sources["crashlogger@id"], 1)
+        credits = " ".join(profile.credits())
+        self.assertIn("sse-steam-1-6-1170", credits)
+        self.assertIn(profiling.CRASHLOGGER_CREDIT, credits)
+
+    def test_pinned_build_is_not_bridged(self):
+        raw = raw_profile(RUNS)
+        raw["build"] = profiling.SYMBOLS_BUILD
+        profile = profiling.Profile(raw, self.symbols)
+        self.assertFalse(profile.foreign)
+        self.assertEqual(profile.functions[profile.frame_function[0]][0], "Alpha::Run")
 
 
 class ProfileTests(unittest.TestCase):
@@ -127,6 +184,9 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(report["topWaits"][0]["function"], "NtWaitForSingleObject")
         self.assertAlmostEqual(report["modules"]["game"], 85.71, places=2)
         self.assertAlmostEqual(report["modules"]["plugin"], 14.29, places=2)
+        dlls = {r["module"]: (r["selfPct"], r["totalPct"]) for r in report["dlls"]}
+        self.assertEqual(dlls["SkyrimSE.exe"], (85.71, 100.0))
+        self.assertEqual(dlls["SkyrimDevTools.dll"], (14.29, 14.29))
 
     def test_wait_detected_by_leaf_name_without_flag(self):
         profile = profiling.Profile(raw_profile([[0.0, 4, 2, 0]]))
