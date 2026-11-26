@@ -24,7 +24,7 @@ def register(mcp, native, manager):
         return state["symbols"]
 
     @mcp.tool()
-    async def profile_start(threads: str = "main", hz: float = 1000.0, duration_s: float = 30.0) -> str:
+    async def profile_start(threads: str = "all", hz: float = 1000.0, duration_s: float = 30.0) -> str:
         """Start the sampling CPU profiler (Profile.start). threads: main (the game thread), frame (the thread
         that presents), all, or comma-separated thread ids / name fragments. hz 10-4000 (default 1000);
         duration_s caps the run (max 600). Do the thing to profile, then call profile_stop."""

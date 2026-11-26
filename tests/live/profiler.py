@@ -26,7 +26,7 @@ from skyrim_devtools.use.manager import GameManager  # noqa: E402
 INTERIOR = "coc:RiverwoodSleepingGiantInn,Riverwood"
 CASES = {
     "idle": {"phase": "idle", "threads": "main"},
-    "walk": {"phase": "walk", "threads": "main"},
+    "walk": {"phase": "walk", "threads": "all"},
     "cellload": {"phase": INTERIOR, "threads": "all"},
 }
 
@@ -98,9 +98,21 @@ async def profile_case(manager, symbols, name, spec, seconds, out):
         failed.append("missing output files")
     if spec["threads"] == "all" and len(raw.get("threads", [])) < 3:
         failed.append("threads=all sampled fewer than 3 threads")
+    if (overhead.get("otherMaxSuspendedPct") or 0) >= 3.0:
+        failed.append("another thread suspended >= 3% of wall time")
+    from skyrim_devtools import profile_firefox
+
+    firefox_problems = profile_firefox.check(profiling.profile_firefox_data(profile))
+    if firefox_problems:
+        failed.append(f"Firefox export invalid: {firefox_problems[:3]}")
+    garbage = [r["function"] for r in main["topSelf"] if r["module"] != "SkyrimSE.exe" and "::" in r["function"]
+               and not r["function"].startswith("[")]
+    if garbage:
+        failed.append(f"non-game top-self names that look borrowed from distant exports: {garbage[:3]}")
     return {
         "pass": not failed, "failed": failed, "off": off, "on": on, "fpsRatio": fps_ratio,
-        "overhead": overhead, "coverage": summary["coverage"], "symbolSources": summary["symbolSources"],
+        "overhead": overhead, "otherThreads": [t.get("name") or t["tid"] for t in raw.get("threads", []) if not t.get("main")][:12],
+        "coverage": summary["coverage"], "symbolSources": summary["symbolSources"],
         "threads": len(raw.get("threads", [])), "transfer": fetched.get("transfer"),
         "fetchS": round(fetch_s, 1), "analyseS": round(analyse_s, 1), "modules": main["modules"],
         "topSelf": [f"{r['pct']}% {r['function']} [{r['module']}]" for r in main["topSelf"][:10]],

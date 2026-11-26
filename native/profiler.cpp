@@ -50,6 +50,7 @@ namespace
     constexpr std::size_t chunkBytes = 4 * 1024 * 1024;
     constexpr std::uint32_t flagWaiting = 1;        // the thread did not run since its previous sample
     constexpr std::uint32_t flagReused = 2;         // the stack was not walked again (it cannot have changed)
+    constexpr std::uint32_t flagThrottled = 4;      // skipped to stay inside the suspension budget; holds the last stack
 
     // ---- modules and unwind tables -----------------------------------------------------------
 
@@ -390,6 +391,12 @@ namespace
         std::uint64_t samples = 0;
         std::uint64_t walked = 0;
         double suspendedSeconds = 0.0;
+        std::uint64_t throttled = 0;
+        std::uint32_t lastFlags = 0;
+        // Suspension budget: suspended seconds charged against the current window, which slides forward
+        // carrying any overspend so a burst of expensive samples is paid back by skipped ticks.
+        double budgetWindowStart = -1.0;
+        double budgetSpent = 0.0;
         bool gone = false;
         std::vector<RunRecord> runs;
         double lastAt = -1.0;
@@ -434,6 +441,8 @@ namespace
         std::uint64_t ticks = 0;
         std::uint64_t lateTicks = 0;
         double samplerCpuSeconds = 0.0;
+        double suspendBudget = 0.025;
+        std::uint32_t otherEvery = 4;
         bool truncated = false;
     };
 
@@ -597,6 +606,26 @@ namespace
         }
     }
 
+    // True when the thread has used up its share of suspended time; the caller then holds the last stack.
+    // Suspending costs the target 15-40 us per sample (the kernel has to interrupt it and deliver the
+    // suspend APC), so at 1 kHz a busy thread would otherwise lose 3-5% of its time.
+    bool OverBudget(Target& target, double now, double budget)
+    {
+        if (budget <= 0.0) {
+            return false;
+        }
+        if (target.budgetWindowStart < 0.0) {
+            target.budgetWindowStart = now;
+        }
+        const double elapsed = now - target.budgetWindowStart;
+        if (elapsed > 0.1) {
+            target.budgetSpent = std::max(0.0, target.budgetSpent - budget * elapsed);
+            target.budgetWindowStart = now;
+            return target.budgetSpent > 0.0;
+        }
+        return target.budgetSpent > budget * std::max(elapsed, 0.001);
+    }
+
     // Samples one thread: false when the thread is gone.
     bool SampleThread(Target& target, Stack& scratch, double now, bool& walkedOut)
     {
@@ -616,7 +645,9 @@ namespace
         context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
         bool ok = GetThreadContext(target.handle, &context) != FALSE && CopyStack(context, target.stackHigh, scratch);
         ResumeThread(target.handle);
-        target.suspendedSeconds += perf::Now() - before;
+        const double suspended = perf::Now() - before;
+        target.suspendedSeconds += suspended;
+        target.budgetSpent += suspended;
         scratch.depth = 0;
         if (ok) {
             RebaseOntoCopy(context, scratch);
@@ -703,21 +734,24 @@ namespace
         return static_cast<double>(value(kernel) + value(user)) / 1e7;
     }
 
-    void Append(Session& session, Target& target, double at, std::uint32_t flags)
+    // `weight` is the number of ticks the sample stands for (threads other than the main one are sampled
+    // every few ticks).
+    void Append(Session& session, Target& target, double at, std::uint32_t flags, std::uint32_t weight = 1)
     {
         ++target.samples;
         ++session.sampleCount;
         const double period = 1.0 / session.hz;
-        const bool contiguous = target.lastAt >= 0.0 && at - target.lastAt < period * 1.5;
+        const bool contiguous = target.lastAt >= 0.0 && at - target.lastAt < period * (weight + 0.5);
         target.lastAt = at;
+        target.lastFlags = flags & flagWaiting;
         if (!target.runs.empty() && contiguous && (flags & flagReused)) {
             auto& last = target.runs.back();
             if (last.stack == target.lastStack && last.flags == flags) {
-                ++last.count;
+                last.count += weight;
                 return;
             }
         }
-        target.runs.push_back({ at, target.lastStack, 1, flags });
+        target.runs.push_back({ at, target.lastStack, weight, flags });
         if (++session.runCount >= maxSessionRuns) {
             session.truncated = true;
         }
@@ -794,7 +828,12 @@ namespace
             std::int32_t mainSessionStack = -1;
             bool mainWalked = false;
             bool mainSampled = false;
-            if (haveMain) {
+            const double budget = session ? session->suspendBudget : 0.025;
+            bool mainThrottled = false;
+            if (haveMain && OverBudget(mainTarget, now, budget)) {
+                mainThrottled = true;
+                ++mainTarget.throttled;
+            } else if (haveMain) {
                 bool walked = false;
                 if (SampleThread(mainTarget, *scratch, now, walked)) {
                     mainSampled = true;
@@ -819,11 +858,30 @@ namespace
             }
             if (session) {
                 ++session->ticks;
+                const bool otherTick = session->ticks % session->otherEvery == 0;
                 for (auto& target : session->threads) {
                     if (target.gone) {
                         continue;
                     }
                     bool walked = false;
+                    if (target.main && haveMain && mainThrottled) {
+                        target.throttled = mainTarget.throttled;
+                        if (target.lastStack >= 0) {
+                            Append(*session, target, now, target.lastFlags | flagReused | flagThrottled);
+                        }
+                        continue;
+                    }
+                    if (!target.main && !otherTick) {
+                        continue;
+                    }
+                    const std::uint32_t weight = target.main ? 1 : session->otherEvery;
+                    if (!target.main && OverBudget(target, now, session->suspendBudget * session->otherEvery)) {
+                        ++target.throttled;
+                        if (target.lastStack >= 0) {
+                            Append(*session, target, now, target.lastFlags | flagReused | flagThrottled, weight);
+                        }
+                        continue;
+                    }
                     if (target.main && haveMain) {
                         if (!mainSampled) {
                             continue;
@@ -844,7 +902,7 @@ namespace
                     if (target.lastStack < 0) {
                         continue;
                     }
-                    Append(*session, target, now, walked ? 0 : (flagWaiting | flagReused));
+                    Append(*session, target, now, walked ? 0 : (flagWaiting | flagReused), weight);
                 }
             }
 
@@ -1066,7 +1124,7 @@ namespace
             threads.push_back({ { "tid", target.tid }, { "name", target.name }, { "main", target.main },
                 { "frameThread", target.tid == frameThreadId.load() }, { "samples", target.samples },
                 { "walked", target.walked }, { "suspendedMs", std::round(target.suspendedSeconds * 1e5) / 100.0 },
-                { "runs", std::move(runs) } });
+                { "throttled", target.throttled }, { "runs", std::move(runs) } });
         }
         auto marks = Json::array();
         {
@@ -1085,6 +1143,7 @@ namespace
         }
         const double seconds = s.stopped - s.started;
         Json out{ { "format", "skyrim-devtools-profile" }, { "version", 1 }, { "hz", s.hz }, { "threadsSpec", s.threadsSpec },
+            { "suspendBudgetPct", s.suspendBudget * 100.0 }, { "otherEvery", s.otherEvery },
             { "startEpochMs", static_cast<std::int64_t>(std::chrono::duration<double, std::milli>(
                                   std::chrono::system_clock::now().time_since_epoch()).count() - (perf::Now() - s.started) * 1000.0) },
             { "durationS", seconds }, { "ticks", s.ticks }, { "lateTicks", s.lateTicks }, { "truncated", s.truncated },
@@ -1208,9 +1267,17 @@ DEVTOOLS_MODULE(Profiler)
     SetCapability("profile", true);
 
     Register("Profile.start", [](const Json& params) {
-        AllowOnly(params, { "threads", "hz", "durationS" });
+        AllowOnly(params, { "threads", "hz", "durationS", "suspendBudgetPct", "otherHz" });
         const double hz = Optional<double>(params, "hz", 1000.0);
         const double duration = Optional<double>(params, "durationS", 30.0);
+        const double budgetPct = Optional<double>(params, "suspendBudgetPct", 2.5);
+        const double otherHz = Optional<double>(params, "otherHz", 250.0);
+        if (budgetPct < 0.0 || budgetPct > 100.0) {
+            throw RpcError(code::invalidParams, "suspendBudgetPct is 0 (no limit) to 100");
+        }
+        if (otherHz < 1.0) {
+            throw RpcError(code::invalidParams, "otherHz is at least 1");
+        }
         std::string threads = "main";
         if (params.contains("threads") && params["threads"].is_array()) {
             threads.clear();
@@ -1232,6 +1299,8 @@ DEVTOOLS_MODULE(Profiler)
         }
         auto session = std::make_unique<Session>();
         session->hz = hz;
+        session->suspendBudget = budgetPct / 100.0;
+        session->otherEvery = static_cast<std::uint32_t>(std::max(1.0, std::round(hz / std::min(otherHz, hz))));
         session->threadsSpec = threads;
         session->deadline = perf::Now() + duration;
         finished.reset();
