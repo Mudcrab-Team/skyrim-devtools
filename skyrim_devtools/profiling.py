@@ -849,6 +849,10 @@ def save_outputs(profile, out_dir, title="Skyrim SE"):
 
     export_sqlite(profile, out_dir / "profile.sqlite")
     paths["sqlite"] = out_dir / "profile.sqlite"
+    from .profile_trace import write_perfetto
+
+    write_perfetto(profile, out_dir / "trace.pftrace")
+    paths["perfetto"] = out_dir / "trace.pftrace"
     return {k: str(v) for k, v in paths.items()}, summary
 
 
@@ -1028,8 +1032,12 @@ async def record(args):
             await manager.call("Console.execute", command=f"coc {args.cell}", timeout=60)
         await asyncio.sleep(args.settle)
         frame = (await manager.call("Perf.frameStats")).get("frame", 0)
-        await manager.call("Profile.start", threads=args.threads, hz=args.hz, durationS=args.seconds + 30,
-                           otherHz=args.other_hz, suspendBudgetPct=args.suspend_budget)
+        started = await manager.call("Profile.start", threads=args.threads, hz=args.hz, durationS=args.seconds + 30,
+                                     otherHz=args.other_hz, suspendBudgetPct=args.suspend_budget,
+                                     **trace_params(args, config, symbols))
+        failed = [h for h in (started.get("trace") or {}).get("hooks", []) if h.get("error")]
+        if failed:
+            print(f"trace hooks not installed: {json.dumps(failed)}", file=sys.stderr)
         load = asyncio.create_task(drive(manager, args.phase))
         await asyncio.sleep(args.seconds)
         load.cancel()
@@ -1046,6 +1054,20 @@ async def record(args):
     finally:
         if not args.keep:
             await manager.stop()
+
+
+def trace_params(args, config, symbols):
+    """The Profile.start `trace` argument: built-in public hooks plus the local hook lists (--trace-hooks, config
+    traceHooks, .local/trace-hooks.json), names resolved against the local symbol tables."""
+    from .profile_trace import local_hooks, trace_config
+
+    if args.trace == "off":
+        return {}
+    lists = [p for p in (args.trace_hooks, (config or {}).get("traceHooks"), Path.cwd() / ".local" / "trace-hooks.json") if p]
+    hooks, unresolved = local_hooks(lists, symbols)
+    if unresolved:
+        print(f"trace hooks without a symbol: {', '.join(map(str, unresolved))}", file=sys.stderr)
+    return {"trace": trace_config(api=args.trace, os_waits=not args.trace_no_os, hooks=hooks)}
 
 
 async def gpa_window(manager, args, config):
@@ -1114,8 +1136,17 @@ def export_command(args, symbols):
 
         counts = export_sqlite(profile, args.sqlite)
         print(json.dumps({"sqlite": str(args.sqlite), "rows": counts}))
-        if not args.firefox and not args.open:
-            return 0
+    if args.perfetto:
+        from .profile_trace import serve_and_open, write_chrome_json, write_perfetto
+
+        target = Path(args.perfetto)
+        as_json = (args.format or ("json" if target.suffix == ".json" else "proto")) == "json"
+        stats = (write_chrome_json if as_json else write_perfetto)(profile, target)
+        print(json.dumps({"perfetto": str(target), "trace": stats}))
+        if args.open_perfetto:
+            serve_and_open(args.perfetto)
+    if (args.sqlite or args.perfetto) and not args.firefox and not args.open:
+        return 0
     out = Path(args.firefox) if args.firefox else (source if source.is_dir() else source.parent) / "profile.json.gz"
     data = profile_firefox_data(profile)
     problems = profile_firefox.check(data)
@@ -1171,6 +1202,10 @@ def main(argv=None):
                     help="name other builds through --addrlib even when tables generated from their PDB exist")
     rec.add_argument("--symbols", default=None, help="skyrim-research checkout with the symbol tables")
     rec.add_argument("--out", default=None, help="output directory (default .local/profiles/<stamp>)")
+    rec.add_argument("--trace", default="batched", choices=("batched", "full", "off"),
+                     help="event trace: engine phases, D3D11 per pass (batched) or per call (full), OS waits")
+    rec.add_argument("--trace-no-os", action="store_true", help="leave OS waits and file reads out of the trace")
+    rec.add_argument("--trace-hooks", default=None, help="local JSON hook list (default .local/trace-hooks.json)")
     rec.add_argument("--gpu-counters", action="store_true",
                      help="after the profile, capture AMD GPUPerfAPI hardware counters (docs/profiling.md, AMD counters)")
     rec.add_argument("--gpa-dir", default=None, help="folder with GPUPerfAPIDX11-x64.dll on the game PC (or config gpaDir)")
@@ -1195,6 +1230,9 @@ def main(argv=None):
     exp.add_argument("--addrlib", default=None, help="versionlib-1-7-104-0.bin, to name profiles of other runtimes")
     exp.add_argument("--no-build-tables", action="store_true",
                     help="name other builds through --addrlib even when tables generated from their PDB exist")
+    exp.add_argument("--perfetto", default=None, help="trace file to write (.pftrace; .json writes Chrome trace JSON)")
+    exp.add_argument("--format", choices=("proto", "json"), default=None, help="Perfetto file format (default from the extension)")
+    exp.add_argument("--open-perfetto", action="store_true", help="serve the trace on 127.0.0.1 and open ui.perfetto.dev on it")
     exp.add_argument("--sqlite", default=None, help="also (or only) write the profile as a SQLite database")
     exp.add_argument("--recorder", default=None, help="skyrim-use timeline .jsonl whose tool calls and narration to add as markers")
     exp.add_argument("--symbols", default=None)

@@ -7,6 +7,7 @@
 #include "logs.h"
 #include "perf.h"
 #include "profiler.h"
+#include "trace.h"
 
 #include <Windows.h>
 #include <d3d11.h>
@@ -112,6 +113,9 @@ namespace devtools::profiler
                 Stamp(Label(ViewLabel("rtv", view)));
                 current->hookSeconds += perf::Now() - started;
             }
+            if (view && trace::Active()) {
+                trace::OnPassBoundary(self, "rtv", view);
+            }
             if (view && GpaWantsClears()) {
                 GpaOnClear(self, "rtv", view);
             }
@@ -125,6 +129,9 @@ namespace devtools::profiler
                 const double started = perf::Now();
                 Stamp(Label(ViewLabel("dsv", view)));
                 current->hookSeconds += perf::Now() - started;
+            }
+            if (view && trace::Active()) {
+                trace::OnPassBoundary(self, "dsv", view);
             }
             if (view && GpaWantsClears()) {
                 GpaOnClear(self, "dsv", view);

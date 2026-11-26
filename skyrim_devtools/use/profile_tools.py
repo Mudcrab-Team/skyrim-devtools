@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 import time
 
-from .. import profile_gpa, profile_sqlite, profile_views, profiling
+from .. import profile_gpa, profile_sqlite, profile_trace, profile_views, profiling
 
 
 def dumps(value):
@@ -17,7 +17,7 @@ def dumps(value):
 
 
 def register(mcp, native, manager, recorder=None):
-    state = {"symbols": None, "sqlite": None, "gpuCounters": None}
+    state = {"symbols": None, "sqlite": None, "gpuCounters": None, "raw": None}
 
     def symbols():
         if state["symbols"] is None:
@@ -26,14 +26,21 @@ def register(mcp, native, manager, recorder=None):
 
     @mcp.tool()
     async def profile_start(threads: str = "all", hz: float = 1000.0, duration_s: float = 30.0,
-                            gpu_counters: bool = False) -> str:
+                            gpu_counters: bool = False, trace: str = "batched") -> str:
         """Start the sampling CPU profiler (Profile.start). threads: main (the game thread), frame (the thread
         that presents), all, or comma-separated thread ids / name fragments. hz 10-4000 (default 1000);
         duration_s caps the run (max 600). Do the thing to profile, then call profile_stop. gpu_counters: on an
         AMD GPU with GPUPerfAPI installed (config gpaDir), profile_stop also captures hardware counters for a
-        few seconds after the CPU profile (see profile_gpu_counters)."""
+        few seconds after the CPU profile (see profile_gpu_counters). trace: batched (default; engine phases,
+        D3D11 calls summed per render pass, OS waits and file reads), full (every D3D11 call) or off; the trace
+        lands in trace.pftrace and the TraceEvents table (see profile_trace_summary)."""
         state["gpuCounters"] = gpu_counters
-        return dumps(await native("Profile.start", threads=threads, hz=hz, durationS=duration_s))
+        params = {}
+        if trace != "off":
+            lists = [p for p in (manager.config.get("traceHooks"), Path.cwd() / ".local" / "trace-hooks.json") if p]
+            hooks, _ = await asyncio.to_thread(profile_trace.local_hooks, lists, symbols())
+            params["trace"] = profile_trace.trace_config(api=trace, hooks=hooks)
+        return dumps(await native("Profile.start", threads=threads, hz=hz, durationS=duration_s, **params))
 
     @mcp.tool()
     async def profile_stop(top: int = 10, out_dir: str | None = None) -> str:
@@ -41,7 +48,7 @@ def register(mcp, native, manager, recorder=None):
         stacks, the module split (game / plugin / skse / gpu-driver / kernel / system / other-dll), what the
         thread waited on, slow frames (>100 ms) with their stacks and wait chain, sampler overhead and the
         share of game samples with a real function name. Also writes raw data, a Firefox Profiler profile
-        (profile.json.gz, open at profiler.firefox.com) and flame graph SVGs and timeline.html (threads, frames, cell loads, tool calls and
+        (profile.json.gz, open at profiler.firefox.com), trace.pftrace (open locally in ui.perfetto.dev), flame graph SVGs and timeline.html (threads, frames, cell loads, tool calls and
         hitches on one zoomable time axis), and profile.sqlite (for profile_query) to out_dir (default
         .local/profiles/<stamp> on this machine) and returns their paths. The gpu section has per-frame GPU time,
         passes, whether frames were GPU- or CPU-bound and, on AMD with the ADLX helper, board metrics (clocks, power,
@@ -58,6 +65,7 @@ def register(mcp, native, manager, recorder=None):
         paths, summary = profiling.save_outputs(profile, out)
         summary["files"] = paths
         state["sqlite"] = paths.get("sqlite")
+        state["raw"] = paths.get("raw")
         for key in ("main", "all"):
             if key in summary:
                 for field in ("topSelf", "topTotal"):
@@ -129,12 +137,27 @@ def register(mcp, native, manager, recorder=None):
         return dumps(await native("Profile.mark", kind=kind, name=name, durationMs=duration_ms))
 
     @mcp.tool()
+    async def profile_trace_summary(path: str | None = None, top: int = 10) -> str:
+        """Event-trace summary of a traced profile (the last profile_stop, or path to its output directory or
+        raw.json.gz): engine phases in ms per frame (mean, p95, max), the longest frames and which phases filled
+        them, draw calls per frame, D3D11 time per render pass and the costliest API calls, OS waits by thread and
+        file reads by kind, plus hook install status. Query single events with profile_query on TraceEventsV."""
+        target = path or state["raw"]
+        if not target:
+            return dumps({"error": "no profile yet: run profile_start/profile_stop or pass path"})
+        try:
+            raw = await asyncio.to_thread(profiling.load_raw, Path(target).expanduser())
+            return dumps(profile_trace.summary(raw, top=max(1, min(top, 50))))
+        except Exception as error:
+            return dumps({"error": f"{type(error).__name__}: {error}"})
+
+    @mcp.tool()
     async def profile_query(sql: str, path: str | None = None, limit: int = 200) -> str:
         """Run one read-only SQL statement (SQLite) against a profile database: path to a profile.sqlite, or by
         default the one the last profile_stop wrote. Tables: Frames (frame, start, end, frame_ms, cpu_ms, gpu_ms,
         hitch, bound), CpuSamples, Callchains (depth 0 = leaf), Symbols, ThreadNames, Markers, GpuRanges,
-        Counters, Meta, StringIds; views SymbolsV, LeafSamplesV, MarkersV, GpuRangesV, CountersV, ThreadsV join
-        names in. Times are ms from the profile start. Writes, ATTACH and PRAGMA are refused; at most `limit`
+        Counters, TraceEvents (engine ranges, D3D11 calls/passes, waits, reads), Meta, StringIds; views SymbolsV,
+        LeafSamplesV, MarkersV, GpuRangesV, CountersV, ThreadsV, TraceEventsV join names in. Times are ms from the profile start. Writes, ATTACH and PRAGMA are refused; at most `limit`
         rows come back. Example queries are in docs/profiling.md, SQLite export."""
         target = path or state["sqlite"]
         if not target:

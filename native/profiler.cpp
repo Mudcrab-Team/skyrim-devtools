@@ -15,6 +15,7 @@
 #include "methods.h"
 #include "perf.h"
 #include "profiler.h"
+#include "trace.h"
 
 #include <Windows.h>
 #include <DbgHelp.h>
@@ -450,6 +451,7 @@ namespace
         double started = 0.0;
         double stopped = 0.0;
         double deadline = 0.0;
+        bool traced = false;
         std::string threadsSpec;
         Interner interner;
         std::vector<Target> threads;
@@ -941,6 +943,7 @@ namespace
                     CloseHandle(t.handle);
                     t.handle = nullptr;
                 }
+                trace::Stop();
                 std::lock_guard lock(controlMutex);
                 finished = std::move(session);
                 profiling.store(false);
@@ -1330,6 +1333,9 @@ namespace
             { "gpuCounters", profiler::GpuCounters(s.started, s.stopped + 1.1, s.started) },
             { "gpuMetrics", profiler::GpuMetrics(s.started, s.stopped + 1.1, s.started) } };
         out["modules"] = resolver.Modules();
+        if (s.traced) {
+            out["trace"] = trace::Serialize(s.started);
+        }
         return out.dump(-1, ' ', false, Json::error_handler_t::replace);
     }
 
@@ -1525,7 +1531,7 @@ DEVTOOLS_MODULE(Profiler)
     SetCapability("profile", true);
 
     Register("Profile.start", [](const Json& params) {
-        AllowOnly(params, { "threads", "hz", "durationS", "suspendBudgetPct", "otherHz" });
+        AllowOnly(params, { "threads", "hz", "durationS", "suspendBudgetPct", "otherHz", "trace" });
         const double hz = Optional<double>(params, "hz", 1000.0);
         const double duration = Optional<double>(params, "durationS", 30.0);
         const double budgetPct = Optional<double>(params, "suspendBudgetPct", 2.5);
@@ -1556,6 +1562,11 @@ DEVTOOLS_MODULE(Profiler)
             throw RpcError(code::busy, "A profile is already running; call Profile.stop");
         }
         auto session = std::make_unique<Session>();
+        Json traceInfo = nullptr;
+        if (params.contains("trace") && params["trace"].is_object() && params["trace"].value("enabled", true)) {
+            traceInfo = trace::Start(params["trace"]);
+            session->traced = true;
+        }
         session->hz = hz;
         session->suspendBudget = budgetPct / 100.0;
         session->otherEvery = static_cast<std::uint32_t>(std::max(1.0, std::round(hz / std::min(otherHz, hz))));
@@ -1568,7 +1579,7 @@ DEVTOOLS_MODULE(Profiler)
         profiling.store(true);
         EnsureSampler();
         return Json{ { "started", true }, { "hz", hz }, { "threads", threads }, { "durationS", duration },
-            { "mainThread", mainThreadId } };
+            { "mainThread", mainThreadId }, { "trace", std::move(traceInfo) } };
     }, { .thread = Thread::Any });
 
     Register("Profile.stop", [](const Json& params) {
@@ -1590,6 +1601,7 @@ DEVTOOLS_MODULE(Profiler)
             }
         }
         profiling.store(false);
+        trace::Stop();
         for (int i = 0; i < 4000; ++i) {
             {
                 std::lock_guard lock(controlMutex);
