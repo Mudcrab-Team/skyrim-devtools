@@ -58,6 +58,18 @@ this plugin build" instead of failing obscurely, and `rpc_call` reaches any meth
 (a buffered, not yet drained event; it does not consume it) and a generic probe `method` + `path` + `equals`,
 for example `method=Player.state path=location.cell equals=WhiterunBanneredMare`.
 
+**Stuck handling.** Every movement path (`walk`, `nav_goto` in both modes, combat approach) runs the
+same native detector: no displacement while moving input is held, a route whose distance to the goal
+stops shrinking, ping-pong between spots and a door that keeps being re-entered. It steps back and
+strafes, jumps, replans around the spot (blocking a looped door), and then stops with `stuck` within
+about 15 s: `walk` returns `{"stuck": true, "error": "stuck", reason, pos, facingDeg, blockers,
+screenshotHint}` and `nav_wait` returns `"error": "stuck"` with the same report under `stuck`; take a
+`screenshot` to see the blocker. Tune it per call with the `stuck` argument (`false` disables;
+`{"distance": 40, "windowS": 3, "maxFailures": 3, "totalS": 20, "progressWindowS": 15}`).
+`moveStuck` / `moveUnstuck` events land in the timeline JSONL. `walk` also has a client-side backstop:
+if the player covers under 40 units in 20 s the walk is stopped and reported `reason: hardCap`.
+Details: docs/protocol.md, "Stuck detector".
+
 `nav_goto` returns at once; follow it with `nav_wait` (blocks up to 300 s per call) or `wait_for
 event_type=navArrived`. Use `mode=ai` for long overland trips (the engine pathfinder handles cell
 streaming and roads) and `mode=input` for short, precise walks that behave like a player pressing

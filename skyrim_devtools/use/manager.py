@@ -60,6 +60,12 @@ def plugin_report(info, methods):
 class GameError(RuntimeError):
     """A failure to report to the playtester as-is."""
 
+    rpc_code = None  # the plugin's error code when the failure came from a native call
+    rpc_data = None
+
+
+STUCK_CODE = -32011
+
 
 def describe_rpc_error(error):
     text = f"{error} ({HINTS[error.code]})" if error.code in HINTS else str(error)
@@ -89,6 +95,7 @@ class GameManager:
         self._connect = connect
         self.keepalive_seconds = keepalive
         self.lock = asyncio.Lock()
+        self.listeners = []  # callbacks(compact_event) for every native event, kept across game restarts
         self.reset()
 
     def reset(self):
@@ -113,8 +120,14 @@ class GameManager:
         return self.session is not None and self.phase == "running"
 
     def _on_event(self, event):
-        self.events.append(compact_event(event))
+        compact = compact_event(event)
+        self.events.append(compact)
         self.event_total += 1
+        for listener in list(self.listeners):
+            try:
+                listener(compact)
+            except Exception:
+                pass
 
     def events_since(self, cursor):
         """Buffered events with absolute index >= cursor, plus how many were lost to the ring."""
@@ -400,7 +413,10 @@ class GameManager:
             try:
                 return await self.session.call(method, timeout=timeout, **params)
             except RpcError as error:
-                raise GameError(describe_rpc_error(error)) from error
+                failure = GameError(describe_rpc_error(error))
+                failure.rpc_code = error.code
+                failure.rpc_data = error.data
+                raise failure from error
             except (ConnectionLost, OSError) as error:
                 async with self.lock:
                     if self.phase == "running" and (self.session is None or self.session._closed is not None):

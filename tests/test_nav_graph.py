@@ -22,6 +22,9 @@ class NavGraphTests(unittest.TestCase):
     def test_path_search(self):
         self.run_cpp("nav_graph_test")
 
+    def test_stuck_detector(self):
+        self.run_cpp("stuck_test")
+
     def test_global_route(self):
         self.run_cpp("nav_global_test")
 

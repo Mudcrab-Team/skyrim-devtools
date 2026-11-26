@@ -93,11 +93,6 @@ namespace
         std::deque<History> history;
         int stuckCount = 0;
         int replans = 0;
-        int stuckSinceProgress = 0;
-        double progressMark = 0.0;  // travelled at the last stuck episode
-        int recoverStep = -1;
-        double recoverUntil = 0.0;
-        double stuckCooldown = 0.0;
 
         RE::FormID door = 0;        // load door being used to change cells
         double doorActivated = 0.0;
@@ -161,10 +156,6 @@ namespace
         double offPathTotal = 0.0;
         double offPathNow = 0.0;
 
-        // Watchdog: real movement within the last 20 s.
-        RE::NiPoint3 progressPos;
-        double progressAt = 0.0;
-        int watchdogRounds = 0;
         // Door approach: the door being walked to (a load door or an activate goal) is entered from a
         // staging point in front of it, not from whichever side the path hugs.
         RE::FormID stageFor = 0;
@@ -172,6 +163,11 @@ namespace
         bool staged = false;
         RE::NiPoint3 stage;
         bool slowed = false;  // walking the last stretch to a door
+        // Stuck detection shared with Move.walk (stuck.h): no displacement, no progress to the goal,
+        // door loops.
+        stuck::Detector det;
+        bool recoveringByAi = false;  // an engine-driven trip is being walked clear by input
+        Json stuckInfo;               // the report of the stop, when the trip ended stuck
         // Spots the player walked through, a few hundred units apart, to step back to when caught
         // in collision geometry that no key press gets out of.
         std::deque<RE::NiPoint3> trail;
@@ -362,6 +358,7 @@ namespace
             });
             if (best) {
                 recentDoor = { best->GetFormID(), Now(), !cell->IsInteriorCell() };
+                stuck::Doors().Note(Now(), best->GetFormID());
             }
         }
         lastCell = cell;
@@ -390,6 +387,13 @@ namespace
     }
 
     // A loaded load door whose other side is in the goal's cell or worldspace (one hop only).
+    // Load doors a trip stopped using after being caught in a loop through them.
+    std::set<RE::FormID>& BlockedDoors()
+    {
+        static std::set<RE::FormID> doors;
+        return doors;
+    }
+
     RE::TESObjectREFR* FindLoadDoor(RE::PlayerCharacter& player, const Goal& goal)
     {
         const auto tes = RE::TES::GetSingleton();
@@ -408,7 +412,7 @@ namespace
         double exitDistance = std::numeric_limits<double>::max();
         tes->ForEachReferenceInRange(&player, 30000.0F, [&](RE::TESObjectREFR* ref) {
             const auto base = ref ? ref->GetBaseObject() : nullptr;
-            if (!base || !base->Is(RE::FormType::Door) || ref->IsDisabled()) {
+            if (!base || !base->Is(RE::FormType::Door) || ref->IsDisabled() || BlockedDoors().contains(ref->GetFormID())) {
                 return RE::BSContainer::ForEachResult::kContinue;
             }
             const auto linked = ref->extraList.GetTeleportLinkedDoor().get();
@@ -518,6 +522,7 @@ namespace
             out["speed"] = Round(speed);
             out["etaS"] = speed > 20.0 ? Json(Round(remaining / speed)) : Json(nullptr);
         }
+        out["stuck"] = p.stuckInfo.is_null() ? Json(nullptr) : p.stuckInfo;
         out["loading"] = p.interruption == "loading";
         out["loadingS"] = Round(p.loadingTotal);
         if (p.activate) {
@@ -714,57 +719,6 @@ namespace
         p.state = "moving";
     }
 
-    bool StuckCheck(Process& p, double now, double window, double minMove)
-    {
-        if (p.history.size() < 2 || now < p.stuckCooldown) {
-            return false;
-        }
-        const auto& front = p.history.front();
-        if (now - front.t < window) {
-            return false;
-        }
-        // Distance over the last `window` seconds.
-        for (const auto& h : p.history) {
-            if (now - h.t <= window) {
-                return Dist2D(h.pos, p.history.back().pos) < minMove;
-            }
-        }
-        return false;
-    }
-
-    void Stuck(Process& p, RE::PlayerCharacter& player, double now)
-    {
-        ++p.stuckCount;
-        if (p.travelled - p.progressMark > 400.0) {
-            p.stuckSinceProgress = 0;
-        }
-        ++p.stuckSinceProgress;
-        p.progressMark = p.travelled;
-        p.stuckCooldown = now + 2.5;
-        Json data = Status(p);
-        data["attempt"] = p.stuckSinceProgress;
-        Emit("navStuck", std::move(data));
-        if (p.stuckSinceProgress > 8 && p.combatSteer) {
-            // Being knocked about in a fight looks like a dead end, but the engine pathfinder takes
-            // over again once it ends; timeoutS still bounds the trip.
-            p.stuckSinceProgress = 0;
-        } else if (p.stuckSinceProgress > 8) {
-            Finish(p, "failed", "Stuck: no progress after 8 recovery attempts");
-            return;
-        }
-        if (p.mode == "ai" && !p.combatSteer) {
-            ++p.replans;
-            StartAiLeg(p, player, now);
-            return;
-        }
-        if (const auto door = DoorAhead(player)) {
-            door->ActivateRef(&player, 0, nullptr, 1, false);
-        }
-        p.state = "recovering";
-        p.recoverStep = (p.stuckSinceProgress - 1) % 4;
-        p.recoverUntil = now + (p.recoverStep == 3 ? 0.9 : 0.7);
-    }
-
     void Plan(Process& p, RE::PlayerCharacter& player, const RE::NiPoint3& target, double now, bool count)
     {
         p.plan = PlanPath(player.GetPosition(), target);
@@ -949,7 +903,6 @@ namespace
                 // A gate, web or door nearby changed state: dead ends and traps recorded so far no longer hold.
                 p.traps.clear();
                 p.deadEnds = 0;
-                p.stuckSinceProgress = 0;
                 p.plan = {};
                 p.replanWanted = true;
                 ++p.staleResets;
@@ -1010,22 +963,6 @@ namespace
             }
             Arrive(p, player);
             return;
-        }
-
-        if (p.state == "recovering") {
-            if (now >= p.recoverUntil) {
-                p.state = "moving";
-                if (p.recoverStep == 3) {
-                    p.replanWanted = true;
-                }
-            } else {
-                static constexpr std::array<const char*, 4> controls{ "Forward", "Strafe Left", "Strafe Right", "Back" };
-                tick.drive.hold.push_back(controls[p.recoverStep]);
-                if (p.recoverStep == 0) {
-                    tick.drive.tap.push_back("Jump");
-                }
-                return;
-            }
         }
 
         const bool stale = p.plan.points.empty() || p.waypoint >= p.plan.points.size() || p.replanWanted ||
@@ -1097,9 +1034,6 @@ namespace
             const bool cornerSoon = p.plan.found && SharpCornerAhead(p, pos, 220.0, 45.0) >= 0.0;
             if ((p.sprint || p.combatSteer) && std::abs(error) < Rad(35.0) && !cornerSoon) {
                 tick.drive.hold.push_back("Sprint");
-            }
-            if (StuckCheck(p, now, 1.2, 30.0)) {
-                Stuck(p, player, now);
             }
         }
     }
@@ -1184,9 +1118,6 @@ namespace
             ++p.replans;
             StartAiLeg(p, player, now);
             return;
-        }
-        if (p.aiResult && now - p.aiDispatched > 3.0 && StuckCheck(p, now, 2.5, 60.0)) {
-            Stuck(p, player, now);
         }
     }
 
@@ -1354,9 +1285,7 @@ namespace
         p.state = "moving";
         p.aiEnded = -1e9;
         p.aiFailures = 0;
-        p.progressPos = player.GetPosition();
-        p.progressAt = now;
-        p.watchdogRounds = 0;
+        p.det.Reset(now);
         if (p.combatSteer) {
             p.combatSteer = false;
             p.sheathe = player.AsActorState()->IsWeaponDrawn();
@@ -1599,8 +1528,6 @@ namespace
         }
     }
 
-    // Backstop for every other check: no real movement for 20 s means recover, and give up
-    // after a few rounds.
     // Last resort for a player wedged in collision (seen at high sgtm against rocks): jumping,
     // strafing and backing up all leave it within a few units, so put it back on its own trail.
     bool Unstick(Process& p, RE::PlayerCharacter& player, double now)
@@ -1625,9 +1552,7 @@ namespace
             p.history.clear();
             p.plan = {};
             p.replanWanted = true;
-            p.stuckSinceProgress = 0;
-            p.progressPos = to;
-            p.progressAt = now;
+            p.det.Reset(now);
             Json data = Status(p);
             data["action"] = "unstick";
             data["from"] = Point(pos);
@@ -1638,31 +1563,99 @@ namespace
         return false;
     }
 
-    void Watchdog(Process& p, RE::PlayerCharacter& player, double now)
+    // Distance still to go along the route, for the no-progress check.
+    double RemainingDistance(Process& p, const RE::NiPoint3& pos)
     {
+        const auto goalPos = GoalPosition(p);
+        double radius = 0.0;
+        const auto target = CurrentTarget(p, radius);
+        if (p.global && p.viaIndex < p.via.size()) {
+            return global::Remaining(GlobalPoints(p), p.viaIndex, V(pos)) + Dist3D(p.via.back(), goalPos);
+        }
+        return p.viaIndex < p.via.size() || p.door ? Dist3D(pos, goalPos) : PathRemaining(p, pos, target);
+    }
+
+    void BlockDoor(RE::FormID id)
+    {
+        BlockedDoors().insert(id);
+        if (const auto ref = LookupRef(id)) {
+            if (const auto linked = ref->extraList.GetTeleportLinkedDoor().get()) {
+                BlockedDoors().insert(linked->GetFormID());
+            }
+        }
+    }
+
+    // One poll of the shared detector for a running trip: starts recoveries, replans around the
+    // trouble spot, or ends the trip as stuck.
+    void DetectStuck(Process& p, RE::PlayerCharacter& player, Tick& tick)
+    {
+        const auto now = tick.now;
         const auto pos = player.GetPosition();
-        if (Dist2D(pos, p.progressPos) > 150.0) {
-            p.progressPos = pos;
-            p.progressAt = now;
-            p.watchdogRounds = 0;
+        if (stuck::Paused() || p.state == "door" || p.state == "waiting" || p.state == "planning") {
+            p.det.Reset(now);
             return;
         }
-        if (now - p.progressAt < 20.0) {
+        if (p.det.Recovering(now)) {
             return;
         }
-        p.progressAt = now;
-        // Pinned: every sample of the last few seconds within a step of where it is now.
-        const bool pinned = !p.history.empty() && now - p.history.front().t > 6.0 &&
-                            std::all_of(p.history.begin(), p.history.end(), [&](const auto& h) { return Dist2D(h.pos, pos) < 40.0; });
-        if (pinned && p.unsticks < 10 && Unstick(p, player, now)) {
+        const auto verdict = p.det.Update(now, pos.x, pos.y, RemainingDistance(p, pos), &stuck::Doors());
+        if (verdict.unstuck) {
+            stuck::EmitUnstuck("nav", verdict, pos);
+        }
+        if (verdict.step == stuck::Step::none) {
             return;
         }
-        if (++p.watchdogRounds > 4) {
-            Finish(p, "failed", "No progress for 20 s through 4 recovery rounds");
+        const auto goalPos = GoalPosition(p);
+        auto report = stuck::Report(verdict, player, &goalPos);
+        ++p.stuckCount;
+        stuck::EmitStuck("nav", verdict, report);
+        Json data = Status(p);
+        data["attempt"] = verdict.failures;
+        data["reason"] = stuck::Name(verdict.reason);
+        Emit("navStuck", std::move(data));
+        if (verdict.step == stuck::Step::abort) {
+            if (p.global && p.unsticks < 10 && verdict.reason == stuck::Reason::stuck && Unstick(p, player, now)) {
+                return;
+            }
+            p.blockers = report["blockers"];
+            p.stuckInfo = report;
+            Finish(p, "failed", std::string("stuck (") + stuck::Name(verdict.reason) + "): " + inspect::BlockerSummary(p.blockers));
             return;
         }
-        p.replanWanted = true;
-        Stuck(p, player, now);
+        if (p.mode == "ai") {
+            player.SetAIDriven(false);
+            if (verdict.step == stuck::Step::replan) {
+                p.recoveringByAi = false;
+                p.aiResult.reset();
+                p.aiEnded = -1e9;
+                ++p.replans;
+            } else {
+                p.recoveringByAi = true;
+            }
+        }
+        if (verdict.step == stuck::Step::replan) {
+            // Aim around the trouble: remember the spot, skip the gate or waypoint whose corridor runs
+            // through it, and refuse a door that keeps being re-entered.
+            p.traps.push_back(pos);
+            if (verdict.door) {
+                BlockDoor(verdict.door);
+                p.door = 0;
+            } else if (p.door) {
+                BlockDoor(p.door);
+                p.door = 0;
+            }
+            if (p.global && p.viaIndex < p.via.size() && p.globalSkips < 30 && verdict.reason != stuck::Reason::doorLoop) {
+                ++p.viaIndex;
+                ++p.globalSkips;
+            } else if (p.waypoint + 1 < p.plan.points.size()) {
+                ++p.waypoint;
+            }
+            p.plan = {};
+            p.deadEnds = 0;
+            p.replanWanted = true;
+            p.det.Rebase(now);
+            Emit("navReplan", { { "id", p.id }, { "why", stuck::Name(verdict.reason) }, { "pos", Point(pos) } });
+        }
     }
 
     void TickNav(Tick& tick)
@@ -1728,9 +1721,7 @@ namespace
         }
         if (!p.interruption.empty()) {
             HandleInterruption(p, *player, tick);
-            if (active && (p.interruptionAction == "flee" || p.interruptionAction == "fight")) {
-                Watchdog(p, *player, now);
-            }
+            p.det.Reset(now);
         } else {
             if (p.sheathe) {
                 p.sheathe = false;
@@ -1748,6 +1739,24 @@ namespace
                     return;
                 }
             }
+            if (p.det.Recovering(now)) {
+                // A step-back or jump recovery replaces normal driving for its short duration.
+                CurrentDrive().owner = "nav";
+                p.state = "recovering";
+                const auto controls = p.det.RecoveryControls(now);
+                tick.drive.hold.insert(tick.drive.hold.end(), controls.hold.begin(), controls.hold.end());
+                if (controls.tapJump) {
+                    tick.drive.tap.push_back("Jump");
+                }
+                return;
+            }
+            if (p.recoveringByAi) {
+                // The engine pathfinder takes over again from wherever the recovery left the player.
+                p.recoveringByAi = false;
+                p.aiResult.reset();
+                p.aiEnded = -1e9;
+                p.state = "moving";
+            }
             if (p.mode == "ai") {
                 TickAi(p, *player, tick);
             } else {
@@ -1756,7 +1765,7 @@ namespace
             }
             if (active) {
                 TrackEpisodes(p, *player, now);
-                Watchdog(p, *player, now);
+                DetectStuck(p, *player, tick);
             }
         }
         if (active && now - p.lastEmit >= 1.0) {
@@ -1976,7 +1985,7 @@ DEVTOOLS_MODULE(NavGoto)
 
     Register("Nav.goto", [](const Json& params) {
         AllowOnly(params, { "goal", "mode", "timeoutS", "run", "sprint", "onCombat", "onDialogue", "onMessageBox", "onMenu", "invulnerable", "via",
-            "route", "routeSpacing", "activate", "loadEpoch" });
+            "route", "routeSpacing", "activate", "stuck", "loadEpoch" });
         RequirePlayable(params);
         std::lock_guard lock(Lock());
         if (active) {
@@ -2068,8 +2077,9 @@ DEVTOOLS_MODULE(NavGoto)
         }
         p.id = nextId++;
         p.started = p.lastEmit = Now();
-        p.progressPos = player.GetPosition();
-        p.progressAt = p.started;
+        BlockedDoors().clear();
+        p.det = stuck::Detector(stuck::ParseConfig(params));
+        p.det.Reset(p.started);
         p.start = p.last = player.GetPosition();
         // Far goals in the same worldspace take the long-range route when a graph exists for it:
         // the loaded navmeshes reach only a few cells, and the engine's own pathfinder reports

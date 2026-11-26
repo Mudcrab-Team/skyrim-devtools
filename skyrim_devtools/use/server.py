@@ -12,7 +12,7 @@ import time
 from mcp.server.fastmcp import FastMCP, Image
 
 from . import capture, combat, perception, saves
-from .manager import GameError, GameManager
+from .manager import STUCK_CODE, GameError, GameManager
 from .timeline import Recorder
 
 INSTRUCTIONS = """\
@@ -25,6 +25,12 @@ Anything the plugin can do that has no curated tool is reachable via rpc_methods
 # Curated wrappers for native methods that older plugin builds lack.
 UNAVAILABLE = "method {} is not available in this plugin build (see rpc_methods); update the plugin or use another tool"
 
+
+# No MCP movement call may keep pushing without getting anywhere for longer than this; the plugin
+# detects it first, this is the backstop for plugin builds without the detector or a stalled one.
+MOVE_HARD_CAP_S = 20.0
+MOVE_CAP_DISPLACEMENT = 40.0
+MOVE_CAP_POLL_S = 2.0
 
 FPS_WARN = 30.0
 P99_WARN_MS = 100.0
@@ -121,8 +127,73 @@ def is_busy_error(error):
     return "did not answer in time" in text or "-32008" in text
 
 
+def stuck_result(error):
+    """The tool result for a movement call the plugin stopped as stuck, or None for other errors."""
+    if getattr(error, "rpc_code", None) != STUCK_CODE:
+        return None
+    return {"stuck": True, "error": "stuck", **(error.rpc_data or {})}
+
+
+class MovementCap:
+    """Backstop for a blocking movement call: samples the player and stops the movement when it has
+    gone MOVE_HARD_CAP_S without covering MOVE_CAP_DISPLACEMENT units."""
+
+    def __init__(self, manager):
+        self.manager = manager
+        self.tripped = None
+        self.task = None
+
+    async def __aenter__(self):
+        if self.manager.has_method("Player.state"):
+            self.task = asyncio.create_task(self.watch())
+        return self
+
+    async def __aexit__(self, *exc):
+        if self.task:
+            self.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self.task
+
+    @staticmethod
+    def position(state):
+        pos = state.get("pos")
+        if isinstance(pos, dict):
+            return pos.get("x", 0.0), pos.get("y", 0.0)
+        if isinstance(pos, list) and len(pos) >= 2:
+            return pos[0], pos[1]
+        return None
+
+    async def watch(self):
+        samples = []
+        while True:
+            await asyncio.sleep(MOVE_CAP_POLL_S)
+            try:
+                state = await self.manager.call("Player.state", timeout=5)
+            except Exception:
+                samples.clear()  # a load or a busy game is not a wall
+                continue
+            here = self.position(state)
+            if here is None:
+                continue
+            now = time.monotonic()
+            samples.append((now, here))
+            while len(samples) > 1 and now - samples[1][0] >= MOVE_HARD_CAP_S:
+                samples.pop(0)
+            if now - samples[0][0] < MOVE_HARD_CAP_S:
+                continue
+            if all(((x - here[0]) ** 2 + (y - here[1]) ** 2) ** 0.5 < MOVE_CAP_DISPLACEMENT for _, (x, y) in samples):
+                self.tripped = {"stuck": True, "error": "stuck", "reason": "hardCap", "pos": list(here),
+                                "capS": MOVE_HARD_CAP_S, "screenshotHint": "Call screenshot to see what blocks the player"}
+                for method in ("Move.stop", "Nav.cancel"):
+                    if self.manager.has_method(method):
+                        with contextlib.suppress(Exception):
+                            await self.manager.call(method, timeout=5)
+                return
+
+
 def build_server(manager, recorder=None):
     recorder = recorder or Recorder()
+    recorder.attach(manager)
 
     @contextlib.asynccontextmanager
     async def lifespan(_server):
@@ -587,15 +658,28 @@ def build_server(manager, recorder=None):
 
     @mcp.tool()
     async def walk(direction: str = "forward", duration_ms: int | None = None, distance: float | None = None,
-                   run: bool | None = None, sprint: bool | None = None) -> str:
+                   run: bool | None = None, sprint: bool | None = None, stuck: dict | bool | None = None) -> str:
         """Move the player by holding a movement key (Move.walk): direction forward/back/left/right, for
         duration_ms (max 60000) OR until `distance` game units are covered (max 20000; 1 unit ~ 1.4 cm,
         a walking stride ~ 70). run/sprint override the run toggle for this walk. Blocks until done and
-        returns the distance actually moved and the displacement; walls stop the player, so compare."""
+        returns the distance actually moved and the displacement. A wall that stops the player ends the walk
+        within about 15 s with {"stuck": true, "error": "stuck", reason, pos, facingDeg, blockers,
+        screenshotHint}: the plugin steps back, jumps and tries again first. `stuck` tunes the detector, e.g.
+        {"distance": 40, "windowS": 3, "maxFailures": 3, "totalS": 20}, or false to turn it off."""
         limit = (duration_ms / 1000 + 15) if duration_ms else 135
-        return dumps(await manager.call("Move.walk", timeout=limit, **{k: v for k, v in dict(
-            direction=direction, durationMs=duration_ms, distance=distance, run=run, sprint=sprint).items()
-            if v is not None}))
+        params = {k: v for k, v in dict(direction=direction, durationMs=duration_ms, distance=distance, run=run,
+                                        sprint=sprint, stuck=stuck).items() if v is not None}
+        async with MovementCap(manager) as cap:
+            try:
+                result = await manager.call("Move.walk", timeout=limit, **params)
+            except GameError as error:
+                found = stuck_result(error)
+                if found is None:
+                    raise
+                return dumps(found)
+        if cap.tripped:
+            return dumps({**cap.tripped, "partial": result})
+        return dumps(result)
 
     @mcp.tool()
     async def turn_to(heading_deg: float | None = None, x: float | None = None, y: float | None = None,
@@ -653,7 +737,7 @@ def build_server(manager, recorder=None):
                        sprint: bool | None = None, on_combat: str | None = None, on_dialogue: str | None = None,
                        on_message_box: str | None = None, on_menu: str | None = None,
                        invulnerable: bool | None = None, via: list | None = None, route: str | None = None,
-                       activate: bool | None = None) -> str:
+                       activate: bool | None = None, stuck: dict | bool | None = None) -> str:
         """Start walking the player to a goal in the background (Nav.goto); returns at once. goal is one of
         {"refID": "0001A2B3"}, {"x":..,"y":..,"z":..}, {"cell": "<editor id>"}, {"place": "Riverwood"} (a
         location name or id from nav_places), {"questTarget": "<quest editor id, id or name>"} (where the compass
@@ -672,14 +756,19 @@ def build_server(manager, recorder=None):
         ignore; on_dialogue close (default; Cancel, then hide, then the last topic for forced greetings), stop or
         wait; on_message_box firstButton (default), stop or wait; on_menu close (default), stop or wait. Loading,
         knockdown and paralysis are waited out; death fails the trip. A trip resumes from wherever the player is
-        once the interruption clears; 20 s without progress triggers recovery and, after 4 rounds, failure.
+        once the interruption clears.
         invulnerable: true turns on god mode for the trip and restores it after. via: [[x,y,z], ...] waypoints; route: "global",
         "local" or a recording name to follow (input mode). Follow with nav_status / nav_wait; stop with nav_cancel. Speed long
-        trips with the console: `sgtm 4` (also speeds everything else; set back with `sgtm 1`)."""
+        trips with the console: `sgtm 4` (also speeds everything else; set back with `sgtm 1`).
+        Stuck handling: the trip steps back, jumps and replans (marking the spot and any door as blocked) when
+        it stops getting anywhere, when the distance to the goal stops shrinking (15 s) or when it keeps
+        re-entering the same door, and then fails with `stuck` (nav_wait shows it under "stuck"). `stuck`
+        tunes it: {"distance": 40, "windowS": 3, "maxFailures": 3, "totalS": 20, "progressWindowS": 15,
+        "progressGain": 100, "doorRepeat": 2, "doorWindowS": 60}, or false to turn it off."""
         return dumps(await native("Nav.goto", goal=goal, mode=mode, timeoutS=timeout_s, run=run, sprint=sprint,
                                   onCombat=on_combat, onDialogue=on_dialogue, onMessageBox=on_message_box,
                                   onMenu=on_menu, invulnerable=invulnerable, via=via, route=route,
-                                  activate=True if activate else None))
+                                  activate=True if activate else None, stuck=stuck))
 
     @mcp.tool()
     async def nav_plan(ref_id: str | None = None, x: float | None = None, y: float | None = None,
@@ -699,7 +788,8 @@ def build_server(manager, recorder=None):
     @mcp.tool()
     async def nav_wait(timeout_s: float = 120, poll_s: float = 2) -> str:
         """Block until the running navigation ends (arrived/failed/cancelled) or timeout_s (max 300)
-        passes; returns the final summary or the current status. Call again to keep waiting. A cell load
+        passes; returns the final summary or the current status; a trip that ended stuck has "error": "stuck" and
+        the details under "stuck" (reason, pos, facingDeg, blockers). Call again to keep waiting. A cell load
         (the game cannot answer for a while) counts as progress: that time is not counted against timeout_s."""
         began = time.monotonic()
         loading_s = 0.0
@@ -715,7 +805,10 @@ def build_server(manager, recorder=None):
                 loading_s += time.monotonic() - tick
                 continue
             if not status.get("active"):
-                return dumps({"done": True, **(status.get("last") or {})})
+                last = status.get("last") or {}
+                if last.get("stuck"):
+                    return dumps({"done": True, "error": "stuck", **last})
+                return dumps({"done": True, **last})
             if status["nav"].get("loading"):
                 loading_s += time.monotonic() - tick + max(poll_s, 0.25)
             if time.monotonic() - began - loading_s >= timeout_s:

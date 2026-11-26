@@ -140,7 +140,7 @@ would press, so animation, collision, stamina and encumbrance all apply.
 
 | Method | Thread | Params | Result and meaning |
 | --- | --- | --- | --- |
-| Move.walk | main (deferred) | direction? (`forward`, `back`, `left`, `right`), durationMs? (≤ 60000) or distance? (≤ 20000), run?, sprint? | Holds the movement control until the time or the distance is used up. `{distance, displacement, durationMs, start, end, stoppedByLimit}`; distance is the path actually walked, so a wall shows as a short distance. |
+| Move.walk | main (deferred) | direction? (`forward`, `back`, `left`, `right`), durationMs? (≤ 60000) or distance? (≤ 20000), run?, sprint?, stuck? | Holds the movement control until the time or the distance is used up. `{distance, displacement, durationMs, start, end, stoppedByLimit}`; distance is the path actually walked, so a wall shows as a short distance. |
 | Move.turnTo | main (deferred) | headingDeg or x, y or refID; smooth? (true), degPerSec? (180) | Turns the player; replies when done with `{headingDeg, pitchDeg}` |
 | Move.jump / Move.stop | main | | Taps Jump / stops a running walk or turn |
 | Move.sneak | main (deferred) | on | Toggles sneak until `IsSneaking` matches; `{sneaking}` |
@@ -148,7 +148,7 @@ would press, so animation, collision, stamina and encumbrance all apply.
 | Camera.set | main | mode? (`first`, `third`), yawDeg?, pitchDeg?, zoom? (0-1, third person), fov? (5-150) | Applies the given fields in that order; read Camera.state a frame later for the result |
 | Camera.lookAt | main | refID or x, y, z | Turns the player's view at a reference (actors at chest height, other references at the centre of their world bound) or a point |
 | Nav.plan | main | refID or x, y, z; from?; route? (`local`, `global`) | Path over the loaded navmeshes, `{found, complete, goalOnMesh, points, triangles, meshes, expanded, ms}`; an incomplete path adds `blockers` (see Nav.status). With `route: "global"` it is the local path to the first gate plus `global {available, world, file, found, cost, length, expanded, startLinks, goalLinks, ms, note, points}` from the worldspace graph (see below). For debugging Nav.goto. |
-| Nav.goto | main | goal, mode? (`input`), timeoutS? (300), run? (true), sprint?, onCombat? (`flee`, `fight`, `stop`, `ignore`), onDialogue? (`close`, `stop`, `wait`), onMessageBox? (`firstButton`, `stop`, `wait`), onMenu? (`close`, `stop`, `wait`), invulnerable? (false), via? ([[x,y,z]...]), route? (`global`, `local` or a recording name), routeSpacing? (600), activate? (false) | Starts a background navigation and replies at once with `{id, mode, goal, goalPos, straightDistance, route, globalLength?, globalNote?}`. Goals: `{refID}`, `{x, y, z, worldspace?}`, `{cell}` (editor id), `{place}` (a location's displayed name or form id, see Nav.places) `{questTarget: <quest>}` (the reference Quest.targets reports for the quest; empty string takes any running quest) or `{near: refID, radius}`. `activate` walks up to activation reach (radius 90 unless given) and activates the goal reference on arrival. Loading screens do not count against `timeoutS`; Nav.status reports `loading` and `loadingS`. A door just arrived through is not taken back (Nav.status `lastDoor`), the way out of an interior is used when no door leads to the goal, and after a door into an exterior a far goal takes the global route. When a door, gate or web within 2500 units changes open/locked/disabled state, dead ends and traps are forgotten and the route is planned again (event `navReplan`, Nav.status `openStateResets`). Fails with `-32009` while one runs. |
+| Nav.goto | main | goal, mode? (`input`), timeoutS? (300), run? (true), sprint?, onCombat? (`flee`, `fight`, `stop`, `ignore`), onDialogue? (`close`, `stop`, `wait`), onMessageBox? (`firstButton`, `stop`, `wait`), onMenu? (`close`, `stop`, `wait`), invulnerable? (false), via? ([[x,y,z]...]), route? (`global`, `local` or a recording name), routeSpacing? (600), activate? (false), stuck? | Starts a background navigation and replies at once with `{id, mode, goal, goalPos, straightDistance, route, globalLength?, globalNote?}`. Goals: `{refID}`, `{x, y, z, worldspace?}`, `{cell}` (editor id), `{place}` (a location's displayed name or form id, see Nav.places) `{questTarget: <quest>}` (the reference Quest.targets reports for the quest; empty string takes any running quest) or `{near: refID, radius}`. `activate` walks up to activation reach (radius 90 unless given) and activates the goal reference on arrival. Loading screens do not count against `timeoutS`; Nav.status reports `loading` and `loadingS`. A door just arrived through is not taken back (Nav.status `lastDoor`), the way out of an interior is used when no door leads to the goal, and after a door into an exterior a far goal takes the global route. When a door, gate or web within 2500 units changes open/locked/disabled state, dead ends and traps are forgotten and the route is planned again (event `navReplan`, Nav.status `openStateResets`). Fails with `-32009` while one runs. |
 | Nav.status | main | | `{active: true, nav:{id, state, mode, goal, elapsedS, distanceRemaining, etaS, waypoint, stuckCount, replans, travelled, combat, interruption, interruptions:{count, recent}, stalls:{count, totalS, offPathCount, offPathTotalS, offPathNow, recent}, ...}}`, or `{active: false, last}` whose `state` is the outcome (`arrived`, `failed`, `cancelled`) with a `reason`. A dead end also sets `blockers {stop, gap:{horizontal, vertical}, refs:[{refID, name, model, type, state, distance, fromStop, offLine, ...}], likely}`: doors, gates, webs, levers and other activators near the stop or between it and the goal, and a one-line guess at the cause (a heuristic; confirm with World.inspect). |
 | Nav.cancel | main | | Stops the navigation and releases controls |
 | Nav.places | main | contains? (substring, case-sensitive), limit? (50) | Locations with a world map marker: `{count, places:[{name, location, marker, pos, world, distance}]}`. Names are in the game's language; `{place}` goals accept the name or the location id. |
@@ -210,10 +210,10 @@ Cancel, then hiding); `firstButton` (selects option 0, then Accept, then hides);
 (keep to the route by input at a sprint; engine legs stop in combat), `fight` (draw, close in and
 attack the nearest enemy, then carry on) or `ignore`; `stop` fails with the reason. When the
 interruption clears the trip resumes from wherever the player is, replanning or dispatching a
-new engine leg. A watchdog recovers after 20 s without 150 units of movement and fails after 4
-rounds. A round in which the player moved under 40 units at all (wedged in collision, which no
-key press undoes) instead puts it back on its own trail at least 300 units behind, up to 10
-times a trip; each is a `navStuck` with `action: "unstick"` and counted in `unsticks`. Caught
+new engine leg. The stuck detector (below) covers
+every way of getting nowhere; as a last resort on a global route, a trip stuck by displacement puts the
+player back on its own trail at least 300 units behind, up to 10 times a trip; each is a `navStuck` with
+`action: "unstick"` and counted in `unsticks`. Caught
 again at the same spot on a global route, it also skips the current gate. `invulnerable: true` turns god mode on for the trip and restores it afterwards.
 
 **Clearance and levels.** Local paths keep clear of walls: a navmesh portal end that touches a wall
@@ -230,6 +230,29 @@ containing the point in plan view whose plane is nearest the actor's height (so 
 and standing under it is the ground), waypoints and goals count as reached only on the same level (120 and
 150 units of height), and a player more than 150 units off the height of the segment it is following
 replans. `tests/live/nav_clearance.py` measures stall time per pass for doors, a bridge, stairs and a tunnel.
+
+**Stuck detector.** One detector (native/stuck.h) serves `Move.walk` and `Nav.goto` (both modes);
+it is skipped during loading screens, menus, dialogue and interruptions. It reports four reasons:
+`stuck` (while input is held, displacement under `distance` units over `windowS`), `noProgress` (the
+best distance to the goal improved by less than `progressGain` in `progressWindowS`, even though the
+player moves), `oscillation` (goal-less `Move.walk`: net displacement under `oscRatio` of the path
+walked over `oscWindowS`, or the same 100-unit cell entered 4 times) and `doorLoop` (arrival through the
+same load door `doorRepeat` times within `doorWindowS`). Escalation for `stuck`: step back and strafe,
+jump, then replan; after more than `maxFailures` recoveries, or `totalS` in one episode, the command
+stops. The other reasons replan once and stop on the next detection. A replan in `Nav.goto` records the
+spot, skips the gate or waypoint whose corridor runs through it and refuses a looped-through door (and
+its partner) for the rest of the trip; the local navmesh planner has no per-edge avoidance. `Move.walk`
+has no route, so its replan step is a longer step back. A walk ends with error `-32011` message
+`stuck` and `data` `{reason, failures, stuckS, pos, facingDeg, blockers, screenshotHint, direction,
+distance, displacement, durationMs, start}`; a trip ends `failed` with `reason` `stuck (<why>): ...`,
+and Nav.status `stuck` holds the same report (null otherwise). Options go in a `stuck` member of the
+request: `false` turns detection off, or an object with `distance` (40), `windowS` (3), `maxFailures`
+(3), `totalS` (20), `progressWindowS` (15), `progressGain` (100), `oscWindowS` (10), `oscRatio` (0.2),
+`oscMinPath` (400), `doorRepeat` (2), `doorWindowS` (60). Events: `moveStuck {source: walk|nav, reason,
+step, failures, stuckS, pos, facingDeg, blockers, door?}` at every detection, and `moveUnstuck {source,
+failures, stuckS, pos}` when the player gets going again (250 units clear of a `stuck` spot, or a full
+window with no further detection for the other reasons). `skyrim-use` writes both into the timeline JSONL
+as `{"t":"event","type":...}`.
 
 **Stalls.** A stall is speed under 40 units/s over 0.5 s (ending above 80); off-path, in input
 mode, is more than 120 units from the planned segment (ending under 60). Each episode gets a
@@ -274,6 +297,7 @@ call into the engine. The chosen target is remembered between calls.
 | -32008 | Timed out waiting for the game; `data` names the method, thread and timeout |
 | -32009 | Too many calls in flight |
 | -32010 | Not found (unknown menu or save) |
+| -32011 | Stuck: `Move.walk` stopped by the stuck detector; `data` has reason, pos, facingDeg, blockers |
 
 ## Adding a method
 
