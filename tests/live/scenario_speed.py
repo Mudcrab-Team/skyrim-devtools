@@ -25,7 +25,7 @@ SWEEP = (100, 150, 200, 250, 300, 400)
 # keep clear of dens, ruins and forts: the speed comparison needs a walk that animals and bandits do not end
 AVOID = ("Barrow", "Cave", "Mine", "Fort", "Ruin", "Shelf", "Tower", "Keep", "Lair", "Camp", "Hold", "Temple", "Nest", "Den",
          "Grove", "Tomb", "Crypt", "Sanctum", "Watchtower", "Pass", "Shrine")
-GOAL_MIN, GOAL_MAX, GOAL_TARGET = 4000.0, 14000.0, 8000.0
+GOAL_MIN, GOAL_MAX, GOAL_TARGET = 4000.0, 20500.0, 8000.0
 NORMAL_TIMEOUT_S, FAST_TIMEOUT_S = 240, 150
 
 
@@ -47,7 +47,7 @@ def make_tool(mcp):
 
 
 def pick_goal(places, home_world):
-    """A same-worldspace named place 4000-14000 units away, closest to 8000, without a dangerous-sounding name."""
+    """A same-worldspace named place 4000-20500 units away, closest to 8000, without a dangerous-sounding name."""
     ranked = []
     for place in places:
         distance = place.get("distance")
@@ -115,12 +115,14 @@ async def case_nav(manager, tool, reload, details):
     runs = {}
     home = await tool("nav_places", contains="Riverwood", limit=5)
     home_world = next((p.get("world") for p in home.get("places", []) if p.get("name") == "Riverwood"), None)
-    places = (await tool("nav_places", limit=200)).get("places", [])
+    places = (await tool("nav_places", limit=2000)).get("places", [])
     goal_place = pick_goal(places, home_world)
     details["navGoal"] = goal_place
     if goal_place is None:
-        details["nav"] = {"pass": False, "error": "no safe named place 4000-14000 units away in the player's worldspace",
-                          "candidates": [(p.get("name"), p.get("world"), p.get("distance")) for p in places][:15]}
+        details["nav"] = {"pass": False, "error": "no safe named place 4000-20500 units away in the player's worldspace",
+                          "count": len(places), "homeWorld": home_world,
+                          "candidates": sorted(((p.get("name"), p.get("world"), p.get("distance")) for p in places if p.get("world") == home_world),
+                                               key=lambda c: c[2] or 1e12)[:12]}
         return
     for fast in (None, 200, 300, 400):
         await reload()
@@ -194,7 +196,8 @@ async def run_cases(manager, tool, cases, details):
         await reload()
         found = await tool("quest_find", text="Golden Claw")
         listed = found.get("quests") if isinstance(found, dict) else []
-        chosen = next((q for q in listed if q.get("name") == "The Golden Claw"), (listed or [{}])[0])
+        # MS13FIN is the epilogue quest of the same name and has no stage 10..40
+        chosen = next((q for q in listed if q.get("editorID") == "MS13"), (listed or [{}])[0])
         quest_id = chosen.get("editorID")
         details["clawFound"] = listed
         tried = []

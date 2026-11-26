@@ -88,6 +88,12 @@ finishes later, its result is dropped. Server notifications have no `id`:
 | Window.info | ui | none | Game window, client and monitor size, style, DPI awareness and swap chain `{width, height, windowed}`. |
 | Perf.reset | any | | Clears the frame-time ring and the hitch count |
 | Perf.configure | any | hitchMs? (0 or null is off, the default), ringSize? (64-1000000 frames, default 20000) | Returns the current settings. Changing `ringSize` clears the ring. |
+| Profile.start | any | threads? (`main` default, `frame`, `all`, or comma-separated ids / name fragments), hz? (10-4000, default 1000), durationS? (max 600, default 30), suspendBudgetPct? (0-100, default 2.5, 0 = none), otherHz? (rate for threads other than the main one, default 250) | Starts the sampling profiler (see [profiling](profiling.md)); `busy` while one runs. Returns `Profile.status`. |
+| Profile.stop | any | encoding | Stops and serializes the profile: `{bytes, encoding, encodedBytes, chunks, waitMs, serializeMs, encodeMs, summary}`. `encoding` is `json` (default) or `mszip`: Windows Compression API MSZIP, base64 encoded, several times smaller over a slow link; `profiling.mszip_decode` reads it. Calling it again after a stop re-encodes the same profile. Read it with `Profile.read`. |
+| Profile.read | any | chunk | `{chunk, encoding, data, last}`: 4 MiB slices of the encoded profile JSON (raw addresses, unwind starts, Address Library IDs, modules); concatenate `data` in order. |
+| Profile.status | any | | `{profiling, watching, watchHz, hitchMs, mainThread, frameThread, hitchesCaptured}` |
+| Profile.watch | any | enabled?, hz? (default 250), hitchMs? (default 100) | Low-rate main-thread sampling kept in a ring so every slow frame keeps its stacks. |
+| Profile.hitches | any | limit? (default 10), sinceFrame?, clear? | `{hitches[], frames[], modules[], status}`; each hitch `{frame, ms, startMs, stacks[], samples[[ms, stack, flags]], waitChain}`; flags 1 = the thread was not running. |
 | Window.place | ui | mode | `offscreen`, `hide`, `minimize` or `restore` |
 
 Mutations that take `loadEpoch` fail with `-32005` and the current epoch when the world was

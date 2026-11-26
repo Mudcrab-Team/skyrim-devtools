@@ -23,6 +23,7 @@ skyrim-devtools-trajectory = "skyrim_devtools.trajectory:main"
 skyrim-devtools-navgraph = "skyrim_devtools.navgraph:main"
 skyrim-devtools-livetest = "skyrim_devtools.livetest:main"
 skyrim-devtools-scenario = "skyrim_devtools.scenario_cli:main"
+skyrim-devtools-profile = "skyrim_devtools.profiling:main"
 
 [tool.setuptools.packages.find]
 include = ["skyrim_devtools*"]
