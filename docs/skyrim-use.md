@@ -96,7 +96,7 @@ read `failures` and `warnings` before trusting the setup.
   `run <file> --config devtools.json [--save Fixture] [--headless] [--keep-running]` starts the game, loads the save,
   applies the scenario and prints the report as JSON.
 
-**Speed.** `game_speed {walk, timescale, reset}` sets the player's walk speed (percent of normal, 25-400) and the clock
+**Speed.** `game_speed {walk, timescale, reset}` sets the player's walk speed (percent of normal, 25-400; the walk is measured to scale up to about 3x, so 400 equals 300; use `timescale` or `fast_travel` for more) and the clock
 scale; `nav_goto {fast: true}` raises the walk speed to 300% only while the walk is undisturbed and restores it on arrival,
 failure, cancel, combat, dialogue, doors and loading (`fast: 200` picks the percent, 100-400). `fast_travel {to}` goes to a
 discovered map marker (name or id; `force` for an undiscovered one) and advances the clock by the estimated travel time; the

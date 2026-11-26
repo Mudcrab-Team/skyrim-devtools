@@ -237,3 +237,71 @@ class LiveScriptTests(unittest.TestCase):
         self.assertIn("speed", out["details"])
         self.assertIn("lovely", out["details"])
         self.assertIn("travel", out["details"])
+
+
+class LiveHelperTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import sys
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent / "live"))
+        import scenario_speed
+
+        cls.mod = scenario_speed
+
+    def test_pick_goal_takes_a_safe_place_near_the_target_distance(self):
+        places = [
+            {"name": "Bleak Falls Barrow", "world": "Tamriel", "distance": 8000},
+            {"name": "Rorikstead", "world": "Tamriel", "distance": 12000},
+            {"name": "Whiterun Stables", "world": "Tamriel", "distance": 7000},
+            {"name": "Far Farm", "world": "Tamriel", "distance": 30000},
+            {"name": "Interior", "world": None, "distance": 8000},
+        ]
+        self.assertEqual(self.mod.pick_goal(places, "Tamriel")["name"], "Whiterun Stables")
+        self.assertIsNone(self.mod.pick_goal(places[:1] + places[3:], "Tamriel"))
+
+    def test_nav_verdict_is_evaluable_when_normal_times_out(self):
+        def run(state, seconds, reason=None):
+            return {"seconds": seconds, "outcome": {"state": state, "reason": reason}}
+
+        timed_out = {"100": run("failed", 240, "Timed out"), "200": run("arrived", 90), "300": run("arrived", 40), "400": run("arrived", 45)}
+        verdict = self.mod.nav_verdict(timed_out)
+        self.assertTrue(verdict["pass"])
+        self.assertTrue(verdict["normalTimedOut"])
+        slow = {**timed_out, "100": run("arrived", 50)}
+        self.assertFalse(self.mod.nav_verdict(slow)["pass"])
+        stuck = {**timed_out, "100": run("failed", 30, "stuck")}
+        self.assertFalse(self.mod.nav_verdict(stuck)["pass"])
+
+    def test_speed_case_reports_ratios_with_a_fake_manager(self):
+        import contextlib
+        import io  # noqa: F401
+
+        class Manager:
+            def __init__(self):
+                self.percent = 100
+
+            async def call(self, method, timeout=None, **params):
+                return {"distance": 1000.0 * min(self.percent, 300) / 100}
+
+        manager = Manager()
+
+        async def tool(name, /, **args):
+            if "walk" in args:
+                manager.percent = args["walk"]
+            return {"speedMult": manager.percent}
+
+        async def scenario():
+            details = {}
+            real_sleep = asyncio.sleep
+            self.mod.asyncio.sleep = lambda *_: real_sleep(0)
+            try:
+                await self.mod.case_speed(manager, tool, details)
+            finally:
+                self.mod.asyncio.sleep = real_sleep
+            return details["speed"]
+
+        out = run(scenario())
+        self.assertEqual(out["ratioToNormal"][300], 3.0)
+        self.assertEqual(out["ratioToNormal"][400], 3.0)
+        self.assertTrue(out["pass"])

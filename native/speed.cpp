@@ -40,6 +40,10 @@ namespace
         if (change != 0.0F) {
             values->ModActorValue(RE::ACTOR_VALUE_MODIFIER::kTemporary, kSpeed, change);
             tempDelta = wanted;
+            // The movement code reads SpeedMult through a cached value that only the carry-weight
+            // recomputation refreshes; a net-zero nudge triggers it without changing the capacity.
+            values->ModActorValue(RE::ACTOR_VALUE_MODIFIER::kTemporary, RE::ActorValue::kCarryWeight, 1.0F);
+            values->ModActorValue(RE::ACTOR_VALUE_MODIFIER::kTemporary, RE::ActorValue::kCarryWeight, -1.0F);
         }
         applied = value;
     }
@@ -65,6 +69,25 @@ namespace
         if (std::abs(applied - want) > 0.01F || !overridden) {
             Write(want);
         }
+    }
+
+    // The date globals are only recomputed by the engine at midnight, so a skip across midnights moves
+    // day, month and year by hand to keep Game.time's calendar fields in step with daysPassed.
+    void AdvanceDate(RE::Calendar& calendar, int daysToAdd)
+    {
+        auto day = static_cast<int>(calendar.gameDay->value) + daysToAdd;
+        auto month = static_cast<int>(calendar.gameMonth->value);
+        auto year = static_cast<int>(calendar.gameYear->value);
+        while (month >= 0 && month < 12 && day > RE::Calendar::DAYS_IN_MONTH[month]) {
+            day -= RE::Calendar::DAYS_IN_MONTH[month];
+            if (++month == 12) {
+                month = 0;
+                ++year;
+            }
+        }
+        calendar.gameDay->value = static_cast<float>(day);
+        calendar.gameMonth->value = static_cast<float>(month);
+        calendar.gameYear->value = static_cast<float>(year);
     }
 
     Json Describe()
@@ -94,14 +117,30 @@ namespace devtools::speed
         }
         const auto beforeHour = calendar->gameHour->value;
         const auto beforeDays = calendar->gameDaysPassed->value;
-        // Both globals move together so day rollover and the day counter stay consistent; the engine
-        // then derives the date from them on its next update.
-        const double total = static_cast<double>(beforeDays) * 24.0 + beforeHour + hours;
-        const double days = std::floor(total / 24.0);
-        calendar->gameDaysPassed->value = static_cast<float>(days + (total - days * 24.0) / 24.0);
-        calendar->gameHour->value = static_cast<float>(total - days * 24.0);
+        const auto beforeRaw = calendar->rawDaysPassed;
+        const auto beforeMidnights = calendar->midnightsPassed;
+        // The skip is added to each counter instead of recomputed from one of them, so every counter keeps its
+        // own convention. The engine rebuilds the global from its counters on every update, so they move too;
+        // otherwise the skip is undone on the next frame (the global fell back by the skipped days).
+        const double added = hours / 24.0;
+        const double total = static_cast<double>(beforeDays) + added;
+        const double hourNow = std::fmod(static_cast<double>(beforeHour) + hours, 24.0);
+        const auto crossed = static_cast<std::uint32_t>(std::floor((static_cast<double>(beforeHour) + hours) / 24.0));
+        // rawDaysPassed is either the running day count (it tracks the global) or only the fraction of the
+        // current day; whichever it is, it keeps the same convention after the skip.
+        const bool rawIsTotal = std::abs(static_cast<double>(beforeRaw) - static_cast<double>(beforeDays)) < 0.01;
+        calendar->midnightsPassed = beforeMidnights + crossed;
+        calendar->rawDaysPassed = rawIsTotal ? static_cast<float>(static_cast<double>(beforeRaw) + added) : static_cast<float>(hourNow / 24.0);
+        calendar->gameDaysPassed->value = static_cast<float>(total);
+        calendar->gameHour->value = static_cast<float>(hourNow);
+        if (calendar->gameDay && calendar->gameMonth && calendar->gameYear) {
+            AdvanceDate(*calendar, static_cast<int>(crossed));
+        }
         Json out{ { "waitedHours", hours }, { "hourBefore", Round(beforeHour, 2) }, { "hour", Round(calendar->gameHour->value, 2) },
-            { "daysPassedBefore", Round(beforeDays, 3) }, { "daysPassed", Round(calendar->gameDaysPassed->value, 3) } };
+            { "daysPassedBefore", Round(beforeDays, 3) }, { "daysPassed", Round(calendar->gameDaysPassed->value, 3) },
+            { "rawDaysPassed", Round(calendar->rawDaysPassed, 3) }, { "rawIsTotal", rawIsTotal },
+            { "midnightsPassed", calendar->midnightsPassed }, { "day", static_cast<int>(calendar->gameDay->value) },
+            { "month", static_cast<int>(calendar->gameMonth->value) } };
         events::Emit("timeSkipped", out);
         return out;
     }
