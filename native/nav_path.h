@@ -25,6 +25,9 @@ namespace devtools::nav
 
     Plan PlanPath(const RE::NiPoint3& from, const RE::NiPoint3& to);
 
+    // Whether p lies inside a loaded navmesh triangle (plan view, within a step of its height).
+    bool OnNavmesh(const RE::NiPoint3& p);
+
     // Changes whenever the set of loaded navmeshes changes, so callers know to plan again.
     std::uint64_t GraphGeneration();
 

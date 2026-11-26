@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <limits>
 #include <queue>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -35,6 +36,29 @@ namespace devtools::nav::graph
         std::vector<std::array<V3, 3>> verts;
         std::vector<std::array<int, 3>> nbr;
         std::vector<double> costScale;  // 1 normally; below 1 for preferred triangles
+        // Vertices that touch a boundary edge (a wall or the edge of the loaded meshes), by 1-unit grid
+        // key; empty until MarkWalls runs, in which case every vertex counts as a wall.
+        std::unordered_set<std::int64_t> walls;
+        bool wallsKnown = false;
+
+        static std::int64_t Key(V3 p)
+        {
+            return (static_cast<std::int64_t>(std::llround(p.x)) << 32) ^ (static_cast<std::int64_t>(std::llround(p.y)) & 0xFFFFFFFFLL);
+        }
+        void MarkWalls()
+        {
+            walls.clear();
+            for (std::size_t t = 0; t < verts.size(); ++t) {
+                for (int i = 0; i < 3; ++i) {
+                    if (nbr[t][i] < 0) {
+                        walls.insert(Key(verts[t][i]));
+                        walls.insert(Key(verts[t][(i + 1) % 3]));
+                    }
+                }
+            }
+            wallsKnown = true;
+        }
+        [[nodiscard]] bool IsWall(V3 p) const { return !wallsKnown || walls.contains(Key(p)); }
 
         [[nodiscard]] std::size_t Size() const { return verts.size(); }
         [[nodiscard]] V3 Center(int t) const
@@ -62,8 +86,24 @@ namespace devtools::nav::graph
         return !(neg && pos);
     }
 
-    // The triangle under p: one containing p in plan view whose plane height is nearest, else
-    // the triangle with the nearest centre within maxDist. -1 when nothing is close.
+    // Height of triangle t's plane at p's x, y (the centroid height for a degenerate triangle).
+    inline double PlaneZ(const std::array<V3, 3>& v, V3 p)
+    {
+        const auto e1 = v[1] - v[0];
+        const auto e2 = v[2] - v[0];
+        const double det = e1.x * e2.y - e1.y * e2.x;
+        if (std::abs(det) < 1e-9) {
+            return (v[0].z + v[1].z + v[2].z) / 3.0;
+        }
+        const double dx = p.x - v[0].x, dy = p.y - v[0].y;
+        const double a = (dx * e2.y - dy * e2.x) / det;
+        const double b = (e1.x * dy - e1.y * dx) / det;
+        return v[0].z + a * e1.z + b * e2.z;
+    }
+
+    // The triangle under p: among those containing p in plan view, the one whose plane is nearest
+    // p's height (a bridge deck or the ground below it, whichever the actor is on), else the
+    // triangle with the nearest centre in 3D within maxDist. -1 when nothing is close.
     inline int Locate(const Graph& g, V3 p, double maxDist, double maxStep = 160.0)
     {
         int best = -1;
@@ -73,7 +113,7 @@ namespace devtools::nav::graph
         for (int t = 0; t < static_cast<int>(g.Size()); ++t) {
             const auto& v = g.verts[t];
             if (InTriangle2D(v, p)) {
-                const auto dz = std::abs((v[0].z + v[1].z + v[2].z) / 3.0 - p.z);
+                const auto dz = std::abs(PlaneZ(v, p) - p.z);
                 if (dz < bestDz) {
                     bestDz = dz;
                     best = t;
@@ -194,8 +234,10 @@ namespace devtools::nav::graph
     }
 
     // The shared edge from triangle a to its neighbour b as (left, right) seen when walking
-    // from a into b, each end pulled inwards by up to `shrink` units to keep clear of walls.
-    inline bool Portal(const Graph& g, int a, int b, double shrink, V3& left, V3& right)
+    // from a into b. Ends that touch a wall are pulled inwards by `shrink` (the actor's radius plus a
+    // margin) so the path keeps clear of corners; when that would leave nothing (a passage narrower
+    // than twice the clearance) both ends become the midpoint. `width` reports the open width.
+    inline bool Portal(const Graph& g, int a, int b, double shrink, V3& left, V3& right, double* width = nullptr, bool* bothWalls = nullptr)
     {
         for (int i = 0; i < 3; ++i) {
             if (g.nbr[a][i] != b) {
@@ -212,11 +254,23 @@ namespace devtools::nav::graph
                 right = p;
             }
             const auto span = Len2(right - left);
+            if (width) {
+                *width = span;
+            }
             if (span > 1e-6) {
-                const auto pull = std::min(shrink, span * 0.45) / span;
+                const double pullLeft = g.IsWall(left) ? shrink : 0.0;
+                const double pullRight = g.IsWall(right) ? shrink : 0.0;
+                if (bothWalls) {
+                    *bothWalls = pullLeft > 0.0 && pullRight > 0.0;
+                }
                 const auto along = right - left;
-                left = left + along * pull;
-                right = right - along * pull;
+                if (pullLeft + pullRight > span * 0.9) {
+                    const auto mid = left + along * 0.5;
+                    left = right = mid;
+                } else {
+                    left = left + along * (pullLeft / span);
+                    right = right - along * (pullRight / span);
+                }
             }
             return true;
         }
@@ -225,13 +279,58 @@ namespace devtools::nav::graph
 
     // Simple stupid funnel: the shortest polyline from start to end through the corridor of
     // triangles, in plan view; heights come from the portal points it bends at.
-    inline std::vector<V3> Funnel(const Graph& g, const std::vector<int>& tris, V3 start, V3 end, double shrink = 30.0)
+    // Passages narrower than `narrow` get a lead-in point `lead` units before and after their middle,
+    // on the line through it perpendicular to the opening, so they are entered straight.
+    inline std::vector<V3> Funnel(const Graph& g, const std::vector<int>& tris, V3 start, V3 end, double shrink = 30.0,
+                                  double narrow = 0.0, double lead = 80.0)
     {
         std::vector<std::pair<V3, V3>> portals;
         portals.push_back({ start, start });
         for (std::size_t k = 0; k + 1 < tris.size(); ++k) {
             V3 l, r;
-            if (Portal(g, tris[k], tris[k + 1], shrink, l, r)) {
+            double width = 0.0;
+            bool walled = false;
+            if (Portal(g, tris[k], tris[k + 1], shrink, l, r, &width, &walled)) {
+                if (narrow > 0.0 && width < narrow && walled) {
+                    // Perpendicular to the opening, pointing the way the corridor goes.
+                    const V3 mid = (l + r) * 0.5;
+                    const auto ahead = g.Center(tris[k + 1]) - g.Center(tris[k]);
+                    V3 n{ 0, 0, 0 };
+                    for (int i = 0; i < 3; ++i) {
+                        if (g.nbr[tris[k]][i] == tris[k + 1]) {
+                            const auto edge = g.verts[tris[k]][(i + 1) % 3] - g.verts[tris[k]][i];
+                            n = V3{ -edge.y, edge.x, 0 };
+                        }
+                    }
+                    const auto len = Len2(n);
+                    if (len > 1e-6) {
+                        n = n * (1.0 / len);
+                        if (n.x * ahead.x + n.y * ahead.y < 0) {
+                            n = n * -1.0;
+                        }
+                        const V3 before = mid - n * lead;
+                        const V3 after = mid + n * lead;
+                        // On the corridor itself, a triangle or two either side of the opening.
+                        const auto inside = [&](std::size_t from, std::size_t to, V3 p) {
+                            for (auto j = from; j <= to && j < tris.size(); ++j) {
+                                if (InTriangle2D(g.verts[tris[j]], p)) {
+                                    return true;
+                                }
+                            }
+                            return false;
+                        };
+                        const bool beforeOk = inside(k >= 2 ? k - 2 : 0, k, before);
+                        const bool afterOk = inside(k + 1, k + 3, after);
+                        if (beforeOk) {
+                            portals.push_back({ before, before });
+                        }
+                        portals.push_back({ mid, mid });
+                        if (afterOk) {
+                            portals.push_back({ after, after });
+                        }
+                        continue;
+                    }
+                }
                 portals.push_back({ l, r });
             }
         }
