@@ -145,6 +145,13 @@ class LiveTest(unittest.TestCase):
         self.assertEqual(manager.stops, 1)
         self.assertEqual(livetest.split_command("a.py x", "/c"), ("a.py", ["x", "--config", "/c"]))
 
+    def test_module_scripts_stay_session_cases_when_a_config_is_given(self):
+        # the appended --config must not count as the script's own argument
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / "m.py").write_text("async def run(ctx):\n    return {}\n")
+            self.assertTrue(livetest.uses_session({"script": "m.py"}, root, "/c"))
+            self.assertFalse(livetest.uses_session({"script": "m.py --x 1"}, root, "/c"))
+
     def test_standalone_scripts_do_not_start_the_shared_game_between_perf_readings(self):
         requests = [self.req("s1", script="tests/live/standalone.py"), self.req("s2", script="tests/live/standalone.py")]
         manager, batch = self.run_batch(requests, perf_interval=3600)

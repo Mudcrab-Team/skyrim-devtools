@@ -189,11 +189,13 @@ def split_command(script, config_path):
 
 async def run_script(ctx, script, root, timeout):
     name, args = split_command(script, ctx.config_path)
+    own_args = split_command(script, None)[1]
     path = (Path(root) / name).resolve()
     if not path.is_file():
         raise FileNotFoundError(f"script {name} not found under {root}")
     module = None
-    if not args and "async def run(" in path.read_text(encoding="utf-8", errors="replace"):
+    # the appended --config is not the script's own argument, or no module script would ever be imported
+    if not own_args and "async def run(" in path.read_text(encoding="utf-8", errors="replace"):
         spec = importlib.util.spec_from_file_location(f"livetest_{path.stem}", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -239,7 +241,7 @@ def uses_session(case, root, config_path=None):
     or a manual case (the harness takes its screenshot)."""
     if "script" not in case:
         return True
-    name, args = split_command(case["script"], config_path)
+    name, args = split_command(case["script"], None)
     path = Path(root) / name
     if args or not path.is_file():
         return False
