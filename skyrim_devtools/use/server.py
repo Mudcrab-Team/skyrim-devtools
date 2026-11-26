@@ -11,7 +11,9 @@ import time
 
 from mcp.server.fastmcp import FastMCP, Image
 
+from . import capture
 from .manager import GameError, GameManager
+from .timeline import Recorder
 
 INSTRUCTIONS = """\
 Playtest Skyrim SE (offline test profile) through an injected plugin. Call game_start first (headless by
@@ -73,17 +75,22 @@ def image_parts(result):
         return None
 
 
-def build_server(manager):
+def build_server(manager, recorder=None):
+    recorder = recorder or Recorder()
+
     @contextlib.asynccontextmanager
     async def lifespan(_server):
+        recorder.start_sampler(manager)
         try:
             yield
         finally:
+            await recorder.stop_sampler()
             # a game left running would hold the single test PC after the client is gone
             with contextlib.suppress(Exception):
                 await manager.stop()
 
     mcp = FastMCP("skyrim-use", instructions=INSTRUCTIONS, lifespan=lifespan)
+    recorder.instrument(mcp)
 
     async def native(method, **params):
         """Call a method that may be missing from the running plugin build."""
@@ -462,6 +469,7 @@ def build_server(manager):
         contains filters by substring; limit default 500."""
         return dumps(await native("Papyrus.log", since=since, level=level, limit=limit, contains=contains))
 
+    capture.register(mcp, manager, recorder)
     return mcp
 
 

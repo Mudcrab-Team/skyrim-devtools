@@ -1,19 +1,26 @@
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('install-task', 'start', 'run', 'status', 'stop', 'evidence')]
+    [ValidateSet('install-task', 'start', 'run', 'status', 'stop', 'evidence',
+                 'install-capture-task', 'capture-start', 'capture-run', 'capture-stop', 'capture-status')]
     [string] $Action,
     [ValidatePattern('^[a-f0-9]{32}$')]
     [string] $Session,
     [ValidateSet('', 'headless', 'windowed')]
-    [string] $Mode = ''
+    [string] $Mode = '',
+    [ValidateRange(5, 60)]
+    [int] $Fps = 30,
+    [ValidateRange(320, 3840)]
+    [int] $Width = 1920
 )
 $ErrorActionPreference = 'Stop'
 $taskName = 'SkyrimDevTools'
+$captureTask = 'SkyrimDevToolsCapture'
 $root = $PSScriptRoot
 $games = Join-Path $root 'game'
 $profile = Join-Path $root 'profile'
 $runs = Join-Path $root 'runs'
 $lease = Join-Path $root 'active'
+$captureLease = Join-Path $root 'capture-active'
 $pin = '846efccf0c1374d71f892907f46549560f2fcb0a75cb87a3eed438baa0f1402f'
 $account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 
@@ -475,6 +482,150 @@ function Run-Game {
     }
 }
 
+function Now-Ms { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+
+function Find-Ffmpeg {
+    $found = Get-Command ffmpeg -ErrorAction SilentlyContinue
+    if ($found) { return $found.Source }
+    $packages = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
+    $file = Get-ChildItem -LiteralPath $packages -Recurse -Filter ffmpeg.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (!$file) { throw 'ffmpeg is not installed (winget install Gyan.FFmpeg)' }
+    $file.FullName
+}
+
+function Capture-Paths($SessionId) {
+    $dir = Join-Path (Join-Path $runs $SessionId) 'capture'
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    @{ dir = $dir; state = (Join-Path $dir 'state.json'); stop = (Join-Path $dir 'stop'); request = (Join-Path $dir 'request.json') }
+}
+
+function Restore-GameFocus {
+    # Starting the capture task briefly takes the foreground, and an unfocused windowed game stops answering.
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class SkyrimDevToolsFocus
+{
+    [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr window, int command);
+    [DllImport("user32.dll")] private static extern void keybd_event(byte key, byte scan, uint flags, UIntPtr extra);
+    public static void Focus(IntPtr window)
+    {
+        // a synthetic Alt press lets a background process take the foreground
+        keybd_event(0x12, 0, 0, UIntPtr.Zero);
+        ShowWindow(window, 9);
+        SetForegroundWindow(window);
+        keybd_event(0x12, 0, 2, UIntPtr.Zero);
+    }
+}
+'@ -ErrorAction SilentlyContinue
+    $game = Get-Process SkyrimSE -ErrorAction SilentlyContinue | Where-Object MainWindowHandle -NE 0 | Select-Object -First 1
+    if ($game) { [SkyrimDevToolsFocus]::Focus($game.MainWindowHandle) }
+}
+
+function Stop-Tree($Process) {
+    # the cmd wrapper's child (ffmpeg) survives a plain Kill and would keep the screen grab running
+    if ($Process -and !$Process.HasExited) { & taskkill.exe /T /F /PID $Process.Id 2>&1 | Out-Null }
+}
+
+function Run-Capture {
+    # Runs in the interactive desktop session: desktop duplication does not work from an SSH session.
+    $id = [IO.File]::ReadAllText($captureLease)
+    if ($id -notmatch '^[a-f0-9]{32}$') { throw 'Invalid capture lease' }
+    $paths = Capture-Paths $id
+    $request = Read-Json $paths.request
+    $out = Join-Path $paths.dir $request.file
+    $log = Join-Path $paths.dir ($request.file + '.log')
+    $process = $null
+    $state = @{ phase = 'failed'; reason = 'start'; file = $request.file; path = $out }
+    try {
+        $ffmpeg = Find-Ffmpeg
+        $scale = "scale=$($request.width):-2:flags=bilinear,format=nv12"
+        # Desktop duplication loses access when the game owns the display, so GDI capture goes first.
+        $sources = @(
+            @('gdigrab', "-f gdigrab -framerate $($request.fps) -draw_mouse 0 -i desktop -vf ""$scale"""),
+            @('ddagrab', "-filter_complex ""ddagrab=output_idx=0:framerate=$($request.fps):draw_mouse=0,hwdownload,format=bgra,$scale"""))
+        $encoders = @(
+            @('h264_amf', '-quality speed -rc cbr -b:v 8M'),
+            @('libx264', '-preset ultrafast -crf 24 -pix_fmt yuv420p'))
+        $attempts = foreach ($source in $sources) { foreach ($encoder in $encoders) { , @($source, $encoder) } }
+        foreach ($attempt in $attempts) {
+            $source, $encoder = $attempt
+            Remove-Item -LiteralPath $out, $log -ErrorAction SilentlyContinue
+            $command = '"{0}" -hide_banner -y {1} -c:v {2} {3} -movflags +frag_keyframe+empty_moov+default_base_moof "{4}" 2> "{5}"' -f
+                $ffmpeg, $source[1], $encoder[0], $encoder[1], $out, $log
+            $info = New-Object Diagnostics.ProcessStartInfo 'cmd.exe', ('/d /c "{0}"' -f $command)
+            $info.UseShellExecute = $false
+            $info.CreateNoWindow = $true
+            $info.RedirectStandardInput = $true
+            $process = [Diagnostics.Process]::Start($info)
+            $started = $null
+            $opened = $null
+            $deadline = [DateTime]::UtcNow.AddSeconds(8)
+            while (!$started -and !$process.HasExited -and [DateTime]::UtcNow -lt $deadline) {
+                Start-Sleep -Milliseconds 40
+                $text = if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -Raw -ErrorAction SilentlyContinue } else { '' }
+                if (!$opened -and $text -match 'Output #0') { $opened = Now-Ms }
+                # frames must actually flow before the recording counts as started
+                if ($opened -and $text -match 'frame=\s*[1-9]') { $started = $opened }
+            }
+            if ($started) {
+                $state = @{ phase = 'recording'; file = $request.file; path = $out; encoder = $encoder[0]; source = $source[0]
+                            fps = $request.fps; width = $request.width; startEpochMs = $started }
+                Write-Json $state $paths.state
+                Restore-GameFocus
+                break
+            }
+            Stop-Tree $process
+            $process = $null
+        }
+        if (!$process) {
+            $tail = if (Test-Path -LiteralPath $log) { (Get-Content -LiteralPath $log -Tail 8) -join "`n" } else { '' }
+            $state = @{ phase = 'failed'; reason = 'no encoder started'; detail = $tail }
+            return
+        }
+        # a recording must not outlive its game if nobody calls capture-stop
+        $gameGoneSince = $null
+        $nextCheck = [DateTime]::UtcNow
+        while (!$process.HasExited -and !(Test-Path -LiteralPath $paths.stop)) {
+            Start-Sleep -Milliseconds 100
+            if ([DateTime]::UtcNow -ge $nextCheck) {
+                $nextCheck = [DateTime]::UtcNow.AddSeconds(2)
+                if (Get-Process SkyrimSE -ErrorAction SilentlyContinue) { $gameGoneSince = $null }
+                elseif (!$gameGoneSince) { $gameGoneSince = [DateTime]::UtcNow }
+                elseif ([DateTime]::UtcNow -ge $gameGoneSince.AddSeconds(20)) { break }
+            }
+        }
+        $stoppedAt = Now-Ms
+        $diedEarly = $process.HasExited -and !(Test-Path -LiteralPath $paths.stop)
+        if (!$process.HasExited) {
+            # q makes ffmpeg finish the file cleanly
+            $process.StandardInput.WriteLine('q')
+            $process.StandardInput.Flush()
+            if (!$process.WaitForExit(20000)) { Stop-Tree $process }
+        }
+        $final = $state.Clone()
+        $final.phase = if ($diedEarly) { 'failed' } else { 'stopped' }
+        if ($diedEarly) {
+            $final.reason = 'the recorder exited while recording'
+            $final.detail = (Get-Content -LiteralPath $log -Tail 6 -ErrorAction SilentlyContinue) -join "`n"
+        }
+        $final.stopEpochMs = $stoppedAt
+        $final.bytes = if (Test-Path -LiteralPath $out) { (Get-Item -LiteralPath $out).Length } else { 0 }
+        $state = $final
+    } catch {
+        $state = @{ phase = 'failed'; reason = $_.Exception.Message }
+    } finally {
+        Stop-Tree $process
+        Write-Json $state $paths.state
+        Remove-Item -LiteralPath $captureLease -ErrorAction SilentlyContinue
+    }
+}
+
+function Capture-State($Paths) {
+    if (Test-Path -LiteralPath $Paths.state) { Get-Content -LiteralPath $Paths.state -Raw } else { '{"phase":"idle"}' }
+}
+
 switch ($Action) {
     'install-task' {
         $arguments = '-NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "{0}" run' -f $PSCommandPath
@@ -514,6 +665,53 @@ switch ($Action) {
         @{ sessionId = $Session; port = $config.port; token = $token } | ConvertTo-Json -Compress
     }
     'run' { Run-Game }
+    'install-capture-task' {
+        $arguments = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy RemoteSigned -File "{0}" capture-run' -f $PSCommandPath
+        $task = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
+        $principal = New-ScheduledTaskPrincipal -UserId $account -LogonType Interactive
+        $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        Register-ScheduledTask -TaskName $captureTask -Action $task -Principal $principal -Settings $settings -Force | Out-Null
+    }
+    'capture-start' {
+        if (!$Session) { throw 'Session id is required' }
+        $paths = Capture-Paths $Session
+        if ((Get-ScheduledTask -TaskName $captureTask).State -ne 'Ready') { throw 'A capture is already running' }
+        Remove-Item -LiteralPath $paths.stop, $paths.state -ErrorAction SilentlyContinue
+        $file = 'capture-{0}.mp4' -f [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss')
+        Write-Json @{ fps = $Fps; width = $Width; file = $file } $paths.request
+        Write-Json @{ phase = 'starting' } $paths.state
+        [IO.File]::WriteAllText($captureLease, $Session)
+        Start-ScheduledTask -TaskName $captureTask
+        $deadline = [DateTime]::UtcNow.AddSeconds(20)
+        do {
+            Start-Sleep -Milliseconds 200
+            $current = Read-Json $paths.state
+        } until ($current.phase -ne 'starting' -or [DateTime]::UtcNow -ge $deadline)
+        if ($current.phase -eq 'starting') {
+            Remove-Item -LiteralPath $captureLease -ErrorAction SilentlyContinue
+            $current = @{ phase = 'failed'; reason = 'capture task did not start' }
+        }
+        $current | ConvertTo-Json -Compress
+    }
+    'capture-run' { Run-Capture }
+    'capture-status' {
+        if (!$Session) { throw 'Session id is required' }
+        (Capture-State (Capture-Paths $Session)).Trim()
+    }
+    'capture-stop' {
+        if (!$Session) { throw 'Session id is required' }
+        $paths = Capture-Paths $Session
+        $current = Read-Json $paths.state
+        if ($current.phase -eq 'recording') {
+            [IO.File]::WriteAllText($paths.stop, '')
+            $deadline = [DateTime]::UtcNow.AddSeconds(30)
+            do {
+                Start-Sleep -Milliseconds 200
+                $current = Read-Json $paths.state
+            } until ($current.phase -ne 'recording' -or [DateTime]::UtcNow -ge $deadline)
+        }
+        $current | ConvertTo-Json -Compress
+    }
     'status' {
         if (!$Session) { throw 'Session id is required' }
         Get-Content -LiteralPath (Join-Path $runs "$Session\state.json") -Raw
