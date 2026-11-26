@@ -67,6 +67,12 @@ def plugin_report(info, methods):
 class GameError(RuntimeError):
     """A failure to report to the playtester as-is."""
 
+    rpc_code = None  # the plugin's error code when the failure came from a native call
+    rpc_data = None
+
+
+STUCK_CODE = -32011
+
 
 class StartStalled(GameError):
     """The game was running but never reached the main menu."""
@@ -101,6 +107,7 @@ class GameManager:
         self.keepalive_seconds = keepalive
         self.event_listeners = []
         self.lock = asyncio.Lock()
+        self.listeners = []  # callbacks(compact_event) for every native event, kept across game restarts
         self.reset()
 
     def reset(self):
@@ -138,6 +145,11 @@ class GameManager:
             return
         self.events.append(compact)
         self.event_total += 1
+        for listener in list(self.listeners):
+            try:
+                listener(compact)
+            except Exception:
+                pass
 
     def note_warning(self, code, message):
         """Put a tool-side warning into the event buffer, where events_drain and the timeline can see it."""
@@ -470,7 +482,10 @@ class GameManager:
             try:
                 return await self.session.call(method, timeout=timeout, **params)
             except RpcError as error:
-                raise GameError(describe_rpc_error(error)) from error
+                failure = GameError(describe_rpc_error(error))
+                failure.rpc_code = error.code
+                failure.rpc_data = error.data
+                raise failure from error
             except (ConnectionLost, OSError) as error:
                 async with self.lock:
                     if self.phase == "running" and (self.session is None or self.session._closed is not None):

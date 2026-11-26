@@ -100,6 +100,7 @@ namespace
         RE::NiPoint3 start;
         RE::NiPoint3 last;
         double travelled = 0.0;
+        stuck::Detector det;
         ReplyPtr reply;
     };
 
@@ -134,6 +135,28 @@ namespace
         return { { "headingDeg", Round(Deg(player.GetAngleZ()), 100.0) }, { "pitchDeg", Round(Deg(player.GetAngleX()), 100.0) } };
     }
 
+    // A walk that ended because the player stopped getting anywhere: the reply is the `stuck` error.
+    void StopStuck(RE::PlayerCharacter& player, const stuck::Verdict& verdict)
+    {
+        if (walk->restoreRunning) {
+            if (const auto running = Running()) {
+                *running = *walk->restoreRunning;
+            }
+        }
+        const auto pos = player.GetPosition();
+        auto data = stuck::Report(verdict, player, nullptr);
+        data["direction"] = walk->control;
+        data["distance"] = Round(walk->travelled);
+        data["displacement"] = Round(Dist2D(walk->start, pos));
+        data["durationMs"] = static_cast<std::int64_t>((Now() - walk->started) * 1000.0);
+        data["start"] = Point(walk->start);
+        walk->reply->Fail(code::stuck, "stuck", std::move(data));
+        walk.reset();
+        if (CurrentDrive().owner == "walk") {
+            CurrentDrive().owner.clear();
+        }
+    }
+
     void FinishWalk(RE::PlayerCharacter& player, bool timedOut)
     {
         if (walk->restoreRunning) {
@@ -166,15 +189,51 @@ namespace
                 const auto step = Dist3D(pos, walk->last);
                 walk->travelled += step < 1000.0 ? step : 0.0;  // a teleport is not walking
                 walk->last = pos;
+                if (step >= 1000.0) {
+                    walk->det.Reset(tick.now);
+                }
                 const auto elapsed = tick.now - walk->started;
                 const bool done = (walk->duration > 0.0 && elapsed >= walk->duration) ||
                                   (walk->distance > 0.0 && walk->travelled >= walk->distance);
                 if (done || elapsed > 120.0) {
                     FinishWalk(*player, !done);
-                } else {
+                } else if (stuck::Paused()) {
+                    walk->det.Reset(tick.now);
                     tick.drive.hold.push_back(walk->control);
-                    if (walk->sprint) {
-                        tick.drive.hold.push_back("Sprint");
+                } else if (walk->det.Recovering(tick.now)) {
+                    const auto controls = walk->det.RecoveryControls(tick.now);
+                    tick.drive.hold.insert(tick.drive.hold.end(), controls.hold.begin(), controls.hold.end());
+                    if (controls.tapJump) {
+                        tick.drive.tap.push_back("Jump");
+                    }
+                } else {
+                    const auto verdict = walk->det.Update(tick.now, pos.x, pos.y, -1.0, &stuck::Doors());
+                    if (verdict.unstuck) {
+                        stuck::EmitUnstuck("walk", verdict, pos);
+                    }
+                    if (verdict.step == stuck::Step::abort) {
+                        stuck::EmitStuck("walk", verdict, stuck::Report(verdict, *player, nullptr));
+                        StopStuck(*player, verdict);
+                    } else {
+                        if (verdict.step != stuck::Step::none) {
+                            stuck::EmitStuck("walk", verdict, stuck::Report(verdict, *player, nullptr));
+                            if (verdict.step == stuck::Step::replan) {
+                                // Nothing to replan on a fixed heading: back off the other way instead.
+                                walk->det.BeginRecovery(tick.now, stuck::Step::back, 1.0);
+                            }
+                        }
+                        if (walk->det.Recovering(tick.now)) {
+                            const auto controls = walk->det.RecoveryControls(tick.now);
+                            tick.drive.hold.insert(tick.drive.hold.end(), controls.hold.begin(), controls.hold.end());
+                            if (controls.tapJump) {
+                                tick.drive.tap.push_back("Jump");
+                            }
+                        } else {
+                            tick.drive.hold.push_back(walk->control);
+                            if (walk->sprint) {
+                                tick.drive.hold.push_back("Sprint");
+                            }
+                        }
                     }
                 }
             }
@@ -294,7 +353,7 @@ DEVTOOLS_MODULE(NavMove)
     const MethodSpec main{ .thread = Thread::Main };
 
     RegisterDeferred("Move.walk", [](const Json& params, ReplyPtr reply) {
-        AllowOnly(params, { "direction", "durationMs", "distance", "run", "sprint", "loadEpoch" });
+        AllowOnly(params, { "direction", "durationMs", "distance", "run", "sprint", "stuck", "loadEpoch" });
         RequirePlayable(params);
         std::lock_guard lock(Lock());
         if (walk || CurrentDrive().owner == "nav") {
@@ -308,6 +367,7 @@ DEVTOOLS_MODULE(NavMove)
             throw RpcError(code::invalidParams, "Give durationMs (up to 60000) or distance (up to 20000 units)");
         }
         next.sprint = Optional<bool>(params, "sprint", false);
+        next.det = stuck::Detector(stuck::ParseConfig(params));
         if (params.contains("run")) {
             if (const auto running = Running()) {
                 next.restoreRunning = *running;
@@ -317,6 +377,7 @@ DEVTOOLS_MODULE(NavMove)
         auto& player = Player();
         next.start = next.last = player.GetPosition();
         next.started = Now();
+        next.det.Reset(next.started);
         next.reply = std::move(reply);
         walk = std::move(next);
         CurrentDrive().owner = "walk";

@@ -6,6 +6,7 @@ that `capture_start` records:
   {"t":"tool","name":..,"args":{..},"startMs":..,"endMs":..,"ok":bool,"summary":"..","error":".."}
   {"t":"narrate","ms":..,"text":".."}                      caption the agent wants on screen
   {"t":"status","ms":..,"cell":..,"pos":[x,y,z],"health":[cur,max],"quest":{..},"nav":".."}
+  {"t":"event","ms":..,"type":"moveStuck"|"moveUnstuck","data":{..}}   movement trouble reported by the plugin
   {"t":"capture","ms":..,"action":"start"|"stop","startEpochMs":..,"file":".."}
   {"t":"alert","ms":..,"action":"raised"|"cleared","kind":..,"severity":..,"hint":..,"detail":..}
 """
@@ -78,6 +79,16 @@ class Recorder:
     def write(self, record):
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+    MOVE_EVENTS = ("moveStuck", "moveUnstuck")
+
+    def attach(self, manager):
+        """Write the plugin's movement-trouble events into the timeline as they arrive."""
+        def on_event(event):
+            if event.get("type") in self.MOVE_EVENTS:
+                self.write({"t": "event", "ms": now_ms(), "type": event["type"], "data": event.get("data")})
+
+        manager.listeners.append(on_event)
 
     def narrate(self, text):
         self.write({"t": "narrate", "ms": now_ms(), "text": text.strip()})
