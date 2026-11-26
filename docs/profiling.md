@@ -3,8 +3,9 @@
 A sampling CPU profiler built into the plugin: which game functions take the frame, with call stacks, self
 and total time, the split between the game, plugins, SKSE, the GPU driver and Windows, what the main thread
 waits on, and the stacks of every slow frame. Agents drive it through MCP (`profile_*` tools) and people
-through the `skyrim-devtools-profile` command. Output opens in the [Firefox Profiler](https://profiler.firefox.com)
-and as flame graph SVGs.
+through the `skyrim-devtools-profile` command. There are three views: a live terminal dashboard (`top`,
+in the spirit of `nvidia-smi`), a timeline of threads, frames and events (`timeline.html`, in the spirit of
+Nsight Systems) and the [Firefox Profiler](https://profiler.firefox.com) with flame graph SVGs for the deep dive.
 
 ## How it works
 
@@ -40,6 +41,8 @@ skyrim-devtools-profile record --config host.json --seconds 30 [--phase idle|wal
 skyrim-devtools-profile report DIR [--rewrite] [--json]
 skyrim-devtools-profile export DIR --firefox OUT.json[.gz] [--open]
 skyrim-devtools-profile diff A B [--threads main|all] [--json]
+skyrim-devtools-profile top --config host.json [--save NAME] [--cell C] [--phase P] [--window 3] [--count N] [--json]
+skyrim-devtools-profile timeline DIR [--recorder TIMELINE.jsonl] [--out FILE]
 ```
 
 `record` launches the game with a window, optionally loads a save and moves to a cell, starts the profiler,
@@ -52,6 +55,7 @@ applies a load (`walk` turns and walks, `coc:` loads a cell and returns, repeate
 | `profile.json.gz` | Firefox Profiler format, see below |
 | `cpu-flame.svg`, `cpu.folded` | On-CPU flame graph (interactive: click to zoom, Esc or "Reset zoom" to go back, "Search" or Ctrl+F to highlight a regex, hover for samples, % and ms) and Brendan Gregg folded stacks |
 | `wait-flame.svg`, `wait.folded` | The same for waiting (off-CPU) samples |
+| `timeline.html` | Self-contained timeline viewer (see below) |
 | `raw.json.gz` | The raw profile; `report --rewrite` regenerates everything from it |
 
 ### Firefox Profiler
@@ -74,8 +78,43 @@ each hitch. The file layout is described in [profile-data.md](profile-data.md).
 changes in self and total share and in the module split.
 
 MCP tools in `skyrim-use`: `profile_start {threads, hz, duration_s}` (threads `all` by default), `profile_stop` (returns the report and
-writes the files on the MCP host), `profile_status`, `profile_watch` and `profile_hitches`. Raw RPC methods
-are listed in [protocol.md](protocol.md).
+writes the files on the MCP host), `profile_status`, `profile_watch`, `profile_hitches`, `profile_top` (one
+live snapshot) and `profile_mark` (a named span on the running profile). Raw RPC methods are listed in
+[protocol.md](protocol.md).
+
+### Live view: `top`
+
+`top` launches the game (like `record`) and redraws once a second:
+
+* fps and frame time p50/p99/max over the window (Present hook);
+* main thread busy vs waiting %, the module split and its top functions by self % (with total %) over the
+  last `--window` seconds, plus what it waited in;
+* process CPU and the busiest threads by CPU % (`GetThreadTimes` deltas, thread descriptions as names);
+* memory: working set, private bytes, *resident %* (working set / private), page faults/s and free system
+  memory. A resident share that drops while faults/s climb means Windows trimmed the game's working set and
+  every touched page now faults back in, which shows as a freeze;
+* GPU utilisation of the busiest engine and dedicated VRAM, from the WDDM performance counters (`GPU Engine`,
+  `GPU Process Memory`); shown as `-` where the counters are missing.
+
+Each `Profile.top` call keeps the main-thread sampler of the hitch watch (250 Hz) running for 10 s, so it
+costs nothing once nobody is looking; the first snapshot after a pause has few samples. `--count N` stops
+after N refreshes and `--json` prints one snapshot per line, for scripts. Agents use `profile_top`.
+
+### Timeline: `timeline.html`
+
+Every `record`/`profile_stop` writes `timeline.html`, a single file with the data embedded that opens in any
+browser without a server. It has one time axis with:
+
+* presented frames as alternating bands, frames over 33 ms tinted and hitches (over the threshold) red;
+* marker lanes: cell loads (`load`, the loading screen), other menus, RPC handlers that ran on the game or UI
+  thread (`rpc`), hitches, and client markers (`Profile.mark`: `alert`, `narrate` or any kind). `profile_stop`
+  also overlays the skyrim-use timeline's tool calls and narration that fall in the profile window; for a saved
+  profile, `timeline DIR --recorder FILE.jsonl` does the same;
+* one row per sampled thread with its samples as a stacked flame strip (root at the top, coloured by module
+  kind, grey while waiting).
+
+Wheel zooms, drag pans, double-click resets. Clicking a frame band or a thread row selects that frame and
+lists its markers and, per thread, the top self functions and hottest stacks.
 
 ## Profiling a mod
 
