@@ -94,6 +94,13 @@ class RoomTests(unittest.TestCase):
         model = rooms.build_model(finish(grid_reply(cells)), empty_contents())
         self.assertEqual(len(model.rooms), 1)
 
+    def test_a_very_long_tunnel_is_cut_into_stretches(self):
+        model = rooms.build_model(finish(grid_reply(block(0, 0, 90, 3))), empty_contents(player=[100, 100, 0]))
+        self.assertGreaterEqual(len(model.rooms), 2)
+        self.assertLessEqual(len(model.rooms), 4)
+        for room in model.rooms.values():
+            self.assertLess(room.bbox[2] - room.bbox[0], rooms.MAX_SPAN * 1.2)
+
     def test_three_chambers_in_a_row_chain_their_links(self):
         cells = block(0, 0, 10, 10) | block(10, 4, 6, 2) | block(16, 0, 10, 10) | block(26, 4, 6, 2) | block(32, 0, 10, 10)
         model = rooms.build_model(finish(grid_reply(cells)), empty_contents())
@@ -277,9 +284,12 @@ class ToolTests(unittest.TestCase):
     def setUp(self):
         self.saved = list(test_use.METHODS)
         test_use.METHODS.extend(TOOL_METHODS)
+        self.hit_window = explore.HIT_WINDOW_S
+        explore.HIT_WINDOW_S = 0
 
     def tearDown(self):
         test_use.METHODS[:] = self.saved
+        explore.HIT_WINDOW_S = self.hit_window
 
     async def scenario(self, contents, visited=None):
         h = Harness()
@@ -363,6 +373,16 @@ class ToolTests(unittest.TestCase):
             await h.text("game_stop")
         run(go())
 
+    def test_explore_without_fight_stops_at_a_hostile_it_reached(self):
+        async def go():
+            h, socket = await self.scenario(empty_contents(actors=[actor("A1", "Bandit", 2800, 500)]))
+            reply = json.loads(await h.text("explore", goal="clear", rooms=5))
+            self.assertEqual(reply["status"], "hostile_reached")
+            self.assertEqual(reply["ref"], "A1")
+            self.assertIn("combat_fight", reply["advice"])
+            await h.text("game_stop")
+        run(go())
+
     def test_explore_fights_on_contact_then_resumes(self):
         async def go():
             h, socket = await self.scenario(empty_contents(actors=[actor("A1", "Bandit", 2800, 500)]))
@@ -384,7 +404,7 @@ class ToolTests(unittest.TestCase):
                 return json.dumps({"outcome": "clear", "rounds": 3, "lowestHealthPct": 80, "hostilesLeft": 0})
             h.server._tool_manager._tools["combat_fight"].fn = fake_fight
             reply = json.loads(await h.text("explore", goal="clear", fight=True, invulnerable=True, rooms=3))
-            self.assertEqual(len(fought), 1)
+            self.assertGreaterEqual(len(fought), 1)
             self.assertEqual(reply["legs"][0]["fights"][0]["outcome"], "clear")
             goto = [c for c in socket.calls if c[0] == "Nav.goto"]
             self.assertEqual(goto[0][1]["onCombat"], "stop")

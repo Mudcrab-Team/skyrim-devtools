@@ -19,6 +19,7 @@ NAV_LEG_TIMEOUT_S = 150.0
 FIGHTS_PER_LEG = 6
 GIVE_UP_AFTER = 2          # failed legs to the same target before it is skipped
 STUCK_AFTER = 4            # consecutive failed legs before explore stops
+HIT_WINDOW_S = 4.5         # Nav.goto counts a hit taken this recently as combat
 ARRIVE_NEAR = 220.0        # already this close to a reference target: count it as reached
 
 
@@ -268,8 +269,8 @@ def register(mcp, native, manager, is_busy):
         call (default 1; use 99 to run to the end), within timeout_s. fight=true answers
         combat with combat_fight (style, stand_ground as there) and then carries on; invulnerable=true turns god
         mode on for the walk. Without it, combat is handled by Nav.goto's default (run past). The reply has a
-        status (go-on states: budget; final: cleared, fully_explored, found, looted, at_exit, arrived-at-exit,
-        not_found, no_exit, stuck, dead, outmatched), the legs walked with their outcome, hostiles seen to be
+        status (budget: more to do; final: cleared, fully_explored, found, looted, at_exit, arrived_at_exit,
+        left_cell, hostile_reached, not_found, no_exit, stuck, dead, outmatched), the legs walked with their outcome, hostiles seen to be
         gone, and the map summary. Call again to continue; cell_map shows the picture."""
         fight_on_contact = fight
         began = time.monotonic()
@@ -311,14 +312,21 @@ def register(mcp, native, manager, is_busy):
                 await native("Nav.goto", **nav_args)
                 result = await wait_nav(NAV_LEG_TIMEOUT_S)
                 fights = []
-                while fight_on_contact and result.get("state") == "failed" and \
-                        str(result.get("reason", "")).startswith("Interrupted by combat") and len(fights) < FIGHTS_PER_LEG:
+                at_hostile = pick.get("kindOf") == "hostile"
+                while fight_on_contact and len(fights) < FIGHTS_PER_LEG:
+                    contact = result.get("state") == "failed" and str(result.get("reason", "")).startswith("Interrupted by combat")
+                    if not contact and not (at_hostile and result.get("state") == "arrived"):
+                        break
                     outcome = await run_fight(style, stand_ground)
                     fights.append({"outcome": outcome.get("outcome"), "rounds": outcome.get("rounds"),
                                    "lowestHealthPct": outcome.get("lowestHealthPct"), "hostilesLeft": outcome.get("hostilesLeft")})
                     if outcome.get("outcome") in ("dead", "outmatched", "retreated"):
                         status = {"status": "dead" if outcome["outcome"] == "dead" else "outmatched",
                                   "why": outcome.get("assessment") or outcome["outcome"], "advice": outcome.get("advice")}
+                        break
+                    # Nav.goto treats a hit in the last few seconds as combat, so let that window pass
+                    await asyncio.sleep(HIT_WINDOW_S)
+                    if at_hostile:
                         break
                     await native("Nav.goto", **nav_args)
                     result = await wait_nav(NAV_LEG_TIMEOUT_S)
@@ -339,6 +347,9 @@ def register(mcp, native, manager, is_busy):
                                   "why": f"walked up to {pick.get('name')}"}
                     elif pick.get("kindOf") == "exit door":
                         status = {"status": "arrived_at_exit" if not activate else "left_cell", "exit": pick["ref"]}
+                    elif at_hostile and not fight_on_contact:
+                        status = {"status": "hostile_reached", "ref": pick["ref"], "name": pick.get("name"), "room": pick.get("room"),
+                                  "advice": "call combat_fight, or explore again with fight=true, to deal with it"}
                     elif pick.get("kindOf") in ("container", "item"):
                         status = {"status": "go", "arrivedAt": pick.get("name")}
                 else:
@@ -347,16 +358,23 @@ def register(mcp, native, manager, is_busy):
                     if memory.failures[pick["key"]] >= GIVE_UP_AFTER:
                         memory.blocked.add(pick["key"])
                         leg["givenUp"] = True
-                if status.get("status") in ("dead", "outmatched", "found", "arrived_at_exit", "left_cell"):
+                if status.get("status") in ("dead", "outmatched", "found", "arrived_at_exit", "left_cell", "hostile_reached"):
                     break
                 if failures_in_row >= STUCK_AFTER:
                     status = {"status": "stuck", "why": f"{failures_in_row} legs in a row failed; last reason: {result.get('reason')}"}
                     break
                 after, _, _ = await read_model()
+                still = {h["refID"] for h in after.hostiles()}
                 for ref, name in alive_before.items():
-                    if ref not in {h["refID"] for h in after.hostiles()}:
+                    if ref not in still:
                         killed.append(name)
                         memory.killed.append(name)
+                if at_hostile and arrived and pick["ref"] in still:
+                    # fought at it and it is still standing: do not loop on it forever
+                    memory.failures[pick["key"]] += 1
+                    if memory.failures[pick["key"]] >= GIVE_UP_AFTER + 1:
+                        memory.blocked.add(pick["key"])
+                        leg["givenUp"] = True
                 if status.get("status") == "go":
                     status = {"status": "budget", "why": "continuing"}
         finally:
