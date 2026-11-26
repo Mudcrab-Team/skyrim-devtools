@@ -161,7 +161,10 @@ DEVTOOLS_MODULE(StatePlayer)
         out["sprinting"] = state->IsSprinting();
         out["swimming"] = state->IsSwimming();
         out["weaponDrawn"] = state->IsWeaponDrawn();
-        out["inCombat"] = player.IsInCombat();
+        const auto combatants = view::ActiveCombatants(player);
+        out["inCombat"] = combatants > 0;
+        out["combatFlag"] = player.IsInCombat();
+        out["combatants"] = combatants;
         out["dead"] = player.IsDead();
 
         auto effects = Json::array();

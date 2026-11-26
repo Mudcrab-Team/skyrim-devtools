@@ -18,6 +18,7 @@ With --lock-wait, waiting agents queue by ticket next to agent.lock and are serv
 """
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -36,6 +37,16 @@ SYNC_DIRS = ["native"]
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,40}")
 
 
+def powershell_argv(script, policy="Bypass"):
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", policy, "-EncodedCommand", encoded]
+
+
+def remote_script(args):
+    # an encoded command exits 0 unless told otherwise, and callers branch on the script's exit code
+    return rf"& (Join-Path $env:USERPROFILE '{REMOTE_ROOT}\pc_build_remote.ps1') {args}; exit $LASTEXITCODE"
+
+
 def fail(message, code=1):
     print(f"pc-build: {message}", file=sys.stderr)
     sys.exit(code)
@@ -51,6 +62,10 @@ class Host:
             opts += ["-F", str(Path(path).expanduser())]
         self.opts = opts
         self.destination = destination
+
+    def run_powershell(self, script, **kwargs):
+        """Send a script as -EncodedCommand so the remote login shell cannot expand its $variables."""
+        return self.run(" ".join(powershell_argv(script)), **kwargs)
 
     def run(self, command, check=True, stream=False):
         argv = ["ssh", *self.opts, "-T", self.destination, command]
@@ -127,9 +142,7 @@ def sync(host, name, full):
 def run_remote(host, args):
     script = REPO / "tools" / "pc_build_remote.ps1"
     host.put(script, rf"{REMOTE_ROOT}\pc_build_remote.ps1")
-    command = (rf"powershell -NoProfile -ExecutionPolicy Bypass -File "
-               rf"{REMOTE_ROOT}\pc_build_remote.ps1 {args}")
-    return host.run(command, stream=True)
+    return host.run_powershell(remote_script(args), stream=True)
 
 
 HEARTBEAT_SECONDS = 240
@@ -196,8 +209,7 @@ def hold(host, options, argv):
 
     def beat():
         while not stop.wait(HEARTBEAT_SECONDS):
-            result = host.run(rf"powershell -NoProfile -ExecutionPolicy Bypass -File {REMOTE_ROOT}\pc_build_remote.ps1 "
-                              f"-Action lock -Agent {name} -LockWait 0 -Refresh{LOCK_ARGS}", check=False)
+            result = host.run_powershell(remote_script(f"-Action lock -Agent {name} -LockWait 0 -Refresh{LOCK_ARGS}"), check=False)
             if result.returncode:
                 lost.set()
                 print("pc-build: agent.lock refresh failed; the lock is no longer ours", file=sys.stderr)

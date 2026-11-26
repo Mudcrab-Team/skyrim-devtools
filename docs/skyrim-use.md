@@ -60,6 +60,18 @@ this plugin build" instead of failing obscurely, and `rpc_call` reaches any meth
 (a buffered, not yet drained event; it does not consume it) and a generic probe `method` + `path` + `equals`,
 for example `method=Player.state path=location.cell equals=WhiterunBanneredMare`.
 
+**Stuck handling.** Every movement path (`walk`, `nav_goto` in both modes, combat approach) runs the
+same native detector: no displacement while moving input is held, a route whose distance to the goal
+stops shrinking, ping-pong between spots and a door that keeps being re-entered. It steps back and
+strafes, jumps, replans around the spot (blocking a looped door), and then stops with `stuck` within
+about 15 s: `walk` returns `{"stuck": true, "error": "stuck", reason, pos, facingDeg, blockers,
+screenshotHint}` and `nav_wait` returns `"error": "stuck"` with the same report under `stuck`; take a
+`screenshot` to see the blocker. Tune it per call with the `stuck` argument (`false` disables;
+`{"distance": 40, "windowS": 3, "maxFailures": 3, "totalS": 20, "progressWindowS": 10}`).
+`moveStuck` / `moveUnstuck` events land in the timeline JSONL. `walk` also has a client-side backstop:
+if the player covers under 40 units in 20 s the walk is stopped and reported `reason: hardCap`.
+Details: docs/protocol.md, "Stuck detector".
+
 `nav_goto` returns at once; follow it with `nav_wait` (blocks up to 300 s per call) or `wait_for
 event_type=navArrived`. Use `mode=ai` for long overland trips (the engine pathfinder handles cell
 streaming and roads) and `mode=input` for short, precise walks that behave like a player pressing
@@ -200,7 +212,7 @@ the showcase composer shows the active kinds in the status panel.
 | `crime` | a bounty gained, stolen goods value rising, or a hostile guard (held 60 s) | pay, jail or avoid |
 | `targetDead`, `targetUnreachable` | a tracked quest's target actor is dead (the detail says if it is essential), or is disabled or in no cell; checked every `targetCheckS` (10 s) | re-check the quest, reload, or another route |
 | `lowHealthNoHeal` | health under `lowHealthPct` (30) with no restoring potion and no healing spell | retreat, rest, console heal |
-| `moveStuck` | the movement stuck detector's `moveStuck` event, until `moveUnstuck` | another route, open the door |
+| `moveStuck` | the movement stuck detector's `moveStuck` event, until `moveUnstuck`, an arrival, a new `nav_goto`/`walk`/`nav_cancel`, a teleport or a cell change; a loaded save clears every alert (those still true in the plugin return at the next sync) | another route, open the door |
 
 Change thresholds with `agent_alerts {configure: {"thresholds": {"questStalledMin": 3}, "disable": ["crime"]}}`;
 the plugin owns the native keys (`Alerts.configure`), the MCP server the `actionLoop*` and `blind*` ones. Alerts

@@ -17,6 +17,22 @@ from .logs import classify_outcome
 
 ACTIVE = {"starting", "running"}
 MENU_SETTLE = 0.4
+# read-only host actions are safe to repeat; the host can be briefly unreachable or mid-write of its state file
+READ_ONLY_ACTIONS = {"status", "evidence", "crashes", "active", "idle"}
+READ_ATTEMPTS = 4
+READ_SETTLE = 1.5
+IDLE_TIMEOUT = 40.0
+
+
+def encode_powershell(script):
+    """UTF-16LE base64 for -EncodedCommand: the remote login shell never sees the script text, so `$variables`
+    and quotes in it are not expanded or mangled on the way."""
+    return base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+
+
+def powershell_argv(script, policy="RemoteSigned"):
+    return ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", policy,
+            "-EncodedCommand", encode_powershell(script)]
 
 
 @dataclass
@@ -48,7 +64,7 @@ class WindowsHost:
             raise ValueError("Local port must be between 1024 and 65535")
 
     async def command(self, action, session_id="", mode="", grace=None, force=False):
-        if action not in {"start", "status", "stop", "evidence", "crashes", "health", "reset"} or (session_id and not re.fullmatch("[a-f0-9]{32}", session_id)):
+        if action not in {"start", "status", "stop", "evidence", "crashes", "health", "reset", "active", "idle"} or (session_id and not re.fullmatch("[a-f0-9]{32}", session_id)):
             raise ValueError("Invalid Windows session operation")
         if mode not in {"", "headless", "windowed"}:
             raise ValueError("Invalid display mode")
@@ -60,11 +76,19 @@ class WindowsHost:
         if force:
             argument += " -Force"
         script = rf"& (Join-Path $env:USERPROFILE '.local\skyrim-devtools\host.ps1') {action} {argument}"
-        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        attempts = READ_ATTEMPTS if action in READ_ONLY_ACTIONS else 1
+        for attempt in range(attempts):
+            try:
+                return await self._command_once(action, script)
+            except (RuntimeError, TimeoutError) as error:
+                if attempt == attempts - 1 or "Invalid response" in str(error):
+                    raise
+                await asyncio.sleep(READ_SETTLE * (attempt + 1))
+
+    async def _command_once(self, action, script):
         process = await asyncio.create_subprocess_exec(
-            *self.ssh, "-T", self.destination, "powershell", "-NoProfile", "-NonInteractive",
-            "-ExecutionPolicy", "RemoteSigned",
-            "-EncodedCommand", encoded, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            *self.ssh, "-T", self.destination, *powershell_argv(script),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
         try:
             async with asyncio.timeout(45):
@@ -79,6 +103,28 @@ class WindowsHost:
             return json.loads(data)
         except ValueError as error:
             raise RuntimeError(f"Invalid response from Windows host {action}") from error
+
+    async def wait_idle(self, timeout=IDLE_TIMEOUT):
+        """Wait until no game or loader process runs and the session lease is gone. A start right after a stop is
+        refused, or comes up stuck on a loading spinner, while the previous game still holds its files."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        state = {}
+        while True:
+            state = await self.command("idle")
+            if state.get("idle"):
+                return state
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError(f"previous game still running after {timeout:g} s ({state})")
+            await asyncio.sleep(1)
+
+    async def stop_active(self, grace=12):
+        """Stop whatever session holds the lease, including one started by a program that has since died."""
+        active = await self.command("active")
+        session_id = active.get("sessionId")
+        if session_id:
+            await self.stop(session_id, grace=grace)
+        await self.wait_idle()
+        return {"stopped": session_id}
 
     async def wait_ready(self, session_id):
         async def read():
@@ -102,6 +148,9 @@ class WindowsHost:
             # the runner is hung too: kill what is left so the next start does not meet a busy task
             await self.reset(session_id, force=True)
             raise
+        # an older host script has no idle action; the phase is then all there is to wait for
+        with suppress(RuntimeError, TimeoutError):
+            await self.wait_idle()
         await self.reset(session_id)
         return state
 

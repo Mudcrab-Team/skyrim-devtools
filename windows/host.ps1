@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('install-task', 'start', 'run', 'status', 'stop', 'evidence', 'crashes',
+    [ValidateSet('install-task', 'start', 'run', 'status', 'stop', 'evidence', 'crashes', 'active', 'idle',
                  'install-capture-task', 'capture-start', 'capture-run', 'capture-stop', 'capture-status',
                  'health', 'reset')]
     [string] $Action,
@@ -398,7 +398,7 @@ function Preflight($Config, $Headless) {
     }
     # The crash logger is the one diagnostic plugin allowed next to the test plugin.
     $dlls = @(Get-ChildItem -LiteralPath $plugins -File -Filter '*.dll' | ForEach-Object Name)
-    if ($dlls -notcontains 'SkyrimDevTools.dll' -or @($dlls | Where-Object { $_ -notin @('SkyrimDevTools.dll', 'CrashLogger.dll', 'msdia140.dll') }).Count) {
+    if ($dlls -notcontains 'SkyrimDevTools.dll' -or @($dlls | Where-Object { $_ -notin @('SkyrimDevTools.dll', 'CrashLogger.dll', 'msdia140.dll', 'SkyrimDevToolsAdlx.dll') }).Count) {
         throw 'The test plugin and the crash logger (with its symbol reader) must be the only SKSE plugin DLLs'
     }
     Stage-Saves
@@ -838,6 +838,21 @@ switch ($Action) {
     'crashes' {
         # The latest crash logs of the isolated profile, newest first (read-only, safe during a run).
         ConvertTo-Json -InputObject @(Get-CrashLogs $null 5) -Compress -Depth 5
+    }
+    'active' {
+        # The session holding the lease, so a caller whose own program died can still stop that game.
+        $id = $null
+        if (Test-Path -LiteralPath $lease) {
+            $text = [IO.File]::ReadAllText($lease)
+            if ($text -match '^[a-f0-9]{32}$') { $id = $text }
+        }
+        @{ sessionId = $id } | ConvertTo-Json -Compress
+    }
+    'idle' {
+        # Idle means the lease is released and no game or loader process is left holding files.
+        $count = @(Get-Process SkyrimSE, skse64_loader -ErrorAction SilentlyContinue).Count
+        $leased = Test-Path -LiteralPath $lease
+        @{ idle = (!$leased -and $count -eq 0); lease = [bool]$leased; processes = $count } | ConvertTo-Json -Compress
     }
     'status' {
         if (!$Session) { throw 'Session id is required' }

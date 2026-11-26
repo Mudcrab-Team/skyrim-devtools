@@ -5,6 +5,7 @@
 #include "events.h"
 #include "game.h"
 #include "methods.h"
+#include "state_common.h"
 
 #include <algorithm>
 #include <cctype>
@@ -63,7 +64,9 @@ DEVTOOLS_MODULE(World)
             !std::ranges::all_of(cell, [](unsigned char c) { return std::isalnum(c) || c == '_'; })) {
             throw RpcError(code::invalidParams, "cell is an editor ID such as WhiterunBanneredMare");
         }
+        // the fighters stay behind in the old cell, so the flag would otherwise outlive the fight
+        const auto stopped = view::ClearPlayerCombat(view::RequirePlayer());
         const auto lines = console::Run("coc " + cell, nullptr);
-        return Json{ { "cell", cell }, { "lines", lines } };
+        return Json{ { "cell", cell }, { "lines", lines }, { "combatCleared", stopped } };
     }, { .thread = Thread::Main, .timeout = 30s });
 }
