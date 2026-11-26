@@ -461,6 +461,10 @@ namespace
         double suspendBudget = 0.025;
         std::uint32_t otherEvery = 4;
         bool truncated = false;
+        // The main-thread sampler outlives sessions (hitch watch, Profile.top), so its totals are read
+        // relative to where they stood when this session started.
+        double mainSuspendedBase = -1.0;
+        std::uint64_t mainThrottledBase = 0;
     };
 
     // ---- shared state ------------------------------------------------------------------------
@@ -958,6 +962,10 @@ namespace
             std::int32_t mainSessionStack = -1;
             bool mainWalked = false;
             bool mainSampled = false;
+            if (session && haveMain && session->mainSuspendedBase < 0.0) {
+                session->mainSuspendedBase = mainTarget.suspendedSeconds;
+                session->mainThrottledBase = mainTarget.throttled;
+            }
             const double budget = session ? session->suspendBudget : 0.025;
             bool mainThrottled = false;
             if (haveMain && OverBudget(mainTarget, now, budget)) {
@@ -996,7 +1004,7 @@ namespace
                     }
                     bool walked = false;
                     if (target.main && haveMain && mainThrottled) {
-                        target.throttled = mainTarget.throttled;
+                        target.throttled = mainTarget.throttled >= session->mainThrottledBase ? mainTarget.throttled - session->mainThrottledBase : 0;
                         if (target.lastStack >= 0) {
                             Append(*session, target, now, target.lastFlags | flagReused | flagThrottled);
                         }
@@ -1022,7 +1030,7 @@ namespace
                             target.lastStack = mainSessionStack;
                             ++target.walked;
                         }
-                        target.suspendedSeconds = mainTarget.suspendedSeconds;
+                        target.suspendedSeconds = std::max(0.0, mainTarget.suspendedSeconds - std::max(0.0, session->mainSuspendedBase));
                     } else if (!SampleThread(target, *scratch, now, walked)) {
                         target.gone = true;
                         continue;
