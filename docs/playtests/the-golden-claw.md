@@ -176,3 +176,19 @@ the narration markers with `--highlights`.
 14. Lock refresh during long holds (minor): refresh automatically while a game session is open.
 15. Long footage and a full Mac disk (~10 min): `--emit-dir` composes on the host; a `capture_stop transcode`
     step would make the copy small enough to fetch.
+
+## Addendum: low frame rate investigated
+
+* Not our plugin. `Perf.hitches` and per-call timing were added; in 5-6 minute visible runs with the desktop
+  capture, status polling, nearby scans and a Riverwood/trader/barrow navigation loop the game held 59.7-60 fps,
+  p99 16.9-17.2 ms. The one plugin cost found was the first `Nav.goto` reading its worldspace graph on the
+  game thread (78 ms, once 458 ms); the graphs are now read in the background (max 7.7 ms).
+* Not the disk. A 12 GB sequential write on the system SSD during play (1.7 GB/s peak, queue 2.8, 2.9 ms worst
+  transfer) produced no hitch.
+* The old session's evidence: the capture log shows the whole desktop's frame delivery falling from 30 fps in the
+  first 20 minutes to 5-6 fps from minute 50, steadily, while the tool-call rate fell. The plugin log shows
+  the game thread blocked in a wait (not computing) for 6 s or more from minute 50. The degradation is
+  system-wide and time-dependent, not tied to our calls. Not reproduced inside the 20-minute lock limit.
+* Also found: the visible profile used exclusive fullscreen, which drew the game in a corner of the monitor and
+  made desktop capture black; visible runs are now borderless-windowed (`Window.info` confirms 2560x1440
+  windowed on a 2560x1440 monitor). Resolution made no difference to the hitches in the runs above.

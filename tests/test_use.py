@@ -6,7 +6,7 @@ import unittest
 
 from skyrim_devtools.use.manager import GameError, GameManager
 from skyrim_devtools.use.perception import crop_rect, zoomed_fov
-from skyrim_devtools.use.server import build_server, dig
+from skyrim_devtools.use.server import build_server, dig, perf_verdict
 from skyrim_devtools.use.timeline import Recorder
 
 SESSION = "a" * 32
@@ -429,6 +429,24 @@ class UseTests(unittest.TestCase):
     def test_dig(self):
         self.assertEqual(dig({"a": [{"b": 5}]}, "a.0.b"), 5)
         self.assertIsNone(dig({"a": []}, "a.2"))
+
+
+class PerfVerdictTests(unittest.TestCase):
+    def test_smooth_session_is_ok(self):
+        verdict = perf_verdict({"count": 600, "fps": 60.0, "p50Ms": 16.7, "p99Ms": 17.0, "maxMs": 20.0}, {"hitches": []}, 10)
+        self.assertTrue(verdict["ok"])
+        self.assertEqual(verdict["warnings"], [])
+
+    def test_slow_session_warns(self):
+        hitches = {"hitches": [{"ms": 900, "frame": 5}, {"ms": 300, "frame": 9}], "slowCalls": {"World.nearby": {"count": 1}}}
+        verdict = perf_verdict({"count": 80, "fps": 8.0, "p50Ms": 16.7, "p99Ms": 900.0, "maxMs": 900.0}, hitches, 10)
+        self.assertFalse(verdict["ok"])
+        self.assertEqual(len(verdict["warnings"]), 2)
+        self.assertEqual(verdict["worstHitches"][0]["ms"], 900)
+
+    def test_no_frames_warns(self):
+        verdict = perf_verdict({"count": 0, "fps": None, "p99Ms": None}, {"hitches": []}, 10)
+        self.assertFalse(verdict["ok"])
 
 
 if __name__ == "__main__":

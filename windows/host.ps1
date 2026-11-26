@@ -216,6 +216,12 @@ function Write-ProfileSettings($Headless, $Config) {
         if ($Config.muteAudio -ne $false) {
             $prefs = Set-IniValue $prefs 'AudioMenu' 'fAudioMasterVolume' '0.0000'
         }
+    } else {
+        # Exclusive fullscreen drew the game into a corner of the monitor with black margins (the HUD placed for
+        # a larger frame) and made desktop capture grab black; a borderless window at the desktop size has neither
+        # problem and takes the resolution from the profile's own iSize W/H.
+        $prefs = Set-IniValue $prefs 'Display' 'bFull Screen' '0'
+        $prefs = Set-IniValue $prefs 'Display' 'bBorderless' '1'
     }
     [IO.File]::WriteAllText((Join-Path $profile 'Skyrim.ini'), $main)
     [IO.File]::WriteAllText((Join-Path $profile 'SkyrimPrefs.ini'), $prefs)
