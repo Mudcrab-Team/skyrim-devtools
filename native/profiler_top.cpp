@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Profile.top: one snapshot for a live dashboard. Main-thread hot functions come from the profiler's ring;
-// process memory, per-thread CPU and GPU counters are read here. Rates (page faults/s, CPU %) are deltas
-// against the previous call, so the first call after a pause reports them as null.
+// process memory and per-thread CPU are read here. Rates (page faults/s, CPU %) are deltas against the previous
+// call, so the first call after a pause reports them as null. GPU counters come from a background collector,
+// because one WDDM GPU Engine collection walks every engine instance on the system and can take longer than a
+// dashboard refresh.
 #include "methods.h"
 #include "perf.h"
 #include "profiler.h"
@@ -13,10 +15,13 @@
 #include <psapi.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -265,6 +270,60 @@ namespace
             return out;
         }
     } gpu;
+
+    // Collects GPU counters once a second while Profile.top was called in the last 10 s, then exits; the call
+    // returns the latest result and its age, so its latency no longer depends on PDH.
+    struct GpuCollector
+    {
+        std::mutex mutex;
+        Json latest = nullptr;
+        double latestAt = 0.0;
+        double lastCostMs = 0.0;
+        std::atomic<double> leaseUntil = 0.0;
+        std::atomic<bool> running = false;
+
+        Json Get(double now)
+        {
+            leaseUntil = now + 10.0;
+            if (!running.exchange(true)) {
+                std::thread([this] { Run(); }).detach();
+            }
+            std::lock_guard lock(mutex);
+            if (latest.is_null()) {
+                return nullptr;
+            }
+            Json out = latest;
+            out["ageMs"] = Round((now - latestAt) * 1000.0);
+            out["collectMs"] = Round(lastCostMs);
+            return out;
+        }
+
+        void Run()
+        {
+            while (perf::Now() < leaseUntil.load()) {
+                const double started = perf::Now();
+                Json sample = gpu.Sample();
+                const double finished = perf::Now();
+                {
+                    std::lock_guard lock(mutex);
+                    if (!sample.is_null()) {
+                        latest = std::move(sample);
+                        latestAt = finished;
+                    }
+                    lastCostMs = (finished - started) * 1000.0;
+                }
+                const double rest = 1.0 - (finished - started);
+                if (rest > 0.0) {
+                    std::this_thread::sleep_for(std::chrono::duration<double>(rest));
+                }
+            }
+            running = false;
+            // A call that raced the exit renews the lease without starting a thread; pick it up.
+            if (perf::Now() < leaseUntil.load() && !running.exchange(true)) {
+                Run();
+            }
+        }
+    } gpuCollector;
 }
 
 DEVTOOLS_MODULE(ProfilerTop)
@@ -276,13 +335,20 @@ DEVTOOLS_MODULE(ProfilerTop)
             throw RpcError(code::invalidParams, "seconds is 0.5 to 30");
         }
         const auto threadLimit = Optional<std::size_t>(params, "threads", 12);
+        const double started = perf::Now();
         Json out = profiler::TopSamples(seconds);
+        const double sampled = perf::Now();
         std::lock_guard lock(topStateMutex);
         const double now = perf::Now();
         out["memory"] = Memory(now);
-        out["threads"] = Threads(now, threadLimit);
-        out["gpu"] = Optional<bool>(params, "gpu", true) ? gpu.Sample() : Json(nullptr);
+        const double memoryDone = perf::Now();
+        out["threads"] = Threads(memoryDone, threadLimit);
+        const double threadsDone = perf::Now();
+        out["gpu"] = Optional<bool>(params, "gpu", true) ? gpuCollector.Get(threadsDone) : Json(nullptr);
         out["profiling"] = profiler::Profiling();
+        const auto ms = [](double a, double b) { return Round((b - a) * 1000.0); };
+        out["costMs"] = { { "samples", ms(started, sampled) }, { "memory", ms(now, memoryDone) },
+            { "threads", ms(memoryDone, threadsDone) }, { "total", ms(started, perf::Now()) } };
         return out;
     }, { .thread = Thread::Any, .timeout = std::chrono::milliseconds(30000) });
 }

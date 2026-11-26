@@ -37,6 +37,11 @@ BASE_SCHEMA = [
               {"key": "ms", "label": "Frame time", "format": "milliseconds"},
               {"key": "waitingPct", "label": "Main thread waiting %", "format": "decimal"},
               {"key": "top", "label": "Top function", "format": "string", "searchable": True}]},
+    {"name": "Mark", "display": ["marker-chart", "marker-table", "timeline-overview"],
+     "chartLabel": "{marker.data.label}", "tooltipLabel": "{marker.data.kind}: {marker.data.label}",
+     "tableLabel": "{marker.data.kind}: {marker.data.label}",
+     "data": [{"key": "kind", "label": "Kind", "format": "string", "searchable": True},
+              {"key": "label", "label": "Text", "format": "string", "searchable": True}]},
 ]
 
 
@@ -123,6 +128,13 @@ class Export:
                 out.append((f"Hitch {hitch.get('ms')} ms", start, start + (hitch.get("ms") or 0.0),
                             {"type": "Hitch", "frame": hitch.get("frame"), "ms": hitch.get("ms"),
                              "waitingPct": hitch.get("waitingPct"), "top": top}))
+            # loads, menus, RPC calls and client Profile.mark spans; a zero-length one is an instant marker
+            for mark in profile.raw.get("marks", []):
+                if len(mark) < 4 or mark[0] is None:
+                    continue
+                start, end, kind, text = mark[0], mark[1], str(mark[2]), str(mark[3])
+                out.append((f"{kind}: {text}"[:120], start, end if end is not None and end > start else None,
+                            {"type": "Mark", "kind": kind, "label": text}))
         return out
 
     def _thread(self, thread, libs, lib_index):

@@ -122,6 +122,22 @@ namespace
         return out;
     }
 
+    bool ModuleSetChanged(const std::vector<Module>& list)
+    {
+        std::vector<HMODULE> handles(1024);
+        DWORD needed = 0;
+        if (!EnumProcessModulesEx(GetCurrentProcess(), handles.data(), static_cast<DWORD>(handles.size() * sizeof(HMODULE)), &needed, LIST_MODULES_64BIT)) {
+            return false;
+        }
+        handles.resize(std::min<std::size_t>(handles.size(), needed / sizeof(HMODULE)));
+        // Only a module the list lacks matters; a stale entry for an unloaded one is harmless.
+        return std::ranges::any_of(handles, [&](HMODULE handle) {
+            const auto base = reinterpret_cast<std::uintptr_t>(handle);
+            const auto it = std::ranges::lower_bound(list, base, {}, &Module::base);
+            return it == list.end() || it->base != base;
+        });
+    }
+
     const Module* FindModule(const std::vector<Module>& list, std::uintptr_t address)
     {
         auto it = std::upper_bound(list.begin(), list.end(), address, [](std::uintptr_t a, const Module& m) { return a < m.base; });
@@ -1077,6 +1093,7 @@ namespace
         HANDLE symbols;
         bool symInit = false;
         std::unordered_set<std::uint32_t> symLoaded;
+        std::unordered_map<std::uint64_t, Json> frames;
 
         ~Resolver()
         {
@@ -1120,6 +1137,19 @@ namespace
         }
 
         Json Frame(std::uint64_t pc)
+        {
+            if (const auto cached = frames.find(pc); cached != frames.end()) {
+                return cached->second;
+            }
+            auto out = Resolve(pc);
+            if (frames.size() > 65536) {
+                frames.clear();
+            }
+            frames.emplace(pc, out);
+            return out;
+        }
+
+        Json Resolve(std::uint64_t pc)
         {
             const auto* module = FindModule(list, pc);
             if (!module) {
@@ -1433,9 +1463,14 @@ namespace devtools::profiler
         const auto covers = [&](const auto& list) {
             return std::ranges::all_of(list, [&](const auto& item) { return resolver->Covers(item.first); });
         };
-        if (!resolver || !covers(data.self) || !covers(data.total) || !covers(data.waits)) {
+        // A rebuild reloads DbgHelp symbols for every module, which costs hundreds of milliseconds. Code outside
+        // any module (hook trampolines, generated stubs) never becomes covered, so rebuild only when the loaded
+        // module set really changed.
+        const double resolveStart = perf::Now();
+        if (!resolver || ((!covers(data.self) || !covers(data.total) || !covers(data.waits)) && ModuleSetChanged(resolver->list))) {
             resolver.reset();
             resolver = std::make_unique<Resolver>(0x5d7e1e12);
+            out["resolverRebuilt"] = true;
         }
         const auto encode = [&](const auto& list) {
             auto rows = Json::array();
@@ -1452,6 +1487,7 @@ namespace devtools::profiler
         out["total"] = encode(data.total);
         out["waits"] = encode(data.waits);
         out["modules"] = resolver->Modules();
+        out["resolveMs"] = std::round((perf::Now() - resolveStart) * 10000.0) / 10.0;
         return out;
     }
 

@@ -97,7 +97,11 @@ live snapshot) and `profile_mark` (a named span on the running profile). Raw RPC
   `GPU Process Memory`); shown as `-` where the counters are missing.
 
 Each `Profile.top` call keeps the main-thread sampler of the hitch watch (250 Hz) running for 10 s, so it
-costs nothing once nobody is looking; the first snapshot after a pause has few samples. `--count N` stops
+costs nothing once nobody is looking; the first snapshot after a pause has few samples. GPU counters are read
+once a second by a background collector for as long as snapshots keep coming, so a snapshot never waits for
+the WDDM counter enumeration, and symbols are resolved through a cache that is rebuilt only when the loaded
+module set changes. Each `--json` snapshot carries `costMs` (`samples`, `memory`, `threads`, `total` inside
+the game, `resolve`, the `rpc` round trip and `resolverRebuilt`), so a slow refresh shows where it went. `--count N` stops
 after N refreshes and `--json` prints one snapshot per line, for scripts. Agents use `profile_top`.
 
 ### Timeline: `timeline.html`
@@ -105,7 +109,8 @@ after N refreshes and `--json` prints one snapshot per line, for scripts. Agents
 Every `record`/`profile_stop` writes `timeline.html`, a single file with the data embedded that opens in any
 browser without a server. It has one time axis with:
 
-* presented frames as alternating bands, frames over 33 ms tinted and hitches (over the threshold) red;
+* presented frames as boxes with their number and length once wide enough; frames over 1.5x the run's median
+  frame time are orange and hitches (over the threshold) red;
 * marker lanes: cell loads (`load`, the loading screen), other menus, RPC handlers that ran on the game or UI
   thread (`rpc`), hitches, and client markers (`Profile.mark`: `alert`, `narrate` or any kind). `profile_stop`
   also overlays the skyrim-use timeline's tool calls and narration that fall in the profile window; for a saved
@@ -113,8 +118,14 @@ browser without a server. It has one time axis with:
 * one row per sampled thread with its samples as a stacked flame strip (root at the top, coloured by module
   kind, grey while waiting).
 
-Wheel zooms, drag pans, double-click resets. Clicking a frame band or a thread row selects that frame and
-lists its markers and, per thread, the top self functions and hottest stacks.
+Dragging over the rows or the ruler selects a time range, shows its length, and zooms to it on release. The
+ruler moves from whole seconds to milliseconds and, when zoomed in below 10 ms, labels one tick with the
+absolute time and the rest as offsets (`+1.250 ms`, `+50 µs`). A crosshair follows the pointer with the exact
+time on the ruler and each row's value at that time (frame number and length, the marker, each thread's leaf
+function or wait). Keys: wheel zooms around the pointer, Shift+wheel, Alt/Shift-drag or middle-drag pan,
+Backspace (or `Back`) returns to the previous zoom, `-`/`+` zoom, `0`, `f`, `Fit` or double-click fit the whole
+profile, arrows pan, Esc clears the selection, `?` lists the keys. Clicking a frame box or a thread row
+selects that frame and lists its markers and, per thread, the top self functions and hottest stacks.
 
 ## Profiling a mod
 

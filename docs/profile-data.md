@@ -51,7 +51,9 @@ The [Firefox Profiler](https://profiler.firefox.com) *processed* format, `meta.p
 (main first), each with `frameTable`, `funcTable`, `resourceTable` (one per module), `stackTable`,
 `samples` (`time`, `stack`, `weight` = run length), `markers` and `stringArray`. Samples of waiting runs
 use the `Idle` category, so "Include idle samples" switches them. Markers: `Frame` per presented frame
-(`frame`, `ms`), `Hitch` per slow frame (`ms`, `waitingPct`, `top`). Counters (`counters[]`) use the
+(`frame`, `ms`), `Hitch` per slow frame (`ms`, `waitingPct`, `top`), and on the main thread `Mark` per entry
+of the raw `marks` (`kind`, `label`: loads, menus, RPC handlers, `Profile.mark` and recorder overlays; a
+zero-length mark is an instant marker). Counters (`counters[]`) use the
 `display` block of current profiler versions and store values as deltas.
 
 `skyrim_devtools.profile_firefox.Export` builds it; `add_markers` and `add_counter` add marker sets and

@@ -292,6 +292,19 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(wait_weight, 3)
         json.dumps(data)
 
+    def test_firefox_profile_marks(self):
+        from skyrim_devtools import profile_firefox
+
+        raw = raw_profile(RUNS)
+        raw["marks"] = [[2.0, 9.0, "load", "Loading Menu"], [4.0, 4.0, "alert", "low health"], [None, 1.0, "rpc", "x"]]
+        data = profiling.Profile(raw, self.profile.symbols).firefox().build()
+        self.assertEqual(profile_firefox.check(data), [])
+        thread = data["threads"][0]
+        marks = [(thread["markers"]["data"][i], thread["markers"]["endTime"][i], thread["markers"]["phase"][i])
+                 for i in range(thread["markers"]["length"]) if thread["markers"]["data"][i]["type"] == "Mark"]
+        self.assertEqual([(m["kind"], m["label"]) for m, _, _ in marks], [("load", "Loading Menu"), ("alert", "low health")])
+        self.assertEqual([(end, phase) for _, end, phase in marks], [(9.0, 1), (None, 0)])
+
     def test_firefox_counter_and_extra_markers(self):
         from skyrim_devtools import profile_firefox
 

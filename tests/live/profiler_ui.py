@@ -49,6 +49,14 @@ async def snapshots(manager, symbols, seconds, phase):
     return shots, latencies, errors, {k: stats.get(k) for k in ("fps", "p50Ms", "p99Ms", "maxMs", "count")}
 
 
+def slowest_cost(shots, latencies):
+    """Where the slowest snapshot spent its time (native parts, RPC round trip, resolver rebuild)."""
+    if not shots or len(shots) != len(latencies):
+        return None
+    index = max(range(len(latencies)), key=latencies.__getitem__)
+    return {"latencyMs": latencies[index], **(shots[index].get("costMs") or {})}
+
+
 def shot_summary(snap):
     return {"busyPct": snap["main"]["busyPct"], "samples": snap["main"]["samples"], "namedPct": snap["main"]["namedPct"],
             "top": [f"{r['pct']}% {r['function']} [{r['module']}]" for r in snap["topSelf"][:10]],
@@ -84,6 +92,7 @@ async def top_case(manager, symbols, seconds, out):
     (out / "top-last.txt").write_text(profile_views.render_top(shots[-1]) if shots else "")
     return {"pass": not failed, "failed": failed, "off": off, "on": on, "fpsRatio": fps_ratio, "snapshots": len(shots),
             "latencyMs": {"p50": statistics.median(latencies) if latencies else None, "max": max(latencies) if latencies else None},
+            "slowest": slowest_cost(shots, latencies),
             "gpuAvailable": any((s.get("gpu") or {}).get("utilPct") is not None for s in shots),
             "last": shot_summary(shots[-1]) if shots else None, "errors": errors[:3],
             "file": str(out / "top-snapshots.json")}
@@ -101,6 +110,7 @@ async def topload_case(manager, symbols, seconds, out):
     (out / "topload-snapshots.json").write_text(json.dumps(shots, indent=1))
     return {"pass": not failed, "failed": failed, "on": on, "snapshots": len(shots),
             "latencyMs": {"p50": statistics.median(latencies) if latencies else None, "max": max(latencies) if latencies else None},
+            "slowest": slowest_cost(shots, latencies),
             "maxPageFaultsPerS": max(((s.get("memory") or {}).get("pageFaultsPerS") or 0) for s in shots) if shots else None,
             "minResidentPct": min(((s.get("memory") or {}).get("residentPct") or 100) for s in shots) if shots else None,
             "errors": errors[:3]}
@@ -186,7 +196,8 @@ class FakeManager(profiler.FakeManager):
                     "memory": {"workingSetMb": 3000.0, "privateMb": 3500.0, "residentPct": 85.0, "pageFaultsPerS": 10.0},
                     "threads": {"count": 80, "processCpuPct": 120.0, "cores": 16,
                                 "top": [{"tid": 1, "name": "main", "cpuS": 1.0, "pct": 90.0}]},
-                    "gpu": None, "profiling": False}
+                    "gpu": None, "profiling": False,
+                    "costMs": {"samples": 2.0, "memory": 0.5, "threads": 1.0, "total": 3.5}, "resolveMs": 1.0}
 
     async def call(self, method, timeout=None, **params):
         if method == "Profile.top":
