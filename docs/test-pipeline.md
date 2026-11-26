@@ -83,9 +83,11 @@ deterministic; they never sleep for fixed long times when an event or a poll can
 
 1. **Collect.** The Tester takes every request in the queue at start. Requests that arrive during a batch wait
    for the next one.
-2. **Integrate.** Make an integration branch from `origin/main` and merge each request's SHA in. A request
-   that conflicts or breaks the build is dropped from the batch and reported right away with the error;
-   the rest continue. Build the plugin once and deploy it.
+2. **Integrate.** Make an integration branch from `origin/main` and merge each request's SHA in. Most conflicts
+   are additive (two branches each add a registration line, an include, a capability name, a docs row): resolve
+   those by keeping both sides and note it in the report. Drop a request from the batch, and report it right away
+   with the error, only when the conflict is semantic (the same function changed two ways) or the merged build
+   fails; the rest continue. Build the plugin once and deploy it.
 3. **Order.** Group cases by `setup` so each save or scenario loads once per group. Run `needs_fresh_game`
    requests last, or restart the game before them.
 4. **Run.** For each case: reset to its setup, run, collect artifacts, and record pass/fail with the measured
@@ -150,3 +152,17 @@ scripts should run.
 
 `setup` must be a real save name (or `scenario:<name>`) for session-style cases; for standalone scripts it is only a label,
 since the script loads its own save. The harness takes perf readings with `--perf-save NAME` loaded.
+
+## Known friction
+
+- A game start right after a stop or crash can be refused, or can come up with a loading spinner that never closes: the
+  harness retries a refused start after 25 s; a case that fails only with `close_menu` timeouts on `LoadWaitSpinner`
+  right after a start should be rerun alone before it is blamed on the feature.
+- `pc-build --deploy --keep-lock` only works when `--name` matches the lock holder; use one name for the lock, the
+  build and the deploy.
+- A script that crashes leaves the game it started running; the next harness start finds it. Stop the game between
+  groups or pass `--keep` deliberately.
+- Console commands on a placed reference must be ref-prefixed (`<ref>.setpos x 0`): the selection made by `prid`
+  does not carry over to the next `Console.execute` call.
+- Remote PowerShell sent through the host's login shell has its `$variables` expanded locally; send
+  `-EncodedCommand` for anything that uses them.
