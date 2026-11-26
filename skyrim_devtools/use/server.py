@@ -727,7 +727,7 @@ def build_server(manager, recorder=None, board=None):
     combat.register(mcp, native, manager)
     perception.register(mcp, native, manager)
     saves.register(mcp, manager, native)
-    profile_tools.register(mcp, native, manager)
+    profile_tools.register(mcp, native, manager, recorder)
     modtest.register(mcp, native, manager, recorder)
 
     # ---- movement, camera, navigation, recording ----------------------------------------------
