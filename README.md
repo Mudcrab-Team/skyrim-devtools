@@ -58,6 +58,16 @@ cmake -S native -B "$scratch/build" -G "Visual Studio 17 2022" -A x64 -DCMAKE_TO
 cmake --build "$scratch/build" --config Release --parallel 6
 ~~~
 
+### CI build
+
+The **Plugin DLL** workflow runs these steps on a `windows-2022` runner for changes under `native/`,
+and on manual dispatch. It uploads the artifact `SkyrimDevTools-1.7.104` with the DLL, its SHA-256,
+the source commit, the plugin build id and the licence texts. GitHub deletes it after 14 days.
+
+~~~sh
+gh run download <run-id> -R Mudcrab-Team/skyrim-devtools -n SkyrimDevTools-1.7.104 -D <empty-directory>
+~~~
+
 ### Fast builds from the Mac
 
 `tools/pc-build` (Python, runs on the Mac, same `--config` as the smoke runner or
