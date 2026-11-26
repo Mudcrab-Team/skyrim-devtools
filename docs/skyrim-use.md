@@ -136,6 +136,7 @@ so act in it first and leave it with the exit key (`press_control Cancel`) or `d
 
 `dialogue_topics`, `dialogue_explore`, `coverage_start` and `coverage_report` check what a mod's dialogue, quests
 and scenes do in a play session; see [mod-testing.md](mod-testing.md).
+
 ## Alerts
 
 Alerts tell you when you are wasting time. Every tool reply carries the active ones as a short `alerts` field

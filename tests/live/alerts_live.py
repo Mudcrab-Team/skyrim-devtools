@@ -28,6 +28,12 @@ AMBIENT = {"HUD Menu", "Cursor Menu", "Fader Menu", "Overlay Interaction Menu", 
            "Loading Menu"}
 
 
+def parse(text):
+    """The JSON value at the start of a tool reply; a list reply carries its alerts as a trailing text line."""
+    value, _ = json.JSONDecoder().raw_decode((text or "").lstrip())
+    return value
+
+
 def xyz(pos):
     return pos if isinstance(pos, list) else [pos["x"], pos["y"], pos["z"]]
 
@@ -64,6 +70,9 @@ class Run:
         timeout *= self.scale
         began = time.monotonic()
         while time.monotonic() - began < timeout:
+            if kind != "menuLeftOpen":
+                # the game's own tutorial popups (low health, first fall) pause the world until they are closed
+                await self.close_menus()
             found = (await self.alerts()).get(kind)
             if found:
                 reply = await self.step("snapshot", "snapshot")
@@ -94,14 +103,13 @@ class Run:
         """Leave every non-HUD menu so the game is running again; a menu left open pauses game time."""
         for _ in range(4):
             try:
-                open_menus = [m for m in json.loads(await self.tool("list_menus")) if m not in AMBIENT]
+                open_menus = [m for m in parse(await self.tool("list_menus")) if m not in AMBIENT]
             except Exception:
                 return
             if not open_menus:
                 return
             for menu in open_menus:
                 await self.step("close " + menu, "close_menu", name=menu)
-            await self.step("cancel", "press_control", name="Cancel")
             await asyncio.sleep(1.0 * min(1.0, self.scale))
 
     async def hostile(self):
