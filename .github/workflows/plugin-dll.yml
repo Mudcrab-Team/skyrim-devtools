@@ -1,0 +1,138 @@
+# Builds SkyrimDevTools.dll with the CMake steps in README.md ("Windows build") and uploads it.
+# windows-2022 provides Visual Studio 2022. windows-latest moved to a newer Visual Studio.
+name: Plugin DLL
+
+on:
+  pull_request:
+    paths: [native/**, tools/pc-build, .github/workflows/plugin-dll.yml]
+  push:
+    branches: [main]
+    paths: [native/**, tools/pc-build, .github/workflows/plugin-dll.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plugin-dll-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      # The pins in README.md. nlohmann/json 3.12.0 comes from the pinned vcpkg tree.
+      COMMONLIB_COMMIT: 7c27a75da3eb0db080c1f1f63f6df1b7cd733c2a
+      HTTPLIB_COMMIT: 7800c3dc5b33285cbb18baa5998de4ff7ef63515
+      # vcpkg tag 2026.10.16. README.md names its annotated tag object (5d4a3dc).
+      VCPKG_COMMIT: 9eec002df1cd109f8f104cd966a763daf9751489
+      JSON_VERSION: 3.12.0
+      TRIPLET: x64-windows-static-md
+      VCPKG_ROOT: ${{ github.workspace }}/deps/vcpkg
+      SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Keep the committed line endings (the build id hashes native/)
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: plugin
+          ref: ${{ env.SOURCE_COMMIT }}
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: alandtse/CommonLibSSE-NG
+          ref: ${{ env.COMMONLIB_COMMIT }}
+          path: deps/commonlib
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: yhirose/cpp-httplib
+          ref: ${{ env.HTTPLIB_COMMIT }}
+          path: deps/httplib
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: microsoft/vcpkg
+          ref: ${{ env.VCPKG_COMMIT }}
+          path: deps/vcpkg
+          persist-credentials: false
+
+      - name: Bootstrap vcpkg
+        run: ./deps/vcpkg/bootstrap-vcpkg.bat -disableMetrics
+
+      - name: Install dependencies
+        run: >-
+          ./deps/vcpkg/vcpkg.exe install --triplet $env:TRIPLET
+          directxmath directxtk fmt minhook nlohmann-json rapidcsv spdlog
+
+      - name: Check the nlohmann/json version
+        run: |
+          $listed = ./deps/vcpkg/vcpkg.exe list nlohmann-json
+          $listed
+          if (-not ($listed -match "\s$([regex]::Escape($env:JSON_VERSION))(#\d+)?\s")) {
+            throw "Expected nlohmann-json $env:JSON_VERSION"
+          }
+
+      - name: Stamp the build id
+        working-directory: plugin
+        shell: python
+        run: |
+          import pathlib, runpy
+          tool = runpy.run_path("tools/pc-build")
+          build_id = tool["build_id"](tool["scan"]())
+          pathlib.Path("native/build_id.h").write_text(f'#define DEVTOOLS_BUILD_ID "{build_id}"\n')
+          print(build_id)
+
+      - name: Configure
+        run: >-
+          cmake -S plugin/native -B build -G "Visual Studio 17 2022" -A x64
+          "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_MANIFEST_MODE=OFF "-DVCPKG_TARGET_TRIPLET=$env:TRIPLET"
+          "-DCOMMONLIB_SOURCE=${{ github.workspace }}/deps/commonlib"
+          "-DHTTPLIB_SOURCE=${{ github.workspace }}/deps/httplib"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Collect the DLL, licences and checksums
+        run: |
+          New-Item -ItemType Directory artifact/licenses | Out-Null
+          Copy-Item build/Release/SkyrimDevTools.dll artifact/
+          Copy-Item plugin/LICENSE, plugin/licenses/*.txt artifact/licenses/
+          Get-ChildItem "$env:VCPKG_ROOT/installed/$env:TRIPLET/share/*/copyright" | ForEach-Object {
+            Copy-Item $_ "artifact/licenses/$($_.Directory.Name).txt"
+          }
+          Copy-Item deps/httplib/LICENSE artifact/licenses/cpp-httplib.txt
+          Get-ChildItem deps/commonlib/LICENSE*, deps/commonlib/COPYING*, deps/commonlib/EXCEPTIONS* -ErrorAction SilentlyContinue |
+            ForEach-Object { Copy-Item $_ "artifact/licenses/CommonLibSSE-NG-$($_.Name)" }
+          $stamp = (Get-Content plugin/native/build_id.h -Raw).Trim() -replace '.*"(.*)"', '$1'
+          @(
+            "source: https://github.com/${{ github.repository }}/tree/$env:SOURCE_COMMIT"
+            "plugin build id: $stamp"
+            "runtime: Skyrim SE 1.7.104, SKSE 2.3.1"
+            "CommonLibSSE-NG: $env:COMMONLIB_COMMIT"
+            "cpp-httplib: $env:HTTPLIB_COMMIT"
+            "vcpkg: $env:VCPKG_COMMIT (nlohmann-json $env:JSON_VERSION)"
+          ) | Set-Content artifact/BUILD.txt
+          $hash = (Get-FileHash artifact/SkyrimDevTools.dll).Hash.ToLowerInvariant()
+          # LF only, so that sha256sum and shasum can check the file on any system.
+          "$hash  SkyrimDevTools.dll`n" | Set-Content artifact/SHA256SUMS -NoNewline
+          Get-Content artifact/BUILD.txt, artifact/SHA256SUMS
+
+      - name: Verify the checksum file
+        shell: bash
+        working-directory: artifact
+        run: sha256sum --strict --check SHA256SUMS && ! grep -q $'\r' SHA256SUMS
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: SkyrimDevTools-1.7.104
+          path: artifact
+          if-no-files-found: error
+          retention-days: 14
