@@ -16,6 +16,8 @@ namespace devtools::nav
         bool found = false;                // the start lies on a loaded navmesh
         bool complete = false;             // reaches the goal; otherwise ends nearest to it
         bool goalOnMesh = false;           // the goal lies on a loaded navmesh
+        double startLevelZ = 0.0;          // plane height of the start / goal triangle at the point; NaN when none
+        double goalLevelZ = 0.0;
         std::size_t expanded = 0;
         std::size_t triangles = 0;
         std::size_t meshes = 0;
