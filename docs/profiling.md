@@ -155,9 +155,22 @@ frames is counted as stale and dropped. It is plain D3D11, so it works the same 
   early as the data allows. When the GPU ran behind the CPU in every frame of the profile, the true GPU times
   are later than drawn. Durations are exact; positions are a lower bound.
 * **Bound**: per frame, `cpu_ms` is the main thread's on-CPU samples inside the frame and `gpu_ms` the
-  frame's GPU span. A frame is `capped` when both are under 85% of the frame time (vsync or the frame limiter
-  set the pace), otherwise `gpu` when `gpu_ms > cpu_ms` and `cpu` when not. The main thread's busy wait in
-  the frame limiter counts as CPU, so a capped game can read `cpu`; compare `frame_ms` with the target rate.
+  frame's GPU span (frame-start stamp to the Present stamp). The span is not GPU busy time: timestamps keep
+  advancing while the GPU waits for the CPU's next commands, so a game that sleeps in its frame limiter
+  between draws (or a vsync-capped one) shows a GPU span as long as the frame. The classifier therefore:
+  1. compares the GPU span with the CPU's issue span for the same stamps (`excess_ms` = `gpu_ms` minus
+     the time between issuing the frame-start and the Present stamp). Under max(1 ms, 10% of the frame)
+     the GPU kept up with the submissions and was not the limiter (`paced`); pass times of such frames
+     include that waiting. The wait for the flip (vsync) lies between frames, outside the span, because the
+     frame-start stamp is issued after Present returns;
+  2. calls a frame GPU-busy when it was not paced and `gpu_ms` is at least 85% of the frame;
+  3. cross-checks with GPU utilisation where known (`util_pct`, from the WDDM engine counter;
+     `profile_gpu.util_series` is the hook a vendor board reading feeds): under 60% rules GPU-bound out,
+     85% or more rules it in even for a paced frame (the CPU then stalls on a GPU sync inside the frame);
+  4. labels the frame `gpu` when GPU-busy, `cpu` when the main thread was on-CPU for 85% of the frame
+     (the larger wins when both), and otherwise `capped` (vsync or the frame limiter set the pace).
+  `gpu_busy_ms` is the span for frames that were not paced and `util_pct` x `frame_ms` for paced ones.
+  `top` has no per-frame issue span, so it relies on the utilisation reading for the same decision.
 * **Overhead**: about 35 queries per frame and two hooked context calls; `hookUs` per frame is in the
   report. The CPU overhead budget (under 3% fps at 1 kHz) includes it.
 * **Counters**: profiles also carry page faults/s, I/O MB/s, process CPU, working set and free memory every
@@ -183,7 +196,7 @@ profile. The layout follows Nsight Systems' export. Times are milliseconds from 
 | `Meta` | key, value: plugin build, sample rate, symbol sources, credits, GPU alignment offset |
 | `StringIds` | id, value: every name, module and label once |
 | `ThreadNames` | threadId, nameId, isMain, isFrameThread, onCpuSamples, waitingSamples |
-| `Frames` | frame, start, end, frame_ms, cpu_ms, gpu_ms, gpu_start, gpu_end, hitch, bound |
+| `Frames` | frame, start, end, frame_ms, cpu_ms, gpu_ms, gpu_start, gpu_end, hitch, bound, excess_ms, gpu_busy_ms, util_pct |
 | `CpuSamples` | timestamp, threadId, callchainId, state (`running`/`waiting`), weight (samples in the run), end |
 | `Callchains` | id, depth (0 = leaf), symbolId, moduleId |
 | `Symbols` | id, rva, nameId, moduleId, kind (module kind), sourceId (where the name came from) |
@@ -207,10 +220,10 @@ WHERE f.hitch = 1
 GROUP BY s.id ORDER BY samples DESC LIMIT 20;
 ```
 
-Frames where the GPU took longer than the CPU:
+Frames where the GPU fell behind the CPU:
 
 ```sql
-SELECT frame, frame_ms, cpu_ms, gpu_ms, bound FROM Frames WHERE gpu_ms > cpu_ms ORDER BY gpu_ms DESC;
+SELECT frame, frame_ms, cpu_ms, gpu_ms, excess_ms, bound FROM Frames WHERE bound = 'gpu' ORDER BY gpu_ms DESC;
 ```
 
 What ran during cell loads:

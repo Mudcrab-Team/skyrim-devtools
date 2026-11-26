@@ -70,12 +70,62 @@ def _busy_series(profile):
     return times, period
 
 
+BOUND_SHARE = 0.85      # a side that is busy for this share of the frame sets its pace
+PACE_TOLERANCE_MS = 1.0  # GPU span within this of the CPU's issue span: the GPU kept up with the CPU
+UTIL_IDLE_PCT = 60.0     # board utilisation below this rules out a GPU-bound frame
+UTIL_BUSY_PCT = 85.0     # and above this marks one even when the GPU followed the CPU (sync stalls)
+BOUND_LABELS = {"gpu": "gpu", "cpu": "cpu", "capped": "capped (vsync or frame limiter)"}
+
+
+def classify(frame_ms, cpu_ms, gpu_ms, excess_ms=None, util_pct=None):
+    """Which side set the frame's pace: gpu, cpu or capped.
+
+    The GPU span alone cannot tell: timestamps advance while the GPU waits for the CPU's next commands, so
+    a game that sleeps in its frame limiter between draws shows a GPU span as long as the frame. `excess_ms`
+    (GPU span minus the CPU's span from the frame-start stamp to Present) says whether the GPU fell behind;
+    near zero it only followed the CPU. Board utilisation, when known, overrides both ways."""
+    if not frame_ms or frame_ms <= 0 or gpu_ms is None:
+        return None
+    tolerance = max(PACE_TOLERANCE_MS, 0.1 * frame_ms)
+    paced = excess_ms is not None and excess_ms < tolerance
+    gpu_busy = not paced and gpu_ms >= BOUND_SHARE * frame_ms
+    if util_pct is not None:
+        if util_pct < UTIL_IDLE_PCT:
+            gpu_busy = False
+        elif util_pct >= UTIL_BUSY_PCT:
+            gpu_busy = True
+    cpu_busy = cpu_ms is not None and cpu_ms >= BOUND_SHARE * frame_ms
+    if gpu_busy and cpu_busy:
+        return "gpu" if gpu_ms > cpu_ms else "cpu"
+    if gpu_busy:
+        return "gpu"
+    return "cpu" if cpu_busy else "capped"
+
+
+def util_series(raw):
+    """Sorted [(ms, GPU utilisation %)] for the classifier's cross-check: the WDDM engine counter here; a
+    vendor board reading, where a build records one, is preferred by extending this function."""
+    return sorted((row[0], row[1]) for row in raw.get("gpuCounters") or [] if len(row) > 1 and row[1] is not None)
+
+
+def _util_at(series, times, at, within=2000.0):
+    """The utilisation sample covering `at`: counters are rates over the preceding interval, so the first
+    sample at or after it."""
+    i = bisect.bisect_left(times, at)
+    if i < len(series) and series[i][0] - at <= within:
+        return series[i][1]
+    return None
+
+
 def frame_table(profile):
-    """One row per presented frame: start/end (ms), frame ms, sampled main-thread CPU ms, GPU ms and which
-    side bounded it (gpu, cpu, or capped when both finished well inside the frame)."""
+    """One row per presented frame: start/end (ms), frame ms, sampled main-thread CPU ms, GPU span ms, how much
+    longer the GPU took than the CPU issued for (excessMs), the utilisation reading, a GPU busy estimate and
+    which side set the pace (see classify)."""
     raw = profile.raw
     by_frame = {g["frame"]: g for g in gpu_frames(raw)[0]}
     busy, period = _busy_series(profile)
+    util = util_series(raw)
+    util_times = [u[0] for u in util]
     hitch_ms = raw.get("hitchThresholdMs", 100.0)
     rows = []
     for start, end, frame in raw.get("frameMarks", []):
@@ -83,15 +133,19 @@ def frame_table(profile):
         gpu = by_frame.get(frame)
         frame_ms = end - start
         gpu_ms = gpu["gpuMs"] if gpu else None
-        bound = None
-        if gpu_ms is not None and frame_ms > 0:
-            if max(cpu_ms, gpu_ms) < 0.85 * frame_ms:
-                bound = "capped"
-            else:
-                bound = "gpu" if gpu_ms > cpu_ms else "cpu"
+        excess = round(gpu_ms - (gpu["cpuEnd"] - gpu["cpuBegin"]), 3) if gpu else None
+        util_pct = _util_at(util, util_times, end) if gpu else None
+        paced = excess is not None and excess < max(PACE_TOLERANCE_MS, 0.1 * frame_ms)
+        if gpu_ms is None:
+            busy_ms = None
+        elif not paced:
+            busy_ms = gpu_ms
+        else:
+            busy_ms = round(min(gpu_ms, util_pct / 100.0 * frame_ms), 3) if util_pct is not None else None
         rows.append({"frame": frame, "start": start, "end": end, "frameMs": round(frame_ms, 3), "cpuMs": round(cpu_ms, 3),
                      "gpuMs": gpu_ms, "gpuStart": gpu["gpuStart"] if gpu else None, "gpuEnd": gpu["gpuEnd"] if gpu else None,
-                     "hitch": frame_ms > hitch_ms, "bound": bound})
+                     "excessMs": excess, "paced": paced if gpu else None, "utilPct": util_pct, "gpuBusyMs": busy_ms,
+                     "hitch": frame_ms > hitch_ms, "bound": classify(frame_ms, cpu_ms, gpu_ms, excess, util_pct)})
     return rows
 
 
@@ -118,6 +172,10 @@ def gpu_summary(profile, top=10):
         "gpuMsMax": round(max(f["gpuMs"] for f in frames), 3),
         "cpuMsP50": _pct([r["cpuMs"] for r in table], 0.5), "frameMsP50": _pct([r["frameMs"] for r in table], 0.5),
         "boundPct": {k: round(100.0 * bounds.count(k) / len(bounds), 1) for k in ("gpu", "cpu", "capped")} if bounds else {},
+        "pacedPct": round(100.0 * sum(1 for r in table if r["paced"]) / len(table), 1) if table else None,
+        "excessMsP50": _pct([r["excessMs"] for r in table], 0.5),
+        "gpuBusyMsP50": _pct([r["gpuBusyMs"] for r in table if r["gpuBusyMs"] is not None], 0.5),
+        "utilPctMean": round(sum(us) / len(us), 1) if (us := [r["utilPct"] for r in table if r["utilPct"] is not None]) else None,
         "hookUsPerFrame": round(median(f["hookUs"] for f in frames), 1),
         "passes": [{"pass": label, "kind": kind, "msPerFrame": round(ms / len(frames), 3), "pct": round(100.0 * ms / total_gpu, 1)}
                    for label, (kind, ms) in sorted(passes.items(), key=lambda p: -p[1][1])[:top]],
@@ -148,3 +206,62 @@ def counter_series(raw):
             out.append((at, "gpu_vram_mb", vram))
     out.sort(key=lambda r: (r[0], r[1]))
     return out
+
+
+GPU_FRAME_SCHEMA = {
+    "name": "GpuFrame", "display": ["marker-chart", "marker-table", "timeline-overview"],
+    "chartLabel": "GPU {marker.data.frame}: {marker.data.bound}",
+    "tooltipLabel": "GPU frame {marker.data.frame} ({marker.data.bound})",
+    "tableLabel": "GPU frame {marker.data.frame}: {marker.data.gpuMs} ms, {marker.data.bound}",
+    "data": [{"key": "frame", "label": "Frame", "format": "integer", "searchable": True},
+             {"key": "gpuMs", "label": "GPU span", "format": "milliseconds"},
+             {"key": "gpuBusyMs", "label": "GPU busy (estimate)", "format": "milliseconds"},
+             {"key": "cpuMs", "label": "Main thread on-CPU", "format": "milliseconds"},
+             {"key": "excessMs", "label": "GPU span - CPU issue span", "format": "milliseconds"},
+             {"key": "utilPct", "label": "GPU utilisation %", "format": "decimal"},
+             {"key": "bound", "label": "Bound by", "format": "string", "searchable": True}]}
+GPU_PASS_SCHEMA = {
+    "name": "GpuPass", "display": ["marker-chart", "marker-table"],
+    "chartLabel": "{marker.data.pass}", "tooltipLabel": "{marker.data.pass} ({marker.data.kind})",
+    "tableLabel": "{marker.data.pass} ({marker.data.kind}) {marker.data.ms} ms",
+    "data": [{"key": "pass", "label": "Pass", "format": "string", "searchable": True},
+             {"key": "kind", "label": "Kind", "format": "string", "searchable": True},
+             {"key": "frame", "label": "Frame", "format": "integer"},
+             {"key": "ms", "label": "Span", "format": "milliseconds"}]}
+
+
+def firefox_tracks(export, profile):
+    """GPU frames and passes as markers on the main thread (positions are the aligned lower bound, see
+    gpu_frames), GPU frame time and utilisation as counter tracks."""
+    frames, _ = gpu_frames(profile.raw)
+    if not frames:
+        return
+    rows = {r["frame"]: r for r in frame_table(profile)}
+    export.marker_schema(GPU_FRAME_SCHEMA)
+    export.marker_schema(GPU_PASS_SCHEMA)
+    markers = []
+    for f in frames:
+        row = rows.get(f["frame"], {})
+        markers.append((f"GPU frame {f['frame']}", f["gpuStart"], f["gpuEnd"],
+                        {"type": "GpuFrame", "frame": f["frame"], "gpuMs": f["gpuMs"], "gpuBusyMs": row.get("gpuBusyMs"),
+                         "cpuMs": row.get("cpuMs"), "excessMs": row.get("excessMs"), "utilPct": row.get("utilPct"),
+                         "bound": BOUND_LABELS.get(row.get("bound"), "untimed")}))
+        merged = []
+        for label, kind, start, end in f["passes"]:
+            if label == "frame" and end - start < 0.01:
+                continue
+            # A pass reopened by another clear of the same target stays one span in the chart.
+            if merged and merged[-1][0] == label and abs(merged[-1][3] - start) < 1e-6:
+                merged[-1][3] = end
+            else:
+                merged.append([label, kind, start, end])
+        for label, kind, start, end in merged:
+            markers.append((label, start, end, {"type": "GpuPass", "pass": label, "kind": kind, "frame": f["frame"],
+                                                "ms": round(end - start, 3)}))
+    export.add_markers(markers)
+    export.add_counter("gpu_frame_ms", "GPU frame ms", [f["gpuEnd"] for f in frames], [f["gpuMs"] for f in frames],
+                       unit="ms", color="orange", description="GPU span of each timed frame (frame start to Present)")
+    util = util_series(profile.raw)
+    if util:
+        export.add_counter("gpu_util_pct", "GPU util", [u[0] for u in util], [u[1] for u in util], unit="percent",
+                           color="red", description="GPU engine utilisation")

@@ -588,11 +588,12 @@ if __name__ == "__main__":
 
 def gpu_raw():
     raw = raw_profile(RUNS)
-    # GPU clock reads 1000 s less than the CPU clock; the tightest issue bound puts frame 1 at 0-15 ms.
+    # GPU clock reads 1000 s less than the CPU clock; the tightest issue bound puts frame 1 at 0-15 ms. The CPU
+    # issued frame 1 in 5 ms and the GPU took 15, so the GPU fell behind (GPU-bound); frame 2 only followed it.
     raw["gpu"] = {"available": True, "reason": "", "backbuffer": [1920, 1080],
                   "labels": ["frame", "present", "dsv 2048x2048 array", "rtv 1920x1080", "rtv 960x540"],
                   "disjointFrames": 0, "staleFrames": 0,
-                  "frames": [[1, 0.0, 15.0, 4.0, 0, [[0, -999.9995], [2, -999.998], [3, -999.994], [4, -999.990], [1, -999.9845]]],
+                  "frames": [[1, 0.0, 5.0, 4.0, 0, [[0, -999.9995], [2, -999.998], [3, -999.994], [4, -999.990], [1, -999.9845]]],
                              [2, 16.0, 149.0, 4.0, 0, [[0, -999.8508], [3, -999.8506], [1, -999.8505]]]]}
     raw["counters"] = [[0.0, 100, 2 << 30, 0, 0, 0, 8 << 30], [250.0, 150, 2 << 30, 1 << 20, 0, 1_250_000, 8 << 30]]
     raw["gpuCounters"] = [[500.0, 70.0, 2048.0]]
@@ -631,6 +632,11 @@ class GpuTests(unittest.TestCase):
         self.assertEqual(rows[0]["bound"], "gpu")
         self.assertTrue(rows[1]["hitch"])
         self.assertEqual(rows[1]["bound"], "capped")
+        self.assertEqual(rows[0]["excessMs"], 10.0)
+        self.assertFalse(rows[0]["paced"])
+        self.assertEqual(rows[0]["gpuBusyMs"], 15.0)
+        self.assertTrue(rows[1]["paced"])
+        self.assertEqual(rows[1]["utilPct"], 70.0)
         gpu = self.profile.summary()["gpu"]
         self.assertEqual(gpu["frames"], 2)
         self.assertEqual(gpu["timedPct"], 100.0)
@@ -687,7 +693,7 @@ class GpuTests(unittest.TestCase):
         self.assertEqual(len(blocks), 3)
         results = [query(path, sql.strip().rstrip(";")) for sql in blocks]
         self.assertEqual(results[0]["rows"], [])
-        self.assertEqual([r[0] for r in results[1]["rows"]], [1, 2])
+        self.assertEqual([r[0] for r in results[1]["rows"]], [1])
         self.assertEqual(results[2]["rows"][0][0], "Beta::Tick (guess)")
 
     def test_query_is_read_only(self):
@@ -715,7 +721,41 @@ class GpuTests(unittest.TestCase):
         paths, _ = profiling.save_outputs(self.profile, self.root / "saved")
         self.assertTrue(Path(paths["sqlite"]).is_file())
 
+    def test_classify_vsync_capped(self):
+        from skyrim_devtools.profile_gpu import classify
+
+        # A 60 fps capped frame: the GPU span fills the frame only because it followed a sleeping CPU.
+        self.assertEqual(classify(16.7, 5.0, 16.2, excess_ms=-0.2), "capped")
+        self.assertEqual(classify(16.7, 5.0, 16.2, excess_ms=None, util_pct=24.0), "capped")
+        self.assertEqual(classify(16.7, 5.0, 16.2, excess_ms=11.0, util_pct=24.0), "capped")
+        self.assertEqual(classify(16.7, 5.0, 16.2, excess_ms=11.0), "gpu")
+        self.assertEqual(classify(16.7, 5.0, 16.2, excess_ms=-0.2, util_pct=97.0), "gpu")
+        self.assertEqual(classify(16.7, 16.0, 16.2, excess_ms=-0.2), "cpu")
+        self.assertEqual(classify(33.0, 31.0, 30.0, excess_ms=12.0), "cpu")
+        self.assertIsNone(classify(16.7, 5.0, None))
+
+    def test_firefox_gpu_tracks(self):
+        from skyrim_devtools import profile_firefox
+
+        data = profiling.profile_firefox_data(self.profile)
+        self.assertEqual(profile_firefox.check(data), [])
+        self.assertIn("GpuFrame", {s["name"] for s in data["meta"]["markerSchema"]})
+        main = data["threads"][0]
+        kinds = [d.get("type") for d in main["markers"]["data"] if d]
+        self.assertEqual(kinds.count("GpuFrame"), 2)
+        self.assertIn("GpuPass", kinds)
+        bounds = [d["bound"] for d in main["markers"]["data"] if d and d.get("type") == "GpuFrame"]
+        self.assertEqual(bounds, ["gpu", "capped (vsync or frame limiter)"])
+        self.assertEqual([c["name"] for c in data["counters"]], ["gpu_frame_ms", "gpu_util_pct"])
+
+    def test_report_names_capped(self):
+        text = profiling.render_text(self.profile.summary())
+        self.assertIn("capped (vsync or frame limiter) 50.0%", text)
+        self.assertIn("kept up with the CPU's submissions in 50.0% of frames", text)
+
     def test_top_gpu_timing(self):
         timing = profile_views._gpu_timing({"frames": 50, "gpuMsP50": 15.5, "gpuMsP95": 16.0, "passes": []}, 16.6, 0.5)
         self.assertEqual(timing["cpuMsP50"], 8.3)
         self.assertEqual(timing["bound"], "gpu")
+        capped = profile_views._gpu_timing({"frames": 50, "gpuMsP50": 16.2, "passes": []}, 16.7, 0.3, util_pct=24.0)
+        self.assertEqual(capped["bound"], "capped")

@@ -901,8 +901,16 @@ def render_text(summary, top=10):
             lines.append(f"== GPU: {gpu['frames']} of {gpu['presented']} frames timed; gpu p50 {gpu['gpuMsP50']} ms, p95 "
                          f"{gpu['gpuMsP95']} ms, max {gpu['gpuMsMax']} ms; main-thread cpu p50 {gpu['cpuMsP50']} ms; "
                          f"frame p50 {gpu['frameMsP50']} ms")
-            lines.append("bound by: " + ", ".join(f"{k} {v}%" for k, v in gpu["boundPct"].items()) +
+            from .profile_gpu import BOUND_LABELS
+
+            lines.append("bound by: " + ", ".join(f"{BOUND_LABELS[k]} {v}%" for k, v in gpu["boundPct"].items()) +
                          f"; timing cost {gpu['hookUsPerFrame']} us/frame")
+            if gpu.get("pacedPct"):
+                busy = gpu.get("gpuBusyMsP50")
+                lines.append(f"the GPU kept up with the CPU's submissions in {gpu['pacedPct']}% of frames (GPU span "
+                             f"minus CPU issue span p50 {gpu.get('excessMsP50')} ms), so pass times there include "
+                             f"waiting for commands; GPU busy p50 ~{busy if busy is not None else '-'} ms"
+                             + (f" from {gpu['utilPctMean']}% utilisation" if gpu.get("utilPctMean") is not None else ""))
             for r in gpu["passes"]:
                 lines.append(f"  {r['pct']:6.2f}%  {r['msPerFrame']:7.3f} ms  {r['pass']}  ({r['kind']})")
     for hitch in summary.get("hitches", [])[:10]:
@@ -1021,34 +1029,6 @@ async def record(args):
             await manager.stop()
 
 
-def export_command(args, symbols):
-    from . import profile_firefox
-
-    source = Path(args.profile)
-    out = Path(args.firefox) if args.firefox else (source if source.is_dir() else source.parent) / "profile.json.gz"
-    data = profile_firefox_data(Profile(load_raw(source), symbols))
-    problems = profile_firefox.check(data)
-    if problems:
-        raise SystemExit("Firefox export failed its checks: " + "; ".join(problems))
-    profile_firefox.write(data, out)
-    print(f"wrote {out}")
-    if args.open:
-        server, url = profile_firefox.serve(out, open_browser=not args.no_browser)
-        print(f"serving on 127.0.0.1 for {url}\n(the browser reads it from this machine; do not press Upload). Ctrl+C stops.")
-        try:
-            while True:
-                time.sleep(3600)
-        except KeyboardInterrupt:
-            server.shutdown()
-            server.server_close()
-    return 0
-
-
-def profile_firefox_data(profile):
-    """The Firefox profile with everything this build records; save_outputs and export share it."""
-    return profile.firefox().build()
-
-
 async def top(args):
     from .profile_views import render_top, top_snapshot
     from .use.manager import GameManager
@@ -1081,6 +1061,51 @@ async def top(args):
             load.cancel()
         if not args.keep:
             await manager.stop()
+
+
+def export_command(args, symbols):
+    from . import profile_firefox
+
+    source = Path(args.profile)
+    raw = load_raw(source)
+    if args.recorder and raw.get("startEpochMs"):
+        from .profile_views import recorder_marks
+
+        raw.setdefault("marks", []).extend(recorder_marks(args.recorder, raw["startEpochMs"], raw.get("durationS", 0) * 1000.0))
+    profile = Profile(raw, symbols)
+    if args.sqlite:
+        from .profile_sqlite import export_sqlite
+
+        counts = export_sqlite(profile, args.sqlite)
+        print(json.dumps({"sqlite": str(args.sqlite), "rows": counts}))
+        if not args.firefox and not args.open:
+            return 0
+    out = Path(args.firefox) if args.firefox else (source if source.is_dir() else source.parent) / "profile.json.gz"
+    data = profile_firefox_data(profile)
+    problems = profile_firefox.check(data)
+    if problems:
+        raise SystemExit("Firefox export failed its checks: " + "; ".join(problems))
+    profile_firefox.write(data, out)
+    print(f"wrote {out}")
+    if args.open:
+        server, url = profile_firefox.serve(out, open_browser=not args.no_browser)
+        print(f"serving on 127.0.0.1 for {url}\n(the browser reads it from this machine; do not press Upload). Ctrl+C stops.")
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            server.shutdown()
+            server.server_close()
+    return 0
+
+
+def profile_firefox_data(profile):
+    """The Firefox profile with everything this build records; save_outputs and export share it."""
+    from .profile_gpu import firefox_tracks
+
+    export = profile.firefox()
+    firefox_tracks(export, profile)
+    return export.build()
 
 
 def main(argv=None):

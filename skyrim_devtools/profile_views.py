@@ -11,6 +11,7 @@ from pathlib import Path
 import time
 
 from . import profiling
+from .profile_gpu import BOUND_LABELS, classify
 
 KIND_ORDER = ("load", "hitch", "alert", "narrate", "tool", "rpc", "menu", "marker")
 
@@ -73,7 +74,8 @@ async def top_snapshot(call, symbols=None, seconds=3.0, top=15):
         "memory": raw.get("memory"), "threads": raw.get("threads"), "gpu": raw.get("gpu"),
         "costMs": {**(raw.get("costMs") or {}), "resolve": raw.get("resolveMs"), "rpc": round(rpc_ms, 1),
                    "resolverRebuilt": bool(raw.get("resolverRebuilt"))},
-        "gpuTiming": _gpu_timing(raw.get("gpuTiming"), stats.get("p50Ms"), on_cpu / samples if samples else None),
+        "gpuTiming": _gpu_timing(raw.get("gpuTiming"), stats.get("p50Ms"), on_cpu / samples if samples else None,
+                                 (raw.get("gpu") or {}).get("utilPct")),
     }
     credits = profile.credits()
     if credits:
@@ -81,8 +83,11 @@ async def top_snapshot(call, symbols=None, seconds=3.0, top=15):
     return snapshot
 
 
-def _gpu_timing(timing, frame_ms, busy_share):
-    """GPU frame time next to the main thread's sampled busy time per frame, and which one limits the frame."""
+def _gpu_timing(timing, frame_ms, busy_share, util_pct=None):
+    """GPU frame time next to the main thread's sampled busy time per frame, and which one limits the frame.
+    The live summary has no per-frame CPU issue span, so the utilisation reading is what tells a capped game
+    from a GPU-bound one here."""
+
     if not timing:
         return None
     out = dict(timing)
@@ -90,7 +95,7 @@ def _gpu_timing(timing, frame_ms, busy_share):
     cpu_ms = round(frame_ms * busy_share, 2) if frame_ms and busy_share is not None else None
     out["cpuMsP50"] = cpu_ms
     if gpu_ms is not None and cpu_ms is not None and frame_ms:
-        out["bound"] = "capped" if max(gpu_ms, cpu_ms) < 0.85 * frame_ms else ("gpu" if gpu_ms > cpu_ms else "cpu")
+        out["bound"] = classify(frame_ms, cpu_ms, gpu_ms, timing.get("excessMsP50"), util_pct)
     return out
 
 
@@ -136,7 +141,7 @@ def render_top(snap, width=110):
     if timing.get("frames"):
         passes = ", ".join(f"{p['pass']} {p['msPerFrame']}" for p in (timing.get("passes") or [])[:4])
         out.append(f"GPU frame  p50 {timing.get('gpuMsP50')} ms  p95 {timing.get('gpuMsP95')} ms   main CPU ~{timing.get('cpuMsP50')} ms"
-                   f"   bound: {timing.get('bound') or '-'}   passes ms: {passes}")
+                   f"   bound: {BOUND_LABELS.get(timing.get('bound'), '-')}   passes ms: {passes}")
     elif timing:
         out.append(f"GPU frame  not timed ({timing.get('reason') or 'no frames yet'})")
     out.append("")
