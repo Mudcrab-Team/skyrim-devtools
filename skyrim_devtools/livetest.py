@@ -34,6 +34,13 @@ START_RETRY_WAIT = 25.0
 CRASH_MARKERS = ("game is gone", "no game is running", "connection lost")
 
 
+async def release_stray(manager):
+    """Stop a game nobody tracks and release the host's session lease (no-op for managers without a host)."""
+    stop = getattr(manager, "stop_stray", None)
+    if stop is not None:
+        await stop()
+
+
 class Request:
     def __init__(self, data, path):
         self.path = Path(path)
@@ -153,6 +160,10 @@ class Context:
     async def perf_check(self, seconds=10.0):
         return await perf_check(self.manager, seconds)
 
+    async def console_ref(self, ref, command):
+        """A console command on one reference (`<ref>.<command>`); `prid` does not persist between calls."""
+        return await self.client.console_ref(ref, command)
+
 
 async def perf_check(manager, seconds=10.0):
     frame = (await manager.call("Perf.frameStats")).get("frame", 0)
@@ -170,7 +181,10 @@ def last_json(text):
             try:
                 value = json.loads("\n".join(lines[index:]))
             except ValueError:
-                continue
+                try:
+                    value = json.loads(lines[index])  # a traceback printed after the result line
+                except ValueError:
+                    continue
             if isinstance(value, dict):
                 return value
     return None
@@ -215,9 +229,15 @@ async def run_script(ctx, script, root, timeout):
             sys.executable, str(path), *args, env=env, cwd=str(root), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         try:
             data, _ = await asyncio.wait_for(process.communicate(), timeout)
-        except asyncio.TimeoutError:
-            process.kill()
+        except BaseException:
+            # timeouts, errors and Ctrl-C all leave the script's game running unless it is stopped here
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+            await release_stray(ctx.manager)
             raise
+        # a script that exits (or crashes) without stopping its game would block the next start
+        await release_stray(ctx.manager)
         text = data.decode("utf-8", "replace")
         # the host refuses a start while the previous game is still shutting down
         if "Windows host start failed" not in text or attempt == START_RETRIES:
@@ -437,13 +457,17 @@ async def amain(options):
         print("no requests")
         return 1
     batch = Batch(manager, options.results, options.root, options.config, perf_save=options.perf_save)
+    finished = False
     try:
         await batch.run(requests, getattr(options, "case", None), options.case_timeout)
+        finished = True
     finally:
         for path in batch.write_reports(requests):
             print(f"report {path}")
-        if not options.keep:
+        # --keep is for a finished run; an exception or interrupt must never leave the game behind
+        if not options.keep or not finished:
             await manager.stop()
+            await release_stray(manager)
     for request in requests:
         print(summary_line(request, batch.outcomes.get(request.id, [])))
     return 1 if any(o["status"] not in {"pass", "manual"} for outs in batch.outcomes.values() for o in outs) else 0

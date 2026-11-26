@@ -20,6 +20,9 @@ from .health import HealthWatch
 KEEPALIVE_SECONDS = 15
 HEALTH_SAMPLE_SECONDS = 60
 START_RETRIES = 2
+# a launch that reaches the main menu late is a hung start (loading spinner that never closes), not a slow one
+STALL_RETRIES = 1
+MENU_TIMEOUT = 45
 VANITY_OFF_SECONDS = 86400.0
 EVENT_BUFFER = 5000
 # console lines are already returned by the console tool, so subscribing would only add noise
@@ -63,6 +66,10 @@ def plugin_report(info, methods):
 
 class GameError(RuntimeError):
     """A failure to report to the playtester as-is."""
+
+
+class StartStalled(GameError):
+    """The game was running but never reached the main menu."""
 
 
 def describe_rpc_error(error):
@@ -166,7 +173,8 @@ class GameManager:
             if self.alive:
                 return await self._status_locked(note="game already running; reusing the session")
             retries = []
-            for attempt in range(START_RETRIES + 1):
+            stalls = early_deaths = 0
+            while True:
                 await self._teardown()
                 self.reset()
                 self.phase = "starting"
@@ -175,8 +183,14 @@ class GameManager:
                     await self._launch(save)
                     break
                 except BaseException as error:
+                    if isinstance(error, StartStalled) and stalls < STALL_RETRIES:
+                        stalls += 1
+                        retries.append({"stalled": str(error)})
+                        await self._release_game()
+                        continue
                     early = await self._died_early(error)
-                    if early and attempt < START_RETRIES:
+                    if early and early_deaths < START_RETRIES:
+                        early_deaths += 1
                         retries.append(early)
                         await self._close_link()
                         continue
@@ -208,7 +222,19 @@ class GameManager:
         crash, self.crash = self.crash, None
         return crash
 
+    async def _release_game(self):
+        """Stop the hung game and wait until its process and files are released, so the relaunch is clean."""
+        await self._close_link()
+        if self.session_id:
+            with contextlib.suppress(Exception):
+                await self.host.stop(self.session_id, grace=5)
+        with contextlib.suppress(Exception):
+            await self.host.wait_idle()
+
     async def _launch(self, save):
+        with contextlib.suppress(Exception):
+            # the previous game may still be exiting; an older host script has no idle action
+            await self.host.wait_idle()
         bootstrap = await self.host.command("start", mode=self.mode)
         self.session_id, self.token, self.port = bootstrap["sessionId"], bootstrap["token"], bootstrap["port"]
         self.stale_cleared = list(bootstrap.get("staleCleared") or [])
@@ -227,7 +253,11 @@ class GameManager:
                     raise
                 await self._close_link()
                 await asyncio.sleep(1)
-        await observe(self._snapshot_raw, lambda s: any(m["name"] == "Main Menu" for m in s["menus"]), "Main menu", 60)
+        try:
+            await observe(self._snapshot_raw, lambda s: any(m["name"] == "Main Menu" for m in s["menus"]), "Main menu",
+                          self.config.get("menuTimeout", MENU_TIMEOUT))
+        except (TimeoutError, asyncio.TimeoutError) as error:
+            raise StartStalled("the game never reached the main menu (loading spinner did not close)") from error
         await self._quiet_vanity_camera()
         self.phase = "running"
         self.keepalive_task = asyncio.create_task(self._keepalive())
@@ -424,6 +454,11 @@ class GameManager:
                 await self._attach_crash_log(result)
                 outcome["crash"] = self.crash
             return outcome
+
+    async def stop_stray(self):
+        """Stop a game this manager does not track, such as one started by a script that has since died."""
+        with contextlib.suppress(Exception):
+            await self.host.stop_active()
 
     async def call(self, method, timeout=None, **params):
         """Call a native method; transparently recovers a dropped link once."""

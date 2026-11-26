@@ -1,0 +1,5 @@
+# Everything the unit tests import; the same set pyproject.toml declares.
+websockets==16.0
+mcp>=1.12,<2
+pyyaml>=6
+Pillow>=10.1
