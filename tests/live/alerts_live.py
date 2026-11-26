@@ -4,7 +4,7 @@ Each step does something that wastes time on purpose and waits for the matching 
 `alerts` field of a tool reply, then undoes it. Thresholds are lowered so the run is short. Prints one
 line per detector and the plugin's own per-tick cost.
 
-    python3.13 tools/scenarios/alerts_live.py --config devtools.json [--save Fixture]
+    python3.13 tests/live/alerts_live.py --config devtools.json [--save Fixture]
 """
 
 import argparse
@@ -159,8 +159,14 @@ async def scenario(config, save):
         print("SLOWCALLS", json.dumps({k: v for k, v in stats.get("slowCalls", {}).items() if "Alerts" in k}), flush=True)
         await run.tool("screenshot", max_width=640)
         print("TIMELINE", recorder.path, flush=True)
+        run.cost = final.get("cost") or {}
+        run.timeline = str(recorder.path)
     finally:
-        print("RESULTS", json.dumps(run.results), flush=True)
+        passed = sum(1 for r in run.results.values() if r.get("ok"))
+        cost = getattr(run, "cost", {})
+        ok = passed >= 5 and cost.get("mainMeanUs", 1e9) < 500
+        print(json.dumps({"pass": ok, "details": {"detectors": run.results, "passed": passed, "cost": cost,
+                                                  "timeline": getattr(run, "timeline", None)}}), flush=True)
         try:
             await run.tool("game_stop")
         except Exception as error:
