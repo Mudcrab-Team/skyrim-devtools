@@ -162,6 +162,51 @@ class ForeignBuildTests(unittest.TestCase):
         self.assertEqual(profile.functions[profile.frame_function[0]][0], "Alpha::Run")
 
 
+class PerBuildTablesTests(unittest.TestCase):
+    """A build with tables generated from its own PDB is named by RVA, with no Address Library table."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        write_symbols(self.root)
+        self.build = "sse-steam-1-6-1170"
+        tables = self.root / ".local" / "crashlogger_pdb" / self.build
+        (tables / "names").mkdir(parents=True)
+        (tables / "boundaries").mkdir()
+        (tables / "names" / "00.tsv").write_text("# toy\n9000\tToy::Other\n", encoding="utf-8")
+        (tables / "boundaries" / "00.tsv").write_text("9000\t40\n", encoding="utf-8")
+        (tables / "README.md").write_text("<!-- CRASHLOGGER_PDB(59818@2030.01.02) -->\n", encoding="utf-8")
+        self.symbols = profiling.GameSymbols(self.root)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def profile(self, build):
+        raw = raw_profile(RUNS)
+        raw["build"] = build
+        raw["frames"] = [{"m": 0, "rva": 0x9010, "start": 0x9000}, {"m": 0, "rva": 0x1010, "start": 0x1000}]
+        return profiling.Profile(raw, self.symbols)
+
+    def test_selected_by_build_without_flags(self):
+        profile = self.profile(self.build)
+        self.assertFalse(profile.foreign)
+        self.assertEqual([profile.functions[f][0] for f in profile.frame_function], ["Toy::Other", "sub_1000"])
+        credits = " ".join(profile.credits())
+        self.assertIn("CRASHLOGGER_PDB(59818@2030.01.02)", credits)
+        self.assertNotIn(profiling.CRASHLOGGER_CREDIT, credits)
+
+    def test_pinned_build_keeps_committed_tables(self):
+        profile = self.profile(profiling.SYMBOLS_BUILD)
+        self.assertEqual(profile.functions[profile.frame_function[1]][0], "Alpha::Run")
+
+    def test_build_without_tables_falls_back_to_bridging(self):
+        profile = self.profile("sse-steam-1-6-9999")
+        self.assertTrue(profile.foreign)
+
+    def test_build_name_cannot_escape_the_tables_directory(self):
+        self.assertIs(self.symbols.for_build("../../x"), self.symbols)
+
+
 class ProfileTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
