@@ -165,6 +165,13 @@ namespace
         RE::NiPoint3 progressPos;
         double progressAt = 0.0;
         int watchdogRounds = 0;
+        // Door approach: the door being walked to (a load door or an activate goal) is entered from a
+        // staging point in front of it, not from whichever side the path hugs.
+        RE::FormID stageFor = 0;
+        bool hasStage = false;
+        bool staged = false;
+        RE::NiPoint3 stage;
+        bool slowed = false;  // walking the last stretch to a door
         // Spots the player walked through, a few hundred units apart, to step back to when caught
         // in collision geometry that no key press gets out of.
         std::deque<RE::NiPoint3> trail;
@@ -222,15 +229,80 @@ namespace
         return p.goal.point;
     }
 
-    // Where the player is heading right now: the next via point, a load door, or the goal.
+    // The door this trip is walking up to, once the via points are used up: a load door chosen to
+    // change cells, or a door goal that is to be activated.
+    RE::TESObjectREFR* ApproachDoor(Process& p)
+    {
+        if (p.viaIndex < p.via.size()) {
+            return nullptr;
+        }
+        if (const auto door = LookupRef(p.door)) {
+            return door;
+        }
+        if (p.activate && p.goal.ref) {
+            const auto ref = LookupRef(p.goal.ref);
+            const auto base = ref ? ref->GetBaseObject() : nullptr;
+            if (base && base->Is(RE::FormType::Door)) {
+                return ref;
+            }
+        }
+        return nullptr;
+    }
+
+    constexpr double doorStageDistance = 130.0;
+    constexpr double doorActivateReach = 160.0;
+
+    // A point in front of the door on the side the player comes from, on the navmesh. Door models are
+    // thin along one of their two horizontal axes and which one depends on the model, so the four
+    // candidates along both are tried and only one on the navmesh and nearest the player is taken.
+    bool StagePoint(RE::TESObjectREFR& door, const RE::NiPoint3& from, RE::NiPoint3& out)
+    {
+        const auto at = door.GetPosition();
+        const double angle = door.GetAngleZ();
+        const double axes[2][2] = { { std::sin(angle), std::cos(angle) }, { std::cos(angle), -std::sin(angle) } };
+        double best = std::numeric_limits<double>::max();
+        bool found = false;
+        for (const auto& axis : axes) {
+            for (const double sign : { 1.0, -1.0 }) {
+                const RE::NiPoint3 candidate{ at.x + static_cast<float>(sign * axis[0] * doorStageDistance),
+                    at.y + static_cast<float>(sign * axis[1] * doorStageDistance), at.z };
+                if (!OnNavmesh(candidate)) {
+                    continue;
+                }
+                const auto d = Dist2D(candidate, from);
+                if (d < best) {
+                    best = d;
+                    out = candidate;
+                    found = true;
+                }
+            }
+        }
+        return found;
+    }
+
+    // Where the player is heading right now: the next via point, the staging point or the face of a
+    // door, or the goal.
     RE::NiPoint3 CurrentTarget(Process& p, double& radius)
     {
         if (p.viaIndex < p.via.size()) {
             radius = p.global ? 400.0 : 250.0;
             return p.via[p.viaIndex];
         }
-        if (const auto door = LookupRef(p.door)) {
-            radius = 110.0;
+        if (const auto door = ApproachDoor(p)) {
+            if (p.stageFor != door->GetFormID()) {
+                p.stageFor = door->GetFormID();
+                p.staged = false;
+                p.hasStage = false;
+                if (const auto player = RE::PlayerCharacter::GetSingleton()) {
+                    p.hasStage = StagePoint(*door, player->GetPosition(), p.stage);
+                }
+            }
+            if (p.hasStage && !p.staged) {
+                radius = 60.0;
+                return p.stage;
+            }
+            // From the staging point the door is in reach: activate it rather than walk into it.
+            radius = p.staged ? doorActivateReach : (p.door ? 110.0 : p.goal.radius);
             return door->GetPosition();
         }
         radius = p.goal.radius;
@@ -713,6 +785,48 @@ namespace
 
     // Pure pursuit: aim at the point `distance` ahead along the path rather than at the next
     // corner, which turns early and smoothly instead of overshooting each waypoint.
+    // How far the route turns at waypoint i, in degrees (0 at its ends).
+    double TurnAt(const struct Plan& plan, std::size_t i)
+    {
+        if (i == 0 || i + 1 >= plan.points.size()) {
+            return 0.0;
+        }
+        const auto& a = plan.points[i - 1];
+        const auto& b = plan.points[i];
+        const auto& c = plan.points[i + 1];
+        const auto before = HeadingTo(a, b);
+        const auto after = HeadingTo(b, c);
+        return std::abs(Deg(WrapPi(after - before)));
+    }
+
+    constexpr double sharpTurnDeg = 25.0;
+    // Being under a bridge deck or on the floor below a ledge is not being at a point above: arrival
+    // needs the same level, within a step or two.
+    constexpr double levelTolerance = 120.0;
+    constexpr double goalLevelTolerance = 150.0;
+
+    bool AtLevel(const RE::NiPoint3& pos, const RE::NiPoint3& point, double xyRadius, double zTolerance = levelTolerance)
+    {
+        return Dist2D(pos, point) < xyRadius && std::abs(pos.z - point.z) < zTolerance;
+    }
+
+    // Distance along the route to the next sharp corner within `within`, or a negative number.
+    double SharpCornerAhead(const Process& p, const RE::NiPoint3& pos, double within, double minTurn)
+    {
+        double travelled = 0.0;
+        RE::NiPoint3 from = pos;
+        for (auto i = p.waypoint; i < p.plan.points.size() && travelled <= within; ++i) {
+            travelled += Dist2D(from, p.plan.points[i]);
+            from = p.plan.points[i];
+            if (TurnAt(p.plan, i) >= minTurn && travelled <= within) {
+                return travelled;
+            }
+        }
+        return -1.0;
+    }
+
+    // Pure pursuit that stops at sharp corners instead of aiming past them, which would cut inside the
+    // corner and drag the player along its wall.
     RE::NiPoint3 LookAhead(const Process& p, const RE::NiPoint3& pos, double distance)
     {
         RE::NiPoint3 from = pos;
@@ -723,6 +837,9 @@ namespace
             if (d >= left && d > 1e-3) {
                 const auto f = static_cast<float>(left / d);
                 return { from.x + (to.x - from.x) * f, from.y + (to.y - from.y) * f, from.z + (to.z - from.z) * f };
+            }
+            if (TurnAt(p.plan, i) >= sharpTurnDeg) {
+                return to;
             }
             left -= d;
             from = to;
@@ -857,7 +974,27 @@ namespace
             }
         }
 
-        if (Dist2D(pos, target) < radius && std::abs(pos.z - target.z) < 300.0) {
+        if (p.hasStage && !p.staged && p.viaIndex >= p.via.size() && Dist2D(pos, target) < radius) {
+            // At the staging point: face the door, which is then within reach.
+            p.staged = true;
+            if (const auto door = ApproachDoor(p)) {
+                FaceHeading(player, HeadingTo(pos, door->GetPosition()));
+            }
+            p.plan = {};
+            target = CurrentTarget(p, radius);
+        }
+        {
+            // The last stretch to a door is walked, not run.
+            const auto approach = ApproachDoor(p);
+            const bool slow = approach && Dist2D(pos, approach->GetPosition()) < 200.0;
+            if (slow != p.slowed) {
+                p.slowed = slow;
+                if (const auto running = Running(); running && p.run) {
+                    *running = !slow;
+                }
+            }
+        }
+        if (Dist2D(pos, target) < radius && std::abs(pos.z - target.z) < goalLevelTolerance) {
             if (p.viaIndex < p.via.size()) {
                 ++p.viaIndex;
                 p.plan = {};
@@ -900,6 +1037,17 @@ namespace
                 { p.plan.points[p.waypoint - 1].x, p.plan.points[p.waypoint - 1].y, 0.0 },
                 { p.plan.points[p.waypoint].x, p.plan.points[p.waypoint].y, 0.0 });
             deviated = p.offPathNow > 200.0;
+            // On another level than the segment it is following (under the deck it should be crossing):
+            // the plan no longer describes where the player is.
+            const auto& from = p.plan.points[p.waypoint - 1];
+            const auto& to = p.plan.points[p.waypoint];
+            const double sx = to.x - from.x, sy = to.y - from.y;
+            const double len2 = sx * sx + sy * sy;
+            const double t = len2 > 1.0 ? std::clamp(((pos.x - from.x) * sx + (pos.y - from.y) * sy) / len2, 0.0, 1.0) : 0.0;
+            if (std::abs(pos.z - (from.z + (to.z - from.z) * t)) > 150.0) {
+                p.offPathNow = std::max(p.offPathNow, 201.0);
+                deviated = true;
+            }
         }
         if ((stale || deviated) && now - p.lastPlan > 0.5) {
             Plan(p, player, target, now, p.lastPlan > -1e8);
@@ -922,13 +1070,16 @@ namespace
 
         RE::NiPoint3 aim = target;
         if (p.plan.found) {
-            while (p.waypoint + 1 < p.plan.points.size() && Dist2D(pos, p.plan.points[p.waypoint]) < 90.0) {
+            // A sharp corner is reached properly (its point already keeps clear of the walls); a gentle
+            // bend may be rounded.
+            while (p.waypoint + 1 < p.plan.points.size() &&
+                   AtLevel(pos, p.plan.points[p.waypoint], TurnAt(p.plan, p.waypoint) >= sharpTurnDeg ? 35.0 : 90.0)) {
                 ++p.waypoint;
             }
             if (p.waypoint < p.plan.points.size()) {
                 aim = LookAhead(p, pos, 150.0);
             }
-            if (p.waypoint + 1 == p.plan.points.size() && !p.plan.complete && Dist2D(pos, p.plan.points[p.waypoint]) < 90.0) {
+            if (p.waypoint + 1 == p.plan.points.size() && !p.plan.complete && AtLevel(pos, p.plan.points[p.waypoint], 90.0)) {
                 // Plan the next stretch before reaching the end of this one, so there is no pause.
                 p.replanWanted = true;
             }
@@ -942,8 +1093,9 @@ namespace
         CurrentDrive().targetHeading = want;
         if (std::abs(error) < Rad(60.0)) {
             tick.drive.hold.push_back("Forward");
-            // Sprinting through a sharp bend overshoots it.
-            if ((p.sprint || p.combatSteer) && std::abs(error) < Rad(35.0)) {
+            // Sprinting through a sharp bend overshoots it into the wall, so the sprint stops short of one.
+            const bool cornerSoon = p.plan.found && SharpCornerAhead(p, pos, 220.0, 45.0) >= 0.0;
+            if ((p.sprint || p.combatSteer) && std::abs(error) < Rad(35.0) && !cornerSoon) {
                 tick.drive.hold.push_back("Sprint");
             }
             if (StuckCheck(p, now, 1.2, 30.0)) {
@@ -966,7 +1118,7 @@ namespace
             }
         }
         const auto goal = GoalPosition(p);
-        if (Dist2D(pos, goal) < p.goal.radius && std::abs(pos.z - goal.z) < 300.0) {
+        if (Dist2D(pos, goal) < p.goal.radius && std::abs(pos.z - goal.z) < goalLevelTolerance) {
             Arrive(p, player);
             return;
         }

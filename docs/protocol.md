@@ -216,6 +216,21 @@ key press undoes) instead puts it back on its own trail at least 300 units behin
 times a trip; each is a `navStuck` with `action: "unstick"` and counted in `unsticks`. Caught
 again at the same spot on a global route, it also skips the current gate. `invulnerable: true` turns god mode on for the trip and restores it afterwards.
 
+**Clearance and levels.** Local paths keep clear of walls: a navmesh portal end that touches a wall
+(a vertex on a boundary edge) is pulled in by 55 units before string-pulling, and a portal that would be
+left with nothing (a passage under 110 units wide) collapses to its midpoint. Passages under 160 units
+wide also get lead-in points 80 units either side of the middle on the line perpendicular to the opening,
+so they are entered straight. Steering aims at a sharp corner (over 25 degrees) instead of past it,
+reaches sharp corners within 35 units (gentle bends within 90), and does not sprint within 220 units of a
+turn over 45 degrees. A door goal (a load door chosen to change cells, or an `activate` goal on a door) is
+approached through a staging point 130 units in front of it on the navmesh, on the side the player comes
+from; at that point the player faces the door and activates it (reach 160 units) instead of walking into
+it, and the last 200 units to a door are walked, not run. Levels: the start and goal triangle is the one
+containing the point in plan view whose plane is nearest the actor's height (so a bridge goal is the deck
+and standing under it is the ground), waypoints and goals count as reached only on the same level (120 and
+150 units of height), and a player more than 150 units off the height of the segment it is following
+replans. `tests/live/nav_clearance.py` measures stall time per pass for doors, a bridge, stairs and a tunnel.
+
 **Stalls.** A stall is speed under 40 units/s over 0.5 s (ending above 80); off-path, in input
 mode, is more than 120 units from the planned segment (ending under 60). Each episode gets a
 cause guess: engine leg ended, recovering, replan latency, actor in the way, door, turning

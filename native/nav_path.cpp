@@ -118,6 +118,7 @@ namespace
                 }
             }
         }
+        graph.MarkWalls();
         cache.graph = std::move(graph);
         cache.key = std::move(key);
         ++cache.generation;
@@ -140,10 +141,24 @@ namespace
 
 namespace devtools::nav
 {
+    bool OnNavmesh(const RE::NiPoint3& p)
+    {
+        Refresh();
+        return g::Locate(State().graph, V(p), 1.0) >= 0;
+    }
+
     std::uint64_t GraphGeneration()
     {
         Refresh();
         return State().generation;
+    }
+
+    namespace
+    {
+        // The player's capsule is about 35 units wide each way; paths keep this far from wall corners
+        // and treat anything under narrowPassage as a passage to enter straight on.
+        constexpr double clearance = 55.0;
+        constexpr double narrowPassage = 160.0;
     }
 
     Plan PlanPath(const RE::NiPoint3& from, const RE::NiPoint3& to)
@@ -165,7 +180,7 @@ namespace devtools::nav
             plan.complete = search.complete;
             plan.expanded = search.expanded;
             const auto end = search.complete ? V(to) : graph.Center(search.tris.back());
-            for (const auto& p : g::Funnel(graph, search.tris, V(from), end, 30.0)) {
+            for (const auto& p : g::Funnel(graph, search.tris, V(from), end, clearance, narrowPassage)) {
                 plan.points.push_back(P(p));
             }
             if (!search.complete) {
