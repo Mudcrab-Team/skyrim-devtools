@@ -22,6 +22,8 @@ VANITY_OFF_SECONDS = 86400.0
 EVENT_BUFFER = 5000
 # console lines are already returned by the console tool, so subscribing would only add noise
 QUIET_EVENTS = {"console"}
+# delivered to listeners only: alerts reach the agent through the alerts field, not the event buffer
+ALERT_EVENTS = {"alertRaised", "alertCleared"}
 NOT_READY = -32004
 KEEP_OPEN = {"HUD Menu", "Cursor Menu", "Main Menu", "Fader Menu", "LoadWaitSpinner", "Mist Menu"}
 HINTS = {
@@ -88,6 +90,7 @@ class GameManager:
         self.host = host or WindowsHost(config)
         self._connect = connect
         self.keepalive_seconds = keepalive
+        self.event_listeners = []
         self.lock = asyncio.Lock()
         self.reset()
 
@@ -113,7 +116,15 @@ class GameManager:
         return self.session is not None and self.phase == "running"
 
     def _on_event(self, event):
-        self.events.append(compact_event(event))
+        compact = compact_event(event)
+        for listener in self.event_listeners:
+            try:
+                listener(compact)
+            except Exception:  # a broken listener must not cost the agent its event stream
+                pass
+        if compact["type"] in ALERT_EVENTS:
+            return
+        self.events.append(compact)
         self.event_total += 1
 
     def events_since(self, cursor):

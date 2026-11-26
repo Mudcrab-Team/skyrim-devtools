@@ -22,6 +22,9 @@ namespace devtools::gfx
         std::uint32_t width = 0;
         std::uint32_t height = 0;
         std::vector<std::uint8_t> bytes;
+        // Measured on the downscaled image; lets a client notice a black, blank or single-colour view.
+        float meanLuma = 0.0f;       // 0 (black) to 255
+        float dominantShare = 0.0f;  // share of pixels in the most common 4-bit-per-channel colour
     };
 
     // Copies the swap chain's current back buffer to CPU memory. Call it on the render thread

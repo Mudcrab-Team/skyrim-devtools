@@ -7,6 +7,7 @@ that `capture_start` records:
   {"t":"narrate","ms":..,"text":".."}                      caption the agent wants on screen
   {"t":"status","ms":..,"cell":..,"pos":[x,y,z],"health":[cur,max],"quest":{..},"nav":".."}
   {"t":"capture","ms":..,"action":"start"|"stop","startEpochMs":..,"file":".."}
+  {"t":"alert","ms":..,"action":"raised"|"cleared","kind":..,"severity":..,"hint":..,"detail":..}
 """
 
 import asyncio
@@ -22,6 +23,8 @@ SUMMARY_LIMIT = 220
 ARG_LIMIT = 120
 # tools whose own arguments or results carry nothing worth reading on screen
 QUIET_TOOLS = {"narrate"}
+# the alerts tool shows the alerts itself
+NO_ALERT_FIELD = {"agent_alerts"}
 
 
 def now_ms():
@@ -79,8 +82,8 @@ class Recorder:
     def narrate(self, text):
         self.write({"t": "narrate", "ms": now_ms(), "text": text.strip()})
 
-    def instrument(self, mcp):
-        """Make every tool registered on `mcp` afterwards log itself."""
+    def instrument(self, mcp, board=None):
+        """Make every tool registered on `mcp` afterwards log itself and, with a board, carry its active alerts."""
         register = mcp.tool
 
         def tool(*dargs, **dkwargs):
@@ -102,9 +105,17 @@ class Recorder:
                     except BaseException as error:
                         record.update(endMs=now_ms(), ok=False, error=clip(f"{type(error).__name__}: {error}", SUMMARY_LIMIT))
                         self.write(record)
+                        if board is not None and isinstance(error, Exception):
+                            # a call that fails the same way again and again is a loop too
+                            board.observe_call(name, kwargs, f"error: {error}")
                         raise
                     record.update(endMs=now_ms(), ok=True, summary=summarize_result(result))
                     self.write(record)
+                    if board is not None:
+                        board.observe_call(name, kwargs, result)
+                        board.expire()
+                        if name not in NO_ALERT_FIELD:
+                            result = board.attach(result)
                     return result
 
                 return decorate(logged)

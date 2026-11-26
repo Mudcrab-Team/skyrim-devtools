@@ -12,6 +12,7 @@ import time
 from mcp.server.fastmcp import FastMCP, Image
 
 from . import capture, combat, modtest, perception, saves
+from .alerts import AlertBoard
 from .manager import GameError, GameManager
 from .timeline import Recorder
 
@@ -121,8 +122,10 @@ def is_busy_error(error):
     return "did not answer in time" in text or "-32008" in text
 
 
-def build_server(manager, recorder=None):
+def build_server(manager, recorder=None, board=None):
     recorder = recorder or Recorder()
+    board = board or AlertBoard(write=recorder.write)
+    manager.event_listeners.append(board.on_event)
 
     @contextlib.asynccontextmanager
     async def lifespan(_server):
@@ -136,7 +139,7 @@ def build_server(manager, recorder=None):
                 await manager.stop()
 
     mcp = FastMCP("skyrim-use", instructions=INSTRUCTIONS, lifespan=lifespan)
-    recorder.instrument(mcp)
+    recorder.instrument(mcp, board)
 
     async def native(method, **params):
         """Call a method that may be missing from the running plugin build."""
@@ -144,6 +147,17 @@ def build_server(manager, recorder=None):
         if manager.alive and manager.methods and not manager.has_method(method):
             raise GameError(UNAVAILABLE.format(method))
         return await manager.call(method, **params)
+
+    async def sync_alerts(history=False, limit=50):
+        """Fetch the plugin's own view (also after lost events); returns it, or None without the alerts module."""
+        if not manager.alive or not manager.has_method("Alerts.state"):
+            return None
+        try:
+            state = await manager.call("Alerts.state", history=history, limit=limit)
+        except GameError:
+            return None
+        board.sync(state)
+        return state
 
     # ---- lifecycle ----------------------------------------------------------------------------
 
@@ -154,14 +168,19 @@ def build_server(manager, recorder=None):
         Idempotent: if a game is already running its status is returned. A crashed game is reported
         by game_status/any tool; call game_start again to relaunch. With a window (headless=false), call
         perf_check next: a slideshow game wastes the whole session."""
-        return dumps(await manager.start(headless=headless, save=save))
+        board.forget_native()
+        status = await manager.start(headless=headless, save=save)
+        await sync_alerts()
+        return dumps(status)
 
     @mcp.tool()
     async def game_stop(grace_seconds: int = 12) -> str:
         """Close the game and release the connection. Always call this when finished. The game is asked to quit
         and killed if it has not exited after grace_seconds (1-120); `path` in the result says which way it
         ended (graceful, killed-after-Ns, closing-crashed) and `crash` carries the crash log's top frames."""
-        return dumps(await manager.stop(grace=max(1, min(120, grace_seconds))))
+        result = await manager.stop(grace=max(1, min(120, grace_seconds)))
+        board.forget_native()
+        return dumps(result)
 
     @mcp.tool()
     async def game_status() -> str:
@@ -170,6 +189,8 @@ def build_server(manager, recorder=None):
         link, so it notices a crash that happened while you were idle. `daemon.stale` is true when this MCP
         process started before its own source files were last changed: restart it to pick the changes up."""
         status = await manager.status()
+        if not manager.alive:
+            board.forget_native()
         status["daemon"] = daemon_state()
         return dumps(status)
 
@@ -542,7 +563,48 @@ def build_server(manager, recorder=None):
         if parts is None:
             return [dumps(result)]
         meta = {k: v for k, v in result.items() if k not in {"data", "image", "base64", "png", "jpeg"}}
+        board.observe_screenshot(meta)
         return [Image(data=parts[0], format=parts[1]), dumps(meta)]
+
+    @mcp.tool()
+    async def agent_alerts(history: bool = False, limit: int = 20, dismiss: str | None = None,
+                           dismiss_seconds: float = 300, configure: dict | None = None) -> str:
+        """Alerts say when you are wasting time; every other tool reply carries the active ones in `alerts`
+        (kind, severity, since, a hint of what to try). This returns them in full: kind, sinceMs, ageS, detail
+        and, with history=true, the last `limit` raised/cleared entries. Kinds: questStalled, actionLoop,
+        combatStalemate, deathLoop, fellOrOutOfBounds, blindCamera, menuLeftOpen, paused, lowFps,
+        overEncumbered, crime, targetDead, targetUnreachable, lowHealthNoHeal, moveStuck. dismiss=<kind> hides
+        an alert you have dealt with for dismiss_seconds. configure={"thresholds": {name: number},
+        "disable": [kinds], "enable": [kinds]} changes thresholds (names in the reply and docs/skyrim-use.md,
+        e.g. questStalledMin, combatStalemateS, lowFpsS, actionLoopCount, actionLoopWindowS). `cost` reports
+        what the detectors take from the game thread per tick."""
+        extra = {}
+        if configure:
+            native_part = {key: value for key, value in configure.items() if key in ("thresholds", "disable", "enable", "reset")}
+            unknown = set(configure) - set(native_part)
+            if unknown:
+                raise GameError(f"configure takes thresholds, disable, enable and reset, not {sorted(unknown)}")
+            remaining = board.configure(native_part.get("thresholds"), native_part.get("disable", ()), native_part.get("enable", ()))
+            native_part = {key: value for key, value in native_part.items() if key != "thresholds"}
+            if remaining:
+                native_part["thresholds"] = remaining
+            if native_part:
+                extra["configured"] = await native("Alerts.configure", **native_part)
+        if dismiss:
+            alert = board.active.get(dismiss)
+            if manager.alive and manager.has_method("Alerts.dismiss") and (alert is None or alert.get("source") == "native"):
+                await manager.call("Alerts.dismiss", kind=dismiss, forS=dismiss_seconds)
+            extra["dismissed"] = board.dismiss(dismiss, dismiss_seconds)
+        state = await sync_alerts(history=history, limit=limit)
+        out = board.full(history=history, limit=limit)
+        if state:
+            out["cost"] = state.get("cost")
+            out["thresholds"]["native"] = state.get("thresholds")
+            out["disabled"] = sorted(set(state.get("disabled", [])) | board.disabled)
+        else:
+            out["disabled"] = sorted(board.disabled)
+        out.update(extra)
+        return dumps(out)
 
     @mcp.tool()
     async def perf_frame_stats(window: float | None = None) -> str:

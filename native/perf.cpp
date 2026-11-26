@@ -225,6 +225,30 @@ namespace devtools::perf
     bool PresentHooked() { return hooked; }
     double Now() { return QpcSeconds(); }
 
+    RecentFrames Recent(double seconds)
+    {
+        RecentFrames out;
+        out.hooked = hooked;
+        if (!hooked) {
+            return out;
+        }
+        const double now = QpcSeconds();
+        std::lock_guard lock(ringMutex);
+        for (std::size_t i = 0; i < ringCount; ++i) {
+            const auto& sample = ring[(ringHead + ring.size() - 1 - i) % ring.size()];
+            if (now - sample.at > seconds) {
+                break;
+            }
+            ++out.count;
+            out.maxMs = std::max(out.maxMs, static_cast<double>(sample.ms));
+        }
+        // Time since the latest present counts as one long frame, so a stalled game shows up at once.
+        if (lastPresent > 0.0) {
+            out.maxMs = std::max(out.maxMs, (now - lastPresent) * 1000.0);
+        }
+        return out;
+    }
+
     void NoteCall(const std::string& method, const char* thread, double startedAt, double queuedMs, double ranMs)
     {
         if (ranMs < 5.0 && queuedMs < 100.0) {
