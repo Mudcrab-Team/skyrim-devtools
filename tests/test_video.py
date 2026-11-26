@@ -91,6 +91,17 @@ class ComposeTests(unittest.TestCase):
         self.assertEqual(timeline.calls[0].start, 2.0)
         self.assertEqual(timeline.captions[0][0], 4.0)
 
+    def test_action_and_walk_speedups_leave_captions_alone(self):
+        timeline = video.Timeline(
+            calls=[video.Call("combat_fight", {}, 10.0, 11.0, True, "", ""), video.Call("nav_wait", {}, 20.0, 80.0, True, "", "")],
+            captions=[(40.0, 44.0, "hello")])
+        plain = video.plan_segments(timeline, 100.0)
+        fast = video.plan_segments(timeline, 100.0, speedup_walk=30.0, speedup_action=3.0)
+        self.assertEqual([s for s in plain if s[0] <= 10.0 < s[1]][0][2], 1.0)
+        self.assertEqual([s for s in fast if s[0] <= 10.5 < s[1]][0][2], 3.0)
+        self.assertEqual([s for s in fast if s[0] <= 42.0 < s[1]][0][2], 1.0)
+        self.assertGreaterEqual([s for s in fast if s[0] <= 30.0 < s[1]][0][2], 30.0)
+
     def test_status_before_first_sample_uses_the_first_sample(self):
         timeline = video.Timeline(statuses=[(5.0, {"cell": "Riverwood", "health": [90, 100]}),
                                             (9.0, {"health": [40, 100]})])
