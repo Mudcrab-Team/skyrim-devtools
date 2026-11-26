@@ -5,6 +5,7 @@
 // ControlMap assigns user events and every menu and handler sees them exactly like hardware
 // input. Nothing goes through Windows, so the window needs neither focus nor the foreground.
 #include "game.h"
+#include "input.h"
 #include "methods.h"
 
 #include <MinHook.h>
@@ -75,6 +76,20 @@ namespace
     std::atomic<std::uint64_t> injectedButtons = 0;
     std::atomic<std::uint64_t> injectedMoves = 0;
     std::atomic<std::int64_t> lastPollMs = 0;
+
+    // Controls held for the poll listener, kept apart from Input.* requests so neither can
+    // release the other's keys.
+    struct DrivenKey
+    {
+        Button button;
+        Clock::time_point pressed;
+        bool tap = false;
+    };
+    std::mutex listenerMutex;
+    devtools::input::PollListener pollListener;
+    std::map<std::string, DrivenKey> driven;
+    std::mutex drivenNamesMutex;
+    std::vector<std::string> drivenNames;
 
     std::int64_t NowMs()
     {
@@ -237,6 +252,66 @@ namespace
             ++injectedButtons;
         };
 
+        {
+            devtools::input::Drive drive;
+            {
+                std::lock_guard lock(listenerMutex);
+                if (pollListener) {
+                    pollListener(seconds, drive);
+                }
+            }
+            std::map<std::string, bool> wanted;  // control -> tap
+            for (auto& name : drive.hold) {
+                wanted.emplace(std::move(name), false);
+            }
+            for (auto& name : drive.tap) {
+                wanted.emplace(std::move(name), true);
+            }
+            for (auto it = driven.begin(); it != driven.end();) {
+                auto keep = wanted.find(it->first);
+                if (keep != wanted.end() && !it->second.tap) {
+                    // A control held across a menu closing was resolved in the menu's input
+                    // context; once the context changes the same name means another key, so
+                    // release the old key and press the current one.
+                    const auto current = ResolveControl(it->first);
+                    if (current && *current != it->second.button && room()) {
+                        press(it->second.button, 0.0F, Seconds(now - it->second.pressed));
+                        it = driven.erase(it);
+                        continue;
+                    }
+                }
+                if ((keep == wanted.end() || it->second.tap) && room()) {
+                    press(it->second.button, 0.0F, Seconds(now - it->second.pressed));
+                    if (keep != wanted.end()) {
+                        wanted.erase(keep);  // a tap needs one released poll before it repeats
+                    }
+                    it = driven.erase(it);
+                    continue;
+                }
+                if (keep != wanted.end()) {
+                    wanted.erase(keep);
+                    if (room()) {
+                        press(it->second.button, 1.0F, Seconds(now - it->second.pressed));
+                    }
+                }
+                ++it;
+            }
+            for (const auto& [name, tap] : wanted) {
+                const auto button = ResolveControl(name);
+                if (!button || !room()) {
+                    continue;
+                }
+                press(*button, 1.0F, 0.0F);
+                driven.emplace(name, DrivenKey{ *button, now, tap });
+            }
+            std::vector<std::string> names;
+            for (const auto& [name, state] : driven) {
+                names.push_back(name);
+            }
+            std::lock_guard lock(drivenNamesMutex);
+            drivenNames = std::move(names);
+        }
+
         if (releaseAll.exchange(false)) {
             for (auto& [button, state] : held) {
                 if (room()) {
@@ -386,6 +461,23 @@ namespace devtools
         } catch (const RpcError&) {
             return false;
         }
+    }
+}
+
+namespace devtools::input
+{
+    void SetPollListener(PollListener listener)
+    {
+        std::lock_guard lock(listenerMutex);
+        pollListener = std::move(listener);
+    }
+
+    bool Hooked() { return hooked; }
+
+    std::vector<std::string> DrivenControls()
+    {
+        std::lock_guard lock(drivenNamesMutex);
+        return drivenNames;
     }
 }
 

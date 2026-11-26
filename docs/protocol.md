@@ -117,6 +117,81 @@ removes earlier Papyrus logs. A crashed, forced or unexpectedly exited run gets
 A separate crash-logging DLL would give stack traces but is not used while the plugin
 stays the only SKSE DLL.
 
+### Movement, camera, navigation and recording
+
+Headings are degrees clockwise from north (+Y), so 90 is east (+X). Distances are game units
+(about 1.4 cm). Movement is driven from the input poll hook: the same injected controls a player
+would press, so animation, collision, stamina and encumbrance all apply.
+
+| Method | Thread | Params | Result and meaning |
+| --- | --- | --- | --- |
+| Move.walk | main (deferred) | direction? (`forward`, `back`, `left`, `right`), durationMs? (≤ 60000) or distance? (≤ 20000), run?, sprint? | Holds the movement control until the time or the distance is used up. `{distance, displacement, durationMs, start, end, stoppedByLimit}`; distance is the path actually walked, so a wall shows as a short distance. |
+| Move.turnTo | main (deferred) | headingDeg or x, y or refID; smooth? (true), degPerSec? (180) | Turns the player; replies when done with `{headingDeg, pitchDeg}` |
+| Move.jump / Move.stop | main | | Taps Jump / stops a running walk or turn |
+| Move.sneak | main (deferred) | on | Toggles sneak until `IsSneaking` matches; `{sneaking}` |
+| Camera.state | main | | `{mode, stateId, pos, yawDeg, pitchDeg, worldFov, firstPersonFov, zoom, targetZoom, freeRotationDeg, player:{headingDeg, pitchDeg}}`; mode is `firstPerson`, `thirdPerson`, `free`, `furniture`, ... |
+| Camera.set | main | mode? (`first`, `third`), yawDeg?, pitchDeg?, zoom? (0-1, third person), fov? (20-150) | Applies the given fields in that order; read Camera.state a frame later for the result |
+| Camera.lookAt | main | refID or x, y, z | Turns the player's view at a reference (actors at chest height) or a point |
+| Nav.plan | main | refID or x, y, z; from? | Path over the loaded navmeshes, `{found, complete, goalOnMesh, points, triangles, meshes, expanded, ms}`. For debugging Nav.goto. |
+| Nav.goto | main | goal, mode? (`input`), timeoutS? (300), run? (true), sprint?, onCombat? (`flee`, `fight`, `stop`, `ignore`), onDialogue? (`close`, `stop`, `wait`), onMessageBox? (`firstButton`, `stop`, `wait`), onMenu? (`close`, `stop`, `wait`), invulnerable? (false), via? ([[x,y,z]...]), route? (recording name), routeSpacing? (600) | Starts a background navigation and replies at once with `{id, mode, goal, goalPos, straightDistance}`. Goals: `{refID}`, `{x, y, z, worldspace?}`, `{cell}` (editor id), `{place}` (a location's displayed name or form id, see Nav.places) or `{near: refID, radius}`. Fails with `-32009` while one runs. |
+| Nav.status | main | | `{active: true, nav:{id, state, mode, goal, elapsedS, distanceRemaining, etaS, waypoint, stuckCount, replans, travelled, combat, interruption, interruptions:{count, recent}, stalls:{count, totalS, offPathCount, offPathTotalS, offPathNow, recent}, ...}}`, or `{active: false, last}` whose `state` is the outcome (`arrived`, `failed`, `cancelled`) with a `reason` |
+| Nav.cancel | main | | Stops the navigation and releases controls |
+| Nav.places | main | contains? (substring, case-sensitive), limit? (50) | Locations with a world map marker: `{count, places:[{name, location, marker, pos, world, distance}]}`. Names are in the game's language; `{place}` goals accept the name or the location id. |
+| Nav.nearby | main | radius? (3000), kind? (`any`, `actor`, `door`, `object`), limit? (30) | Named references around the player, nearest first: `{count, refs:[{refID, name, pos, distance, kind, loadDoor?}]}` |
+| Record.start | main | hz? (1-60, default 20), fields? (`player`, `camera`, `state`, `input`, `perf`), name? | Samples on the input poll into `runs/<session>/recordings/<name>.jsonl` |
+| Record.stop / Record.status | main | | `{name, file, path, samples, durationS, distance, maxSpeed, hz}` |
+| Record.list | any | | `{dir, recordings:[{name, file, bytes, path}]}` |
+| Record.replayCamera | main | name, speed? (1), method? (`free`, `player`) | Flies the free camera along the recorded camera path (or puts the player on the recorded positions). Ends with `replayFinished`. |
+| Record.replayInput | main | name, teleport? (true) | Best effort: moves the player to the first sample, then replays heading and held controls at the recorded times. Physics, frame timing and AI are not deterministic, so the end drifts; the result reports `endError`. |
+| Record.stopReplay | main | | Stops either replay |
+
+A recording line is one JSON object: `t`, `frame`, `gameTime`, `vel`, `teleport`, and per field
+group `pos`, `rot` [heading, pitch], `speed`, `cell`, `world` (player); `cam {pos, yaw, pitch,
+mode, fov}` (camera); `running`, `sprinting`, `sneaking`, `swimming`, `midair`, `combat`,
+`driver`, `nav`, `stuck` (state); `input` (held control names); `frameMs` (perf).
+
+Navigation events carry the Nav.status fields: `navProgress` (once a second), `navStuck` (plus the
+recovery `attempt`), `navArrived` and `navFailed` (with `reason`). `navInterrupted {id, reason,
+details, action, pos}` and `navResumed {id, after}` bracket every interruption; `navStall {id, kind,
+atS, durationS, pos, cause | maxDistance}` reports each stall or off-path episode as it ends. Recording events: `recordStopped`, `replayFinished`.
+
+**Navigation modes.** `input` is Baritone-like. It runs A* over the triangles of every loaded
+navmesh, with links across mesh borders through navmesh portals and preferred triangles made
+cheaper. A funnel pass turns the corridor into waypoints. The player is steered with injected
+Forward and a heading set per frame. When the goal is outside the loaded cells, it walks the
+best partial path and replans as new cells stream in. It also replans after deviating more than
+300 units. Stuck means under 40 units moved in 2 s; the recovery ladder is activate the nearest
+door, jump forward, strafe left, strafe right, back up and replan. It gives up after 8 attempts
+without progress or 5 dead ends. A goal in another cell or worldspace walks to a load door
+leading there (one hop) and activates it. `ai` sets the player AI-driven and calls Papyrus
+`PathToReference` on a marker (or the goal ref), so the engine's own pathfinder and its
+cross-cell routes drive the player. A leg that ends away from the goal is redispatched; six legs
+in a row without 1500 units of progress fail the trip.
+
+**Interruptions.** Every poll checks, most severe first: death (fails the trip), loading or fader
+screens, a paused game, Dialogue Menu, MessageBoxMenu, other blocking menus (lockpicking, book,
+sleep/wait, container, barter and the like), knockdown or ragdoll, paralysis, and combat (in
+combat, or hit in the last 4 s). Each is handled by its policy: `wait`; `close` (dialogue: Cancel,
+then hiding the menu, then the last topic for a forced greeting that will not let go; other menus:
+Cancel, then hiding); `firstButton` (selects option 0, then Accept, then hides); combat `flee`
+(keep to the route by input at a sprint; engine legs stop in combat), `fight` (draw, close in and
+attack the nearest enemy, then carry on) or `ignore`; `stop` fails with the reason. When the
+interruption clears the trip resumes from wherever the player is, replanning or dispatching a
+new engine leg. A watchdog recovers after 20 s without 150 units of movement and fails after 4
+rounds. `invulnerable: true` turns god mode on for the trip and restores it afterwards.
+
+**Stalls.** A stall is speed under 40 units/s over 0.5 s (ending above 80); off-path, in input
+mode, is more than 120 units from the planned segment (ending under 60). Each episode gets a
+cause guess: engine leg ended, recovering, replan latency, actor in the way, door, turning
+(waypoint overshoot), steep slope or obstacle. Input mode steers by pure pursuit 150 units along
+the plan, accepts waypoints within 90 units, sprints only within 35 degrees of the heading and
+replans before the end of a partial plan. `skyrim-devtools-trajectory plot --episodes` marks the
+episodes on the plot.
+
+**Time scale.** `sgtm <n>` (console) speeds up the whole simulation, movement included, and
+navigation times scale with it; `etaS` and `elapsedS` are real seconds. Values above about 4
+make collisions and streaming less reliable. `set timescale to <n>` only changes the game clock.
+
 ## Errors
 
 | Code | Meaning |

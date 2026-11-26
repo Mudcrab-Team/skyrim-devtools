@@ -493,6 +493,168 @@ def build_server(manager, recorder=None):
         return dumps(await native("Papyrus.log", since=since, level=level, limit=limit, contains=contains))
 
     capture.register(mcp, manager, recorder)
+
+    # ---- movement, camera, navigation, recording ----------------------------------------------
+
+    @mcp.tool()
+    async def walk(direction: str = "forward", duration_ms: int | None = None, distance: float | None = None,
+                   run: bool | None = None, sprint: bool | None = None) -> str:
+        """Move the player by holding a movement key (Move.walk): direction forward/back/left/right, for
+        duration_ms (max 60000) OR until `distance` game units are covered (max 20000; 1 unit ~ 1.4 cm,
+        a walking stride ~ 70). run/sprint override the run toggle for this walk. Blocks until done and
+        returns the distance actually moved and the displacement; walls stop the player, so compare."""
+        limit = (duration_ms / 1000 + 15) if duration_ms else 135
+        return dumps(await manager.call("Move.walk", timeout=limit, **{k: v for k, v in dict(
+            direction=direction, durationMs=duration_ms, distance=distance, run=run, sprint=sprint).items()
+            if v is not None}))
+
+    @mcp.tool()
+    async def turn_to(heading_deg: float | None = None, x: float | None = None, y: float | None = None,
+                      ref_id: str | None = None, smooth: bool | None = None) -> str:
+        """Turn the player to an absolute heading (0 = north/+Y, 90 = east/+X), towards a point x,y, or
+        towards a reference (refID hex). Smooth by default (180 deg/s); smooth=false snaps. For relative
+        turns use look."""
+        return dumps(await native("Move.turnTo", headingDeg=heading_deg, x=x, y=y, refID=ref_id, smooth=smooth))
+
+    @mcp.tool()
+    async def jump() -> str:
+        """Make the player jump once (Move.jump)."""
+        return dumps(await native("Move.jump"))
+
+    @mcp.tool()
+    async def sneak(on: bool) -> str:
+        """Enter (on=true) or leave sneak mode; returns whether the player is sneaking afterwards."""
+        return dumps(await native("Move.sneak", on=on))
+
+    @mcp.tool()
+    async def camera_state() -> str:
+        """Camera mode (firstPerson/thirdPerson/free/...), camera position, yaw/pitch in degrees, zoom
+        (third person, 0-1), field of view, and the player's heading/pitch."""
+        return dumps(await native("Camera.state"))
+
+    @mcp.tool()
+    async def camera_set(mode: str | None = None, yaw_deg: float | None = None, pitch_deg: float | None = None,
+                         zoom: float | None = None, fov: float | None = None) -> str:
+        """Switch the camera to mode first/third, set the view yaw/pitch in degrees (turns the player;
+        pitch + is down), third-person zoom 0 (close) to 1 (far), or world FOV 20-150."""
+        return dumps(await native("Camera.set", mode=mode, yawDeg=yaw_deg, pitchDeg=pitch_deg, zoom=zoom, fov=fov))
+
+    @mcp.tool()
+    async def camera_look_at(ref_id: str | None = None, x: float | None = None, y: float | None = None,
+                             z: float | None = None) -> str:
+        """Aim the player's view at a reference (refID hex, e.g. from a state tool) or a world point x,y,z."""
+        return dumps(await native("Camera.lookAt", refID=ref_id, x=x, y=y, z=z))
+
+    @mcp.tool()
+    async def nav_nearby(radius: float = 3000, kind: str = "any", limit: int = 30) -> str:
+        """Named references around the player, nearest first: refID, name, position, distance and kind
+        (actor, door, object; loadDoor marks doors to another cell). radius 100-20000 game units. Use
+        the refIDs as goals for nav_goto, turn_to or camera_look_at."""
+        return dumps(await native("Nav.nearby", radius=radius, kind=kind, limit=limit))
+
+    @mcp.tool()
+    async def nav_places(contains: str = "", limit: int = 50) -> str:
+        """Named locations that have a map marker (cities, villages, dungeons): name as shown in the
+        game's language, location form id, marker position and worldspace. Use the name or the location
+        id as {"place": ...} in nav_goto; on a localized game the names are translated."""
+        return dumps(await native("Nav.places", contains=contains or None, limit=limit))
+
+    @mcp.tool()
+    async def nav_goto(goal: dict, mode: str = "input", timeout_s: float | None = None, run: bool | None = None,
+                       sprint: bool | None = None, on_combat: str | None = None, on_dialogue: str | None = None,
+                       on_message_box: str | None = None, on_menu: str | None = None,
+                       invulnerable: bool | None = None, via: list | None = None, route: str | None = None) -> str:
+        """Start walking the player to a goal in the background (Nav.goto); returns at once. goal is one of
+        {"refID": "0001A2B3"}, {"x":..,"y":..,"z":..}, {"cell": "<editor id>"}, {"place": "Riverwood"} (a
+        location name or id from nav_places) or {"near": "<refID>", "radius": 300}. mode "input" steers with real key presses
+        over the loaded navmesh (replans as cells stream in, jumps/strafes/backs up when stuck, uses a load
+        door one hop away); mode "ai" hands the player to the engine's pathfinder (best for long trips).
+        Interruptions are handled per policy and reported as navInterrupted/navResumed events: on_combat flee
+        (default: keep to the route at a sprint), fight (draw, attack the nearest enemy, then resume), stop or
+        ignore; on_dialogue close (default; Cancel, then hide, then the last topic for forced greetings), stop or
+        wait; on_message_box firstButton (default), stop or wait; on_menu close (default), stop or wait. Loading,
+        knockdown and paralysis are waited out; death fails the trip. A trip resumes from wherever the player is
+        once the interruption clears; 20 s without progress triggers recovery and, after 4 rounds, failure.
+        invulnerable: true turns on god mode for the trip and restores it after. via: [[x,y,z], ...] waypoints; route: a recording
+        name to follow (input mode). Follow with nav_status / nav_wait; stop with nav_cancel. Speed long
+        trips with the console: `sgtm 4` (also speeds everything else; set back with `sgtm 1`)."""
+        return dumps(await native("Nav.goto", goal=goal, mode=mode, timeoutS=timeout_s, run=run, sprint=sprint,
+                                  onCombat=on_combat, onDialogue=on_dialogue, onMessageBox=on_message_box,
+                                  onMenu=on_menu, invulnerable=invulnerable, via=via, route=route))
+
+    @mcp.tool()
+    async def nav_status() -> str:
+        """The running navigation (state planning/moving/recovering/paused/door, distanceRemaining, etaS,
+        stuckCount, replans, waypoint) or, when idle, the last one's outcome and reason."""
+        return dumps(await native("Nav.status"))
+
+    @mcp.tool()
+    async def nav_wait(timeout_s: float = 120, poll_s: float = 2) -> str:
+        """Block until the running navigation ends (arrived/failed/cancelled) or timeout_s (max 300)
+        passes; returns the final summary or the current status. Call again to keep waiting."""
+        began = time.monotonic()
+        timeout_s = min(max(timeout_s, 1), 300)
+        while True:
+            status = await native("Nav.status")
+            if not status.get("active"):
+                return dumps({"done": True, **(status.get("last") or {})})
+            if time.monotonic() - began >= timeout_s:
+                return dumps({"done": False, **status["nav"]})
+            await asyncio.sleep(max(poll_s, 0.25))
+
+    @mcp.tool()
+    async def nav_cancel() -> str:
+        """Stop the running navigation and release the movement keys."""
+        return dumps(await native("Nav.cancel"))
+
+    @mcp.tool()
+    async def record_start(hz: float | None = None, fields: list[str] | None = None, name: str | None = None) -> str:
+        """Record the player's trajectory to a JSONL file on the test PC at hz samples/s (1-60, default 20).
+        fields from player, camera, state, input, perf (default all). Stop with record_stop."""
+        return dumps(await native("Record.start", hz=hz, fields=fields, name=name))
+
+    @mcp.tool()
+    async def record_stop() -> str:
+        """Stop recording; returns samples, duration, distance and the file name for record_fetch."""
+        return dumps(await native("Record.stop"))
+
+    @mcp.tool()
+    async def record_fetch(name: str, dest_dir: str | None = None, plot: bool = True) -> str:
+        """Copy a recording from the test PC to this machine (scp via the host config) and, by default,
+        write a top-down SVG plot next to it. Returns local paths and a summary (distance, duration, stuck)."""
+        from .. import trajectory
+
+        listing = await native("Record.list")
+        match = next((r for r in listing["recordings"] if r["name"] == name or r["file"] == name), None)
+        if match is None:
+            raise GameError(f"no recording {name}; known: {[r['name'] for r in listing['recordings']]}")
+        folder = Path(dest_dir or manager.config.get("recordingsDir") or "recordings").expanduser()
+        local = await trajectory.fetch(manager.config, match["path"], folder / match["file"])
+        samples = trajectory.load(local)
+        result = {"file": str(local), "summary": trajectory.summarize(samples)}
+        if plot and len(samples) >= 2:
+            svg = local.with_suffix(".svg")
+            svg.write_text(trajectory.plot_svg(samples, title=match["name"]), encoding="utf-8")
+            result["plot"] = str(svg)
+        return dumps(result)
+
+    @mcp.tool()
+    async def trajectory_plot(file: str, output: str | None = None, color_by: str = "speed") -> str:
+        """Plot a fetched local recording as a top-down SVG (north up) coloured by speed or frame time,
+        with start/end and stuck markers. Returns the SVG path and a summary."""
+        from .. import trajectory
+
+        samples = trajectory.load(file)
+        out = Path(output) if output else Path(file).with_suffix(".svg")
+        out.write_text(trajectory.plot_svg(samples, color_by=color_by, title=Path(file).stem), encoding="utf-8")
+        return dumps({"plot": str(out), "summary": trajectory.summarize(samples)})
+
+    @mcp.tool()
+    async def record_replay_camera(name: str, speed: float | None = None, method: str | None = None) -> str:
+        """Play a recording's camera path back as a flythrough (free camera by default; method "player"
+        moves the player along it instead). Returns at once; the replayFinished event marks the end."""
+        return dumps(await native("Record.replayCamera", name=name, speed=speed, method=method))
+
     return mcp
 
 

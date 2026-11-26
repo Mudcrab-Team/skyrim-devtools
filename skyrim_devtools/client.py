@@ -253,6 +253,61 @@ class Session:
 
     async def remove_item(self, form_id, count=1):
         return await self.call("Player.removeItem", formID=form_id, count=count, loadEpoch=self.epoch)
+    async def _call_set(self, method, timeout=None, **params):
+        return await self.call(method, timeout=timeout, **{k: v for k, v in params.items() if v is not None})
+
+    async def walk(self, direction="forward", duration_ms=None, distance=None, run=None, sprint=None):
+        """Hold a movement control until the time or distance is used up; returns the distance moved."""
+        limit = (duration_ms or 0) / 1000 + 15 if duration_ms else 135
+        return await self._call_set("Move.walk", timeout=limit, direction=direction, durationMs=duration_ms,
+                                    distance=distance, run=run, sprint=sprint)
+
+    async def turn_to(self, heading_deg=None, x=None, y=None, ref_id=None, smooth=None, deg_per_sec=None):
+        return await self._call_set("Move.turnTo", timeout=35, headingDeg=heading_deg, x=x, y=y, refID=ref_id,
+                                    smooth=smooth, degPerSec=deg_per_sec)
+
+    async def camera_state(self):
+        return await self.call("Camera.state")
+
+    async def camera_set(self, mode=None, yaw_deg=None, pitch_deg=None, zoom=None, fov=None):
+        return await self._call_set("Camera.set", mode=mode, yawDeg=yaw_deg, pitchDeg=pitch_deg, zoom=zoom, fov=fov)
+
+    async def camera_look_at(self, ref_id=None, x=None, y=None, z=None):
+        return await self._call_set("Camera.lookAt", refID=ref_id, x=x, y=y, z=z)
+
+    async def nav_goto(self, goal, mode="input", timeout_s=None, **options):
+        """Start a navigation process; follow it with nav_status or wait_nav."""
+        return await self._call_set("Nav.goto", goal=goal, mode=mode, timeoutS=timeout_s, **options)
+
+    async def nav_nearby(self, radius=None, kind=None, limit=None):
+        return await self._call_set("Nav.nearby", radius=radius, kind=kind, limit=limit)
+
+    async def nav_places(self, contains=None, limit=None):
+        return await self._call_set("Nav.places", contains=contains, limit=limit)
+
+    async def nav_status(self):
+        return await self.call("Nav.status")
+
+    async def nav_cancel(self):
+        return await self.call("Nav.cancel")
+
+    async def wait_nav(self, timeout, poll=1.0):
+        """Poll Nav.status until the process ends; returns its final summary."""
+        async with asyncio.timeout(timeout):
+            while True:
+                status = await self.call("Nav.status")
+                if not status["active"]:
+                    return status["last"]
+                await asyncio.sleep(poll)
+
+    async def record_start(self, hz=None, fields=None, name=None):
+        return await self._call_set("Record.start", hz=hz, fields=fields, name=name)
+
+    async def record_stop(self):
+        return await self.call("Record.stop")
+
+    async def record_list(self):
+        return await self.call("Record.list")
 
     # --- Menus by meaning (see docs/protocol.md, "Menu semantics") ---
 
