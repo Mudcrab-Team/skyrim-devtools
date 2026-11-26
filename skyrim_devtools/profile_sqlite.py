@@ -6,6 +6,7 @@ the *V views join them back in for hand-written queries. See docs/profiling.md, 
 
 import json
 from pathlib import Path
+import re
 import sqlite3
 import time
 from urllib.parse import quote
@@ -139,6 +140,15 @@ def export_sqlite(profile, path):
     return {"Frames": len(frames), "CpuSamples": len(samples), "Callchains": len(chains), "Symbols": len(symbols),
             "Markers": len(markers), "GpuRanges": len(ranges), "Counters": len(counters), "GpaCounters": len(gpa_rows), "ThreadNames": len(thread_rows),
             "StringIds": len(strings)}
+
+
+# Named blocks let checks pick a query by name; a plain list of blocks shifts whenever a recipe is added.
+_DOC_QUERY = re.compile(r"<!-- query: ([\w-]+) -->\s*```sql\n(.*?)```", re.S)
+
+
+def documented_queries(text):
+    """{name: sql} of the SQL blocks in a markdown text that carry a `<!-- query: NAME -->` line."""
+    return {name: sql.strip().rstrip(";") for name, sql in _DOC_QUERY.findall(text)}
 
 
 _READ_ACTIONS = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION, getattr(sqlite3, "SQLITE_RECURSIVE", 33)}

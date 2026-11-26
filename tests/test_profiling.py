@@ -685,17 +685,74 @@ class GpuTests(unittest.TestCase):
     def test_documented_queries_run(self):
         import re
 
-        from skyrim_devtools.profile_sqlite import export_sqlite, query
+        from skyrim_devtools.profile_sqlite import documented_queries, export_sqlite, query
 
         path = self.root / "doc.sqlite"
         export_sqlite(self.profile, path)
         doc = (Path(__file__).resolve().parent.parent / "docs" / "profiling.md").read_text()
         blocks = re.findall(r"```sql\n(.*?)```", doc, re.S)
-        self.assertEqual(len(blocks), 3)
-        results = [query(path, sql.strip().rstrip(";")) for sql in blocks]
-        self.assertEqual(results[0]["rows"], [])
-        self.assertEqual([r[0] for r in results[1]["rows"]], [1])
-        self.assertEqual(results[2]["rows"][0][0], "Beta::Tick (guess)")
+        for sql in blocks:
+            query(path, sql.strip().rstrip(";"))
+        named = documented_queries(doc)
+        self.assertLessEqual({"hitchTop", "gpuOverCpu", "cellLoads"}, set(named))
+        self.assertEqual(query(path, named["hitchTop"])["rows"], [])
+        self.assertEqual([r[0] for r in query(path, named["gpuOverCpu"])["rows"]], [1])
+        self.assertEqual(query(path, named["cellLoads"])["rows"][0][0], "Beta::Tick (guess)")
+
+    def test_two_clock_domains_join(self):
+        """GPU timestamps on a counter that started days before the profile (as a real GPU clock does) and CPU
+        samples, frames, markers and hitches in ms from the profile start: every time join returns rows."""
+        from skyrim_devtools.profile_gpu import gpu_frames
+        from skyrim_devtools.profile_sqlite import documented_queries, export_sqlite, query
+
+        gpu_epoch_s = 237054.8671875  # GPU counter seconds at the profile start
+        frames, marks, runs, gpu = [], [], [], []
+        for i in range(12):
+            start = i * 16.0
+            end = start + (180.0 if i == 6 else 16.0)
+            frames.append([start, end, 100 + i])
+            # the GPU starts each frame 0.5 ms after the CPU issued it and takes 12 ms
+            gpu.append([100 + i, start, start + 4.0, 3.0, 0,
+                        [[0, gpu_epoch_s + (start + 0.5) / 1000.0], [3, gpu_epoch_s + (start + 6.5) / 1000.0],
+                         [1, gpu_epoch_s + (start + 12.5) / 1000.0]]])
+        for i, (start, end, _) in enumerate(frames):
+            runs.append([start + 1.0, 1 if i % 2 else 2, 3, 0])
+        hitch = frames[6]
+        runs.append([hitch[0] + 50.0, 2, 20, 0])
+        marks.append([hitch[0] + 40.0, hitch[0] + 120.0, "load", "Loading Menu"])
+        raw = raw_profile(runs)
+        raw.update({"frameMarks": frames, "durationS": frames[-1][1] / 1000.0,
+                    "hitches": [{"frame": hitch[2], "ms": hitch[1] - hitch[0], "startMs": hitch[0]}], "marks": marks,
+                    "counters": [[0.0, 100, 2 << 30, 0, 0, 0, 8 << 30], [250.0, 150, 2 << 30, 1 << 20, 0, 1_250_000, 8 << 30]],
+                    "gpu": {"available": True, "reason": "", "backbuffer": [1920, 1080],
+                            "labels": ["frame", "present", "dsv 2048x2048 array", "rtv 1920x1080"],
+                            "disjointFrames": 0, "staleFrames": 0, "frames": gpu}})
+        profile = profiling.Profile(raw, profiling.GameSymbols(self.root))
+
+        timed, offset = gpu_frames(raw)
+        self.assertLess(offset, -2e8)  # the clocks' zero points are days apart; that alone is not misalignment
+        self.assertAlmostEqual(timed[0]["gpuStart"], 0.0, places=3)  # tightest bound: no lag left after alignment
+        summary = profile.summary()["gpu"]
+        self.assertGreaterEqual(summary["gpuLagMsP50"], 0.0)
+        self.assertLess(summary["gpuLagMsP50"], 1.0)
+
+        path = self.root / "clocks.sqlite"
+        export_sqlite(profile, path)
+        named = documented_queries((Path(__file__).resolve().parent.parent / "docs" / "profiling.md").read_text())
+        self.assertEqual(query(path, named["hitchTop"])["rows"][0][:2], ["id:77+0x10", "SkyrimSE.exe"])
+        self.assertEqual(query(path, named["cellLoads"])["rows"][0][:2], ["id:77+0x10", "SkyrimSE.exe"])
+        hitch_marker = query(path, "SELECT COUNT(*) FROM MarkersV m JOIN Frames f ON f.hitch = 1 "
+                                   "AND m.start >= f.start AND m.start < f.end WHERE m.kind = 'hitch'")["rows"]
+        self.assertEqual(hitch_marker, [[1]])
+        inside = query(path, "SELECT COUNT(*) FROM GpuRanges g JOIN Frames f ON f.frame = g.frame "
+                             "AND g.start >= f.start AND g.end <= f.end")["rows"][0][0]
+        self.assertEqual(inside, query(path, "SELECT COUNT(*) FROM GpuRanges")["rows"][0][0])
+        gpu_during_load = query(path, "SELECT COUNT(*) FROM MarkersV m JOIN GpuRanges g ON g.start < m.end "
+                                      "AND g.end > m.start WHERE m.kind = 'load'")["rows"][0][0]
+        self.assertGreater(gpu_during_load, 0)
+        counters = query(path, "SELECT COUNT(*) FROM Counters c JOIN Frames f ON c.timestamp >= f.start "
+                               "AND c.timestamp < f.end")["rows"][0][0]
+        self.assertGreater(counters, 0)
 
     def test_query_is_read_only(self):
         import sqlite3

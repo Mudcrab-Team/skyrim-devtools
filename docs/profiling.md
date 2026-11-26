@@ -159,6 +159,10 @@ frames is counted as stale and dropped. It is plain D3D11, so it works the same 
   offset to the CPU clock is the largest (CPU issue time - GPU time) over the profile, which places the GPU as
   early as the data allows. When the GPU ran behind the CPU in every frame of the profile, the true GPU times
   are later than drawn. Durations are exact; positions are a lower bound.
+  The offset (`alignmentOffsetMs`) is the distance between the two clocks' zero points, so a value of
+  millions of ms is normal: the GPU counter starts near boot, the profile's clock at its start. Check the
+  alignment with `gpuLagMsP50` instead, the median time from the CPU issuing a frame's first stamp to the GPU
+  executing it, which is small and never negative.
 * **Bound**: per frame, `cpu_ms` is the main thread's on-CPU samples inside the frame and `gpu_ms` the
   frame's GPU span (frame-start stamp to the Present stamp). The span is not GPU busy time: timestamps keep
   advancing while the GPU waits for the CPU's next commands, so a game that sleeps in its frame limiter
@@ -321,6 +325,7 @@ Views with the strings joined in: `SymbolsV`, `ThreadsV`, `MarkersV`, `GpuRanges
 
 Top self functions during hitches:
 
+<!-- query: hitchTop -->
 ```sql
 SELECT s.name, s.module, SUM(c.weight) AS samples
 FROM Frames f
@@ -333,12 +338,14 @@ GROUP BY s.id ORDER BY samples DESC LIMIT 20;
 
 Frames where the GPU fell behind the CPU:
 
+<!-- query: gpuOverCpu -->
 ```sql
 SELECT frame, frame_ms, cpu_ms, gpu_ms, excess_ms, bound FROM Frames WHERE bound = 'gpu' ORDER BY gpu_ms DESC;
 ```
 
 What ran during cell loads:
 
+<!-- query: cellLoads -->
 ```sql
 SELECT s.name, s.module, SUM(c.weight) AS samples
 FROM MarkersV m

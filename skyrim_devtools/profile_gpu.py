@@ -180,6 +180,7 @@ def gpu_summary(profile, top=10):
         "gpuBusyMsP50": _pct([r["gpuBusyMs"] for r in table if r["gpuBusyMs"] is not None], 0.5),
         "utilPctMean": round(sum(us) / len(us), 1) if (us := [r["utilPct"] for r in table if r["utilPct"] is not None]) else None,
         "hookUsPerFrame": round(median(f["hookUs"] for f in frames), 1),
+        "gpuLagMsP50": _pct([f["gpuStart"] - f["cpuBegin"] for f in frames], 0.5),
         "passes": [{"pass": label, "kind": kind, "msPerFrame": round(ms / len(frames), 3), "pct": round(100.0 * ms / total_gpu, 1)}
                    for label, (kind, ms) in sorted(passes.items(), key=lambda p: -p[1][1])[:top]],
     })

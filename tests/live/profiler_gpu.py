@@ -14,7 +14,6 @@ import asyncio
 import json
 import os
 from pathlib import Path
-import re
 import sqlite3
 import sys
 import time
@@ -27,13 +26,38 @@ import profiler  # noqa: E402
 from profiler import INTERIOR, frame_window, home, wait_playable  # noqa: E402
 import profiler_ui  # noqa: E402
 from skyrim_devtools import profiling  # noqa: E402
-from skyrim_devtools.profile_sqlite import query  # noqa: E402
+from skyrim_devtools.profile_sqlite import documented_queries, query  # noqa: E402
 from skyrim_devtools.use.manager import GameManager  # noqa: E402
 
 
+DOC_QUERIES = ("hitchTop", "gpuOverCpu", "cellLoads")
+
+# Every table that is joined on time must sit on the profile's clock; a table off by a clock domain shows up
+# as a range far outside the CPU samples' range.
+TIME_RANGES = {"CpuSamples": "SELECT MIN(timestamp), MAX(end) FROM CpuSamples",
+               "Frames": "SELECT MIN(start), MAX(end) FROM Frames",
+               "FramesGpu": "SELECT MIN(gpu_start), MAX(gpu_end) FROM Frames",
+               "Markers": "SELECT MIN(start), MAX(end) FROM Markers",
+               "GpuRanges": "SELECT MIN(start), MAX(end) FROM GpuRanges",
+               "Counters": "SELECT MIN(timestamp), MAX(timestamp) FROM Counters"}
+
+
 def doc_queries():
-    doc = (ROOT / "docs" / "profiling.md").read_text()
-    return [q.strip().rstrip(";") for q in re.findall(r"```sql\n(.*?)```", doc, re.S)]
+    queries = documented_queries((ROOT / "docs" / "profiling.md").read_text())
+    return [queries[name] for name in DOC_QUERIES]
+
+
+def time_domain_failures(db, slack_ms=60000.0):
+    """Tables whose time range is not on the CPU samples' clock, with every table's range."""
+    ranges = {t: query(db, sql)["rows"][0] for t, sql in TIME_RANGES.items()}
+    lo, hi = ranges["CpuSamples"]
+    failed = []
+    if lo is None:
+        return ["CpuSamples empty"], ranges
+    for table, (first, last) in ranges.items():
+        if first is not None and (first < lo - slack_ms or last > hi + slack_ms):
+            failed.append(f"{table} times {first}..{last} are off the CPU clock ({lo}..{hi})")
+    return failed, ranges
 
 
 async def profiled(manager, symbols, name, phase, threads, seconds, out):
@@ -70,6 +94,9 @@ async def gputime_case(manager, symbols, seconds, out):
         failed.append("fps dropped more than 3% (not vsync-capped)")
     if (summary["overhead"].get("mainSuspendedPct") or 100) >= 3.0:
         failed.append("main thread suspended >= 3% of wall time")
+    lag = gpu.get("gpuLagMsP50")
+    if gpu.get("frames") and (lag is None or not 0 <= lag < 100):
+        failed.append(f"GPU lag p50 {lag} ms: GPU times are not aligned to the CPU clock")
     if "nvtx" not in marked:
         failed.append("Profile.mark reply has no nvtx field")
     if not Path(paths.get("sqlite", "")).is_file():
@@ -78,7 +105,8 @@ async def gputime_case(manager, symbols, seconds, out):
             "overhead": summary["overhead"], "nvtx": marked.get("nvtx"),
             "gpu": {k: gpu.get(k) for k in ("available", "reason", "frames", "presented", "timedPct", "gpuMsP50",
                                              "gpuMsP95", "gpuMsMax", "cpuMsP50", "frameMsP50", "boundPct",
-                                             "hookUsPerFrame", "disjointFrames", "staleFrames", "alignmentOffsetMs")},
+                                             "hookUsPerFrame", "disjointFrames", "staleFrames", "alignmentOffsetMs",
+                                             "gpuLagMsP50")},
             "passes": gpu.get("passes", [])[:8], "files": paths}
 
 
@@ -86,7 +114,9 @@ async def sqlite_case(manager, symbols, seconds, out):
     raw, paths, summary, off, on, fps_ratio, _ = await profiled(manager, symbols, "sqlite", INTERIOR, "main", seconds, out)
     db = Path(paths["sqlite"])
     failed, results = [], {}
-    for name, sql in zip(("hitchTop", "gpuOverCpu", "cellLoads"), doc_queries()):
+    domain_failed, ranges = time_domain_failures(db)
+    failed.extend(domain_failed)
+    for name, sql in zip(DOC_QUERIES, doc_queries()):
         try:
             began = time.monotonic()
             r = query(db, sql, limit=10)
@@ -113,7 +143,8 @@ async def sqlite_case(manager, symbols, seconds, out):
     if summary.get("hitches") and results.get("hitchTop", {}).get("rows", 0) == 0:
         failed.append("hitches present but the hitch query returned nothing")
     return {"pass": not failed, "failed": failed, "fpsRatio": fps_ratio, "frames": frames, "counts": counts,
-            "queries": results, "sqliteBytes": db.stat().st_size, "hitches": len(summary.get("hitches", []))}
+            "queries": results, "timeRanges": ranges, "gpuLagMsP50": (summary.get("gpu") or {}).get("gpuLagMsP50"),
+            "sqliteBytes": db.stat().st_size, "hitches": len(summary.get("hitches", []))}
 
 
 async def top_case(manager, seconds):
