@@ -31,7 +31,11 @@ target_link_libraries(SkyrimDevToolsServer PUBLIC nlohmann_json::nlohmann_json P
 
 # Every module .cpp is linked straight into the DLL, so its static registrar is never dropped.
 file(GLOB DEVTOOLS_MODULES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
-add_library(SkyrimDevTools SHARED ${DEVTOOLS_MODULES})
+# The trace thunk is assembly so it can carry the unwind info the sampler walks through. It is its own object
+# library because CommonLib's C++ compile options would otherwise be passed to the assembler.
+enable_language(ASM_MASM)
+add_library(SkyrimDevToolsThunk OBJECT trace_thunk.asm)
+add_library(SkyrimDevTools SHARED ${DEVTOOLS_MODULES} $<TARGET_OBJECTS:SkyrimDevToolsThunk>)
 target_compile_features(SkyrimDevTools PRIVATE cxx_std_23)
 target_include_directories(SkyrimDevTools PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/third_party/gpa")
 target_compile_definitions(SkyrimDevTools PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)

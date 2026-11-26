@@ -12,6 +12,7 @@ import time
 from urllib.parse import quote
 
 from .profile_gpu import counter_series, frame_table, gpu_frames
+from .profile_trace import sqlite_rows
 
 SCHEMA = """
 CREATE TABLE Meta (key TEXT PRIMARY KEY, value TEXT);
@@ -27,10 +28,13 @@ CREATE TABLE Markers (id INTEGER PRIMARY KEY, kind TEXT, start REAL, end REAL, t
 CREATE TABLE GpuRanges (frame INTEGER, passId INTEGER, kind TEXT, start REAL, end REAL, ms REAL);
 CREATE TABLE Counters (timestamp REAL, nameId INTEGER, value REAL);
 CREATE TABLE GpaCounters (sample INTEGER, labelId INTEGER, nameId INTEGER, groupId INTEGER, usage TEXT, value REAL);
+CREATE TABLE TraceEvents (threadId INTEGER, start REAL, end REAL, ms REAL, nameId INTEGER, category TEXT, passIndex INTEGER,
+    a INTEGER, b INTEGER);
 CREATE INDEX CpuSamplesTime ON CpuSamples (timestamp);
 CREATE INDEX CpuSamplesThread ON CpuSamples (threadId, timestamp);
 CREATE INDEX CallchainsSymbol ON Callchains (symbolId, depth);
 CREATE INDEX GpuRangesFrame ON GpuRanges (frame);
+CREATE INDEX TraceEventsTime ON TraceEvents (start);
 CREATE VIEW SymbolsV AS SELECT s.id, s.rva, n.value AS name, m.value AS module, s.kind, src.value AS source
     FROM Symbols s JOIN StringIds n ON n.id = s.nameId JOIN StringIds m ON m.id = s.moduleId
     JOIN StringIds src ON src.id = s.sourceId;
@@ -43,6 +47,8 @@ CREATE VIEW GpuRangesV AS SELECT g.frame, p.value AS pass, g.kind, g.start, g.en
 CREATE VIEW GpaCountersV AS SELECT g.sample, l.value AS label, n.value AS name, gr.value AS grp, g.usage, g.value
     FROM GpaCounters g JOIN StringIds l ON l.id = g.labelId JOIN StringIds n ON n.id = g.nameId
     JOIN StringIds gr ON gr.id = g.groupId;
+CREATE VIEW TraceEventsV AS SELECT e.threadId, e.start, e.end, e.ms, n.value AS name, e.category, e.passIndex, e.a, e.b
+    FROM TraceEvents e JOIN StringIds n ON n.id = e.nameId;
 CREATE VIEW CountersV AS SELECT c.timestamp, n.value AS name, c.value FROM Counters c JOIN StringIds n ON n.id = c.nameId;
 CREATE VIEW LeafSamplesV AS SELECT c.timestamp, c.end, c.threadId, c.state, c.weight, s.name, s.module, s.kind
     FROM CpuSamples c JOIN Callchains cc ON cc.id = c.callchainId AND cc.depth = 0 JOIN SymbolsV s ON s.id = cc.symbolId;
@@ -106,6 +112,9 @@ def export_sqlite(profile, path):
         gpa_rows = [(i, sid(labels[i] if i < len(labels) else ""), sid(c.get("name")), sid(c.get("group")), c.get("usage"), v)
                     for c in gpa.get("counters") or [] for i, v in enumerate(c.get("values") or [])
                     if isinstance(v, (int, float))] if gpa.get("ok") else []
+        trace_rows = [(tid, start, end, ms, sid(name), category, index, a, b)
+                      for tid, start, end, ms, name, category, index, a, b in sqlite_rows(raw)]
+        trace = raw.get("trace") or {}
         board = (raw.get("gpuMetrics") or {})
         context = raw.get("context") or {}
         meta_rows = {
@@ -121,6 +130,10 @@ def export_sqlite(profile, path):
             "gpaDevice": gpa.get("device"), "gpaPassCount": gpa.get("passCount"), "gpaFramesUsed": gpa.get("framesUsed"),
             "gpaOverhead": json.dumps(gpa["overhead"]) if gpa.get("overhead") else None,
             "gpaError": None if not gpa or gpa.get("ok") else gpa.get("error"),
+            "traceSettings": json.dumps(trace["settings"]) if trace.get("settings") else None,
+            "traceHooks": json.dumps(trace["hooks"]) if trace.get("hooks") else None,
+            "traceApi": json.dumps(trace["api"]) if trace.get("api") else None,
+            "traceOsHooks": json.dumps(trace["osHooks"]) if trace.get("osHooks") else None,
         }
         db.executemany("INSERT INTO StringIds VALUES (?, ?)", ((i, t) for t, i in strings.items()))
         db.executemany("INSERT INTO ThreadNames VALUES (?, ?, ?, ?, ?, ?)", thread_rows)
@@ -132,13 +145,14 @@ def export_sqlite(profile, path):
         db.executemany("INSERT INTO GpuRanges VALUES (?, ?, ?, ?, ?, ?)", ranges)
         db.executemany("INSERT INTO Counters VALUES (?, ?, ?)", counters)
         db.executemany("INSERT INTO GpaCounters VALUES (?, ?, ?, ?, ?, ?)", gpa_rows)
+        db.executemany("INSERT INTO TraceEvents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", trace_rows)
         db.executemany("INSERT INTO Meta VALUES (?, ?)", ((k, None if v is None else str(v)) for k, v in meta_rows.items()))
         db.commit()
     finally:
         db.close()
     temp.replace(path)
     return {"Frames": len(frames), "CpuSamples": len(samples), "Callchains": len(chains), "Symbols": len(symbols),
-            "Markers": len(markers), "GpuRanges": len(ranges), "Counters": len(counters), "GpaCounters": len(gpa_rows), "ThreadNames": len(thread_rows),
+            "Markers": len(markers), "GpuRanges": len(ranges), "Counters": len(counters), "GpaCounters": len(gpa_rows), "TraceEvents": len(trace_rows), "ThreadNames": len(thread_rows),
             "StringIds": len(strings)}
 
 

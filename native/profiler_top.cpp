@@ -9,6 +9,7 @@
 #include "methods.h"
 #include "perf.h"
 #include "profiler.h"
+#include "thread_names.h"
 
 #include <Windows.h>
 #include <TlHelp32.h>
@@ -126,11 +127,7 @@ namespace
             FILETIME created, exited, kernel, user;
             if (GetThreadTimes(thread, &created, &exited, &kernel, &user)) {
                 Row row{ entry.th32ThreadID, {}, FileTimeSeconds(kernel) + FileTimeSeconds(user), -1.0 };
-                PWSTR description = nullptr;
-                if (SUCCEEDED(GetThreadDescription(thread, &description)) && description) {
-                    row.name = Narrow(description);
-                    LocalFree(description);
-                }
+                row.name = devtools::threads::NameOf(entry.th32ThreadID, thread).text;
                 rows.push_back(std::move(row));
             }
             CloseHandle(thread);

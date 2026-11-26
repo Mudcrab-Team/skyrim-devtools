@@ -9,6 +9,7 @@
 #include "perf.h"
 #include "profiler.h"
 #include "screen.h"
+#include "trace.h"
 
 #include <MinHook.h>
 #include <Windows.h>
@@ -172,9 +173,11 @@ namespace
             Record(QpcSeconds(), frame);
             screen::BeforePresent(swapChain, frame);
             profiler::GpuBeforePresent(swapChain);
+            trace::BeforePresent(swapChain);
             const double before = QpcSeconds();
             const auto result = originalPresent(swapChain, syncInterval, flags);
             lastPresentMs.store(static_cast<float>((QpcSeconds() - before) * 1000.0), std::memory_order_relaxed);
+            trace::AfterPresent(frame + 1);
             profiler::GpuAfterPresent(frame + 1);
             return result;
         }

@@ -5,7 +5,9 @@ and total time, GPU time per frame and per pass (GPU- or CPU-bound), the split b
 waits on, and the stacks of every slow frame. Agents drive it through MCP (`profile_*` tools) and people
 through the `skyrim-devtools-profile` command. There are three views: a live terminal dashboard (`top`,
 in the spirit of `nvidia-smi`), a timeline of threads, frames and events (`timeline.html`, in the spirit of
-Nsight Systems) and the [Firefox Profiler](https://profiler.firefox.com) with flame graph SVGs for the deep dive.
+Nsight Systems), a Perfetto trace (`trace.pftrace`: samples, engine phases, D3D11 calls, GPU passes, waits and
+markers on one timeline, opened locally in [ui.perfetto.dev](https://ui.perfetto.dev)) and the
+[Firefox Profiler](https://profiler.firefox.com) with flame graph SVGs for the deep dive.
 
 ## How it works
 
@@ -38,13 +40,15 @@ of symbol tables and the same raw profile can be re-symbolised later as names im
 skyrim-devtools-profile record --config host.json --seconds 30 [--phase idle|walk|coc:<cell>[,<back>]]
                                [--threads all|main|frame|<ids or names>] [--hz 1000] [--other-hz 250]
                                [--suspend-budget 2.5] [--save NAME] [--cell Riverwood] [--out DIR] [--keep]
+                               [--trace batched|full|off] [--trace-no-os] [--trace-hooks HOOKS.json]
                                [--gpu-counters [--gpa-dir DIR] [--gpa-counters A,B,...] [--gpa-frames 600]]
 skyrim-devtools-profile report DIR [--rewrite] [--json]
 skyrim-devtools-profile export DIR --firefox OUT.json[.gz] [--open]
 skyrim-devtools-profile diff A B [--threads main|all] [--json]
 skyrim-devtools-profile top --config host.json [--save NAME] [--cell C] [--phase P] [--window 3] [--count N] [--json]
 skyrim-devtools-profile timeline DIR [--recorder TIMELINE.jsonl] [--out FILE]
-skyrim-devtools-profile export DIR --sqlite OUT.sqlite [--recorder TIMELINE.jsonl]
+skyrim-devtools-profile export DIR [--sqlite OUT.sqlite] [--perfetto OUT.pftrace [--format proto|json] [--open-perfetto]]
+                               [--recorder TIMELINE.jsonl]
 skyrim-devtools-profile query DB.sqlite "SELECT ..." [--limit 200] [--json]
 ```
 
@@ -60,6 +64,7 @@ applies a load (`walk` turns and walks, `coc:` loads a cell and returns, repeate
 | `wait-flame.svg`, `wait.folded` | The same for waiting (off-CPU) samples |
 | `timeline.html` | Self-contained timeline viewer (see below) |
 | `profile.sqlite` | The profile as SQL tables (see SQLite export) |
+| `trace.pftrace` | Perfetto trace of everything above plus the event trace (see Perfetto trace) |
 | `raw.json.gz` | The raw profile; `report --rewrite` regenerates everything from it |
 | `gpu-counters.json` | Only with `--gpu-counters`: the GPUPerfAPI capture (see AMD hardware counters) |
 
@@ -82,11 +87,13 @@ each hitch. The file layout is described in [profile-data.md](profile-data.md).
 `diff` compares two profiles (for example the same scene with and without a mod) and lists the largest
 changes in self and total share and in the module split.
 
-MCP tools in `skyrim-use`: `profile_start {threads, hz, duration_s, gpu_counters}` (threads `all` by default), `profile_stop` (returns the report and
+MCP tools in `skyrim-use`: `profile_start {threads, hz, duration_s, gpu_counters, trace}` (threads `all` by default), `profile_stop` (returns the report and
 writes the files on the MCP host), `profile_status`, `profile_watch`, `profile_hitches`, `profile_top` (one
 live snapshot), `profile_mark` (a named span on the running profile) and `profile_query {sql, path?, limit?}`
 (read-only SQL on the last `profile_stop`'s `profile.sqlite`, or on `path`) and `profile_gpu_counters
-{action: capture|list, counters?, max_frames?, gpa_dir?}` (a GPUPerfAPI capture on its own). Raw RPC methods are listed in
+{action: capture|list, counters?, max_frames?, gpa_dir?}` (a GPUPerfAPI capture on its own) and
+`profile_trace_summary {path?, top?}` (engine phases per frame, longest frames, draws per frame, D3D11 cost per
+pass, waits and reads of a traced profile). Raw RPC methods are listed in
 [protocol.md](protocol.md).
 
 ### Live view: `top`
@@ -300,6 +307,88 @@ DXVK changes the CPU and GPU cost of every call (translation, its own pipeline c
 paths), so frame times and CPU profiles taken under it say nothing about the D3D11 game. Use it only for GPU-
 side questions about a scene, and profile CPU and frame time without it.
 
+## Perfetto trace
+
+Every `record` and `profile_stop` also writes `trace.pftrace`, a [Perfetto](https://perfetto.dev) trace
+(protobuf TrackEvent) with the whole profile on one time axis; `export DIR --perfetto OUT.pftrace` writes one
+from a saved profile (`OUT.json` or `--format json` writes Chrome trace JSON instead, without the call-stack
+samples). Open it in [ui.perfetto.dev](https://ui.perfetto.dev) with **Open trace file**: the UI runs in the
+browser and loads the file locally. `export ... --open-perfetto` serves the file on `127.0.0.1:9001` and opens the UI
+on it, which does the same without a file dialog.
+
+**Never share or upload a trace.** It holds game function names from the local symbol tables, like every
+other profile output; it stays in `.local/` and never goes into a commit, issue, PR or chat. Screenshots of
+the UI likewise stay local.
+
+Tracks:
+
+| Track | What |
+|-------|------|
+| SkyrimSE, one track per thread | Call-stack samples (the flame chart under the thread), engine phases as nested ranges, OS waits and file reads |
+| thread / `D3D11 passes` | The render thread's D3D11 work cut at each render-target or depth clear: one range per pass with draws, dispatches, maps, other calls and µs spent in the API |
+| thread / `D3D11 API` | Copies and `Flush` always; with `--trace full`, every draw, dispatch, map, update and clear |
+| thread / `state (sampled)` | Running or waiting, from the sampler |
+| `Frames` | CPU frames, present to present |
+| `GPU` | GPU frames and passes on the CPU clock, with an arrow (flow) from the CPU pass that submitted each GPU pass; board counters (ADLX) below |
+| `Counters` | Process CPU, memory, page faults and I/O |
+| `Markers / Agent` | `Profile.mark` spans, loading screens and menus, agent tool calls and narration, hitches |
+
+The event trace is recorded by the plugin only while a profile with `trace` runs, into per-thread buffers
+on the sampler's clock (QPC), so ranges and samples line up exactly. Its parts:
+
+* **Engine phases**: timed hooks on engine functions (render world, render submission, save, load, cell
+  attach and purge, file streams). The built-in list uses Address Library IDs only. More come from a local
+  list: `--trace-hooks FILE`, config `traceHooks`, or `.local/trace-hooks.json`, as
+  `{"hooks": [{"name": "...", "category": "job", "minUs": 50}]}` (or `id` / `rva` in place of `name`).
+  Names are looked up in the local symbol tables on the analysing machine and only the address goes to the
+  plugin. The plugin refuses a target that is not a function start in the game's code; `Meta.traceHooks`
+  and `profile_trace_summary` report what was installed. `minUs` drops calls shorter than that.
+* **D3D11**: hooks on the immediate context. `batched` (default) sums calls per pass; `full` records every
+  call (more overhead; for short captures).
+* **OS waits and file reads**: the game's imports of the wait, sleep, `ReadFile` and `CreateFile` functions.
+  Waits shorter than 20 µs are only counted. Reads are tagged by file kind (archive, plugin, texture, ...).
+
+`--trace off` (or `profile_start {trace: "off"}`) leaves the plugin's tracer idle. Overhead with the default
+settings is measured by the live test `tests/live/profiler_trace.py` (frame rate at a 60 fps cap, trace on
+versus off).
+
+Queries over the trace in `profile.sqlite` (times in ms; `a`/`b` hold per-category data: draws and maps
+per pass, bytes per read, timeout and result per wait):
+
+Longest frames and what the main thread's engine phases did in them:
+
+```sql
+WITH worst AS (SELECT frame, start, end, frame_ms FROM Frames ORDER BY frame_ms DESC LIMIT 10)
+SELECT w.frame, w.frame_ms, e.name, ROUND(SUM(e.ms), 3) AS ms, COUNT(*) AS calls
+FROM worst w JOIN ThreadsV t ON t.isMain = 1
+JOIN TraceEventsV e ON e.threadId = t.threadId AND e.start >= w.start AND e.start < w.end
+WHERE e.category NOT IN ('d3d11', 'pass')
+GROUP BY w.frame, e.name ORDER BY w.frame_ms DESC, ms DESC;
+```
+
+Time per engine phase per frame:
+
+```sql
+SELECT e.name, COUNT(DISTINCT f.frame) AS frames, ROUND(SUM(e.ms) / (SELECT COUNT(*) FROM Frames), 3) AS ms_per_frame,
+       ROUND(MAX(e.ms), 3) AS max_ms
+FROM TraceEventsV e JOIN Frames f ON e.start >= f.start AND e.start < f.end
+WHERE e.category NOT IN ('d3d11', 'pass', 'wait', 'io')
+GROUP BY e.name ORDER BY ms_per_frame DESC;
+```
+
+Draw calls per frame (batched mode; with `--trace full` count `name LIKE 'Draw%'` rows instead):
+
+```sql
+SELECT f.frame, f.frame_ms, SUM(e.a & 4294967295) AS draws, SUM(e.a >> 32) AS maps,
+       ROUND(SUM(e.b >> 32) / 1000.0, 3) AS api_ms
+FROM Frames f JOIN TraceEventsV e ON e.category = 'pass' AND e.start >= f.start AND e.start < f.end
+GROUP BY f.frame ORDER BY draws DESC;
+```
+
+The trace's own tables can also be queried with Perfetto's
+[trace_processor](https://perfetto.dev/docs/analysis/trace-processor) (`slice`, `thread_track`, `flow`,
+`cpu_profile_stack_sample`, `counter`).
+
 ## SQLite export
 
 Every `record`/`profile_stop` writes `profile.sqlite`; `export DIR --sqlite OUT` writes one from a saved
@@ -318,8 +407,9 @@ profile. The layout follows Nsight Systems' export. Times are milliseconds from 
 | `GpuRanges` | frame, passId, kind, start, end, ms |
 | `Counters` | timestamp, nameId, value |
 | `GpaCounters` | sample, labelId, nameId, groupId, usage, value (only with `--gpu-counters`) |
+| `TraceEvents` | threadId, start, end, ms, nameId, category, passIndex, a, b (the event trace; see Perfetto trace) |
 
-Views with the strings joined in: `SymbolsV`, `ThreadsV`, `MarkersV`, `GpuRangesV`, `CountersV`, `GpaCountersV` and
+Views with the strings joined in: `SymbolsV`, `ThreadsV`, `MarkersV`, `GpuRangesV`, `CountersV`, `GpaCountersV`, `TraceEventsV` and
 `LeafSamplesV` (each sample with its leaf function). Query with any SQLite client, `query DB "SQL"`, or
 `profile_query` (read-only: writes, `ATTACH` and `PRAGMA` are refused, 10 s time limit).
 
@@ -451,3 +541,6 @@ pinned setup; mod DLLs appear as `skse-plugin` modules, named from the PDBs they
 * `threads=all` suspends other game threads at `--other-hz`; with many busy threads lower it, or use
   `threads=main` for the cheapest capture.
 * A throttled tick repeats the previous stack, so at high budget pressure short functions are undercounted.
+* The event trace keeps up to 2 million events (`maxEvents`); a thread that runs out drops further events and
+  `profile_trace_summary` reports the count. Hooked engine functions appear in sampled stacks with the
+  plugin's thunk between them and their callers.

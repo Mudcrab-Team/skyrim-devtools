@@ -15,6 +15,8 @@
 #include "methods.h"
 #include "perf.h"
 #include "profiler.h"
+#include "thread_names.h"
+#include "trace.h"
 
 #include <Windows.h>
 #include <DbgHelp.h>
@@ -375,17 +377,6 @@ namespace
         return out;
     }
 
-    std::string ThreadName(HANDLE thread)
-    {
-        PWSTR name = nullptr;
-        std::string out;
-        if (SUCCEEDED(GetThreadDescription(thread, &name)) && name) {
-            out = Narrow(name);
-            LocalFree(name);
-        }
-        return out;
-    }
-
     // Consecutive samples of one thread with the same stack and state, as one record.
     struct RunRecord
     {
@@ -399,7 +390,8 @@ namespace
     {
         DWORD tid = 0;
         HANDLE handle = nullptr;
-        std::string name;
+        devtools::threads::Name name;
+        std::uintptr_t start = 0;
         bool main = false;
         std::uintptr_t stackHigh = 0;
         std::uint64_t lastCycles = 0;
@@ -450,6 +442,7 @@ namespace
         double started = 0.0;
         double stopped = 0.0;
         double deadline = 0.0;
+        bool traced = false;
         std::string threadsSpec;
         Interner interner;
         std::vector<Target> threads;
@@ -581,7 +574,8 @@ namespace
         }
         target.tid = tid;
         target.handle = handle;
-        target.name = ThreadName(handle);
+        target.name = devtools::threads::NameOf(tid, handle);
+        target.start = devtools::threads::StartAddress(handle);
         target.main = tid == mainThreadId;
         target.stackHigh = StackBase(handle);
         if (!target.stackHigh) {
@@ -658,7 +652,7 @@ namespace
             if (!OpenTarget(tid, target)) {
                 continue;
             }
-            if (!WantsThread(session.threadsSpec, tid, target.name)) {
+            if (!WantsThread(session.threadsSpec, tid, target.name.text)) {
                 CloseHandle(target.handle);
                 continue;
             }
@@ -941,6 +935,7 @@ namespace
                     CloseHandle(t.handle);
                     t.handle = nullptr;
                 }
+                trace::Stop();
                 std::lock_guard lock(controlMutex);
                 finished = std::move(session);
                 profiling.store(false);
@@ -1286,10 +1281,12 @@ namespace
             for (const auto& run : target.runs) {
                 runs.push_back({ std::round((run.at - s.started) * 1e5) / 100.0, run.stack, run.count, run.flags });
             }
-            threads.push_back({ { "tid", target.tid }, { "name", target.name }, { "main", target.main },
+            Json thread{ { "tid", target.tid }, { "main", target.main },
                 { "frameThread", target.tid == frameThreadId.load() }, { "samples", target.samples },
                 { "walked", target.walked }, { "suspendedMs", std::round(target.suspendedSeconds * 1e5) / 100.0 },
-                { "throttled", target.throttled }, { "runs", std::move(runs) } });
+                { "throttled", target.throttled }, { "runs", std::move(runs) } };
+            devtools::threads::Describe(thread, target.tid, target.handle, target.start, 0, target.name);
+            threads.push_back(std::move(thread));
         }
         auto marks = Json::array();
         {
@@ -1330,6 +1327,9 @@ namespace
             { "gpuCounters", profiler::GpuCounters(s.started, s.stopped + 1.1, s.started) },
             { "gpuMetrics", profiler::GpuMetrics(s.started, s.stopped + 1.1, s.started) } };
         out["modules"] = resolver.Modules();
+        if (s.traced) {
+            out["trace"] = trace::Serialize(s.started);
+        }
         return out.dump(-1, ' ', false, Json::error_handler_t::replace);
     }
 
@@ -1525,7 +1525,7 @@ DEVTOOLS_MODULE(Profiler)
     SetCapability("profile", true);
 
     Register("Profile.start", [](const Json& params) {
-        AllowOnly(params, { "threads", "hz", "durationS", "suspendBudgetPct", "otherHz" });
+        AllowOnly(params, { "threads", "hz", "durationS", "suspendBudgetPct", "otherHz", "trace" });
         const double hz = Optional<double>(params, "hz", 1000.0);
         const double duration = Optional<double>(params, "durationS", 30.0);
         const double budgetPct = Optional<double>(params, "suspendBudgetPct", 2.5);
@@ -1556,6 +1556,11 @@ DEVTOOLS_MODULE(Profiler)
             throw RpcError(code::busy, "A profile is already running; call Profile.stop");
         }
         auto session = std::make_unique<Session>();
+        Json traceInfo = nullptr;
+        if (params.contains("trace") && params["trace"].is_object() && params["trace"].value("enabled", true)) {
+            traceInfo = trace::Start(params["trace"]);
+            session->traced = true;
+        }
         session->hz = hz;
         session->suspendBudget = budgetPct / 100.0;
         session->otherEvery = static_cast<std::uint32_t>(std::max(1.0, std::round(hz / std::min(otherHz, hz))));
@@ -1568,7 +1573,7 @@ DEVTOOLS_MODULE(Profiler)
         profiling.store(true);
         EnsureSampler();
         return Json{ { "started", true }, { "hz", hz }, { "threads", threads }, { "durationS", duration },
-            { "mainThread", mainThreadId } };
+            { "mainThread", mainThreadId }, { "trace", std::move(traceInfo) } };
     }, { .thread = Thread::Any });
 
     Register("Profile.stop", [](const Json& params) {
@@ -1590,6 +1595,7 @@ DEVTOOLS_MODULE(Profiler)
             }
         }
         profiling.store(false);
+        trace::Stop();
         for (int i = 0; i < 4000; ++i) {
             {
                 std::lock_guard lock(controlMutex);

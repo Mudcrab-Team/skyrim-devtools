@@ -299,6 +299,73 @@ class Profile:
         self.frame_function = [self._function(f) for f in raw.get("frames", [])]
         self.stacks = raw.get("stacks", [])
         self._stack_cache = {}
+        self.label_threads()
+
+    # Labels the client derived itself; a thread carrying one is relabelled when the symbols change.
+    DERIVED_THREAD_NAMES = ("main", "start-symbol", "root-symbol", "start-address", "root-address")
+
+    def _game_modules(self):
+        return {m["name"].lower() for m in self.modules if m.get("game")} or {"skyrimse.exe"}
+
+    def _code_label(self, where):
+        """(label, resolved) for a code address reported as {module, rva}: `Function (SkyrimSE+0x1234)` when
+        the game's symbols name it, else `module+0x1234`."""
+        if not where or where.get("module") is None or where.get("rva") is None:
+            return None, False
+        module, rva = where["module"], where["rva"]
+        place = f"{module.rsplit('.', 1)[0]}+0x{rva:x}"
+        if module.lower() in self._game_modules() and not self.foreign:
+            label, source, _ = self.symbols.resolve(rva)
+            if source not in ("none", "pdata"):
+                return f"{label} ({place})", True
+        return place, False
+
+    def _sampled_root(self, thread):
+        """{module, rva} of the outermost game frame of the thread's most sampled stack."""
+        weights = Counter()
+        for _, stack, count, _ in thread.get("runs", []):
+            weights[stack] += count
+        frames = self.raw.get("frames", [])
+        for stack, _ in weights.most_common(1):
+            root = None
+            while stack is not None and 0 <= stack < len(self.stacks):
+                prefix, frame = self.stacks[stack]
+                info = frames[frame] if 0 <= frame < len(frames) else {}
+                module = self.modules[info["m"]] if 0 <= info.get("m", -1) < len(self.modules) else {}
+                if module.get("game"):
+                    root = {"module": module["name"], "rva": info.get("rva")}
+                stack = prefix
+            return root
+        return None
+
+    def label_threads(self):
+        """Give every unnamed thread (sampled or traced) a label: `main` for the main thread, else the function
+        its start address or outermost game frame lies in. `nameSource` says where a name came from:
+        description or exception (the game named it), start-symbol/root-symbol, start-address/root-address."""
+        sampled = {t.get("tid"): t for t in self.raw.get("threads", [])}
+        main = {tid for tid, t in sampled.items() if t.get("main")}
+        traced = ((self.raw.get("trace") or {}).get("threads")) or []
+        for thread in list(sampled.values()) + list(traced):
+            source = thread.get("nameSource")
+            if thread.get("name") and source not in self.DERIVED_THREAD_NAMES:
+                continue
+            if thread.get("tid") in main:
+                thread["name"], thread["nameSource"] = "main", "main"
+                continue
+            other = sampled.get(thread.get("tid"), {})
+            root = thread.get("root") or other.get("root") or self._sampled_root(other or thread)
+            candidates = [("start", thread.get("start") or other.get("start")), ("root", root)]
+            # A named function first; else a game address, since CRT and OS start trampolines are shared
+            # by many threads and tell them apart less well.
+            ranked = []
+            for order, (kind, where) in enumerate(candidates):
+                label, resolved = self._code_label(where)
+                if label:
+                    in_game = label.lower().startswith(tuple(f"{g.rsplit('.', 1)[0]}+" for g in self._game_modules()))
+                    ranked.append((not resolved, not (resolved or in_game), order, label,
+                                   f"{kind}-{'symbol' if resolved else 'address'}"))
+            if ranked:
+                _, _, _, thread["name"], thread["nameSource"] = min(ranked)
 
     def _function(self, frame, count_source=True):
         if "m" not in frame:
@@ -849,6 +916,10 @@ def save_outputs(profile, out_dir, title="Skyrim SE"):
 
     export_sqlite(profile, out_dir / "profile.sqlite")
     paths["sqlite"] = out_dir / "profile.sqlite"
+    from .profile_trace import write_perfetto
+
+    write_perfetto(profile, out_dir / "trace.pftrace")
+    paths["perfetto"] = out_dir / "trace.pftrace"
     return {k: str(v) for k, v in paths.items()}, summary
 
 
@@ -1028,8 +1099,12 @@ async def record(args):
             await manager.call("Console.execute", command=f"coc {args.cell}", timeout=60)
         await asyncio.sleep(args.settle)
         frame = (await manager.call("Perf.frameStats")).get("frame", 0)
-        await manager.call("Profile.start", threads=args.threads, hz=args.hz, durationS=args.seconds + 30,
-                           otherHz=args.other_hz, suspendBudgetPct=args.suspend_budget)
+        started = await manager.call("Profile.start", threads=args.threads, hz=args.hz, durationS=args.seconds + 30,
+                                     otherHz=args.other_hz, suspendBudgetPct=args.suspend_budget,
+                                     **trace_params(args, config, symbols))
+        failed = [h for h in (started.get("trace") or {}).get("hooks", []) if h.get("error")]
+        if failed:
+            print(f"trace hooks not installed: {json.dumps(failed)}", file=sys.stderr)
         load = asyncio.create_task(drive(manager, args.phase))
         await asyncio.sleep(args.seconds)
         load.cancel()
@@ -1046,6 +1121,20 @@ async def record(args):
     finally:
         if not args.keep:
             await manager.stop()
+
+
+def trace_params(args, config, symbols):
+    """The Profile.start `trace` argument: built-in public hooks plus the local hook lists (--trace-hooks, config
+    traceHooks, .local/trace-hooks.json), names resolved against the local symbol tables."""
+    from .profile_trace import local_hooks, trace_config
+
+    if args.trace == "off":
+        return {}
+    lists = [p for p in (args.trace_hooks, (config or {}).get("traceHooks"), Path.cwd() / ".local" / "trace-hooks.json") if p]
+    hooks, unresolved = local_hooks(lists, symbols)
+    if unresolved:
+        print(f"trace hooks without a symbol: {', '.join(map(str, unresolved))}", file=sys.stderr)
+    return {"trace": trace_config(api=args.trace, os_waits=not args.trace_no_os, hooks=hooks)}
 
 
 async def gpa_window(manager, args, config):
@@ -1114,8 +1203,17 @@ def export_command(args, symbols):
 
         counts = export_sqlite(profile, args.sqlite)
         print(json.dumps({"sqlite": str(args.sqlite), "rows": counts}))
-        if not args.firefox and not args.open:
-            return 0
+    if args.perfetto:
+        from .profile_trace import serve_and_open, write_chrome_json, write_perfetto
+
+        target = Path(args.perfetto)
+        as_json = (args.format or ("json" if target.suffix == ".json" else "proto")) == "json"
+        stats = (write_chrome_json if as_json else write_perfetto)(profile, target)
+        print(json.dumps({"perfetto": str(target), "trace": stats}))
+        if args.open_perfetto:
+            serve_and_open(args.perfetto)
+    if (args.sqlite or args.perfetto) and not args.firefox and not args.open:
+        return 0
     out = Path(args.firefox) if args.firefox else (source if source.is_dir() else source.parent) / "profile.json.gz"
     data = profile_firefox_data(profile)
     problems = profile_firefox.check(data)
@@ -1171,6 +1269,10 @@ def main(argv=None):
                     help="name other builds through --addrlib even when tables generated from their PDB exist")
     rec.add_argument("--symbols", default=None, help="skyrim-research checkout with the symbol tables")
     rec.add_argument("--out", default=None, help="output directory (default .local/profiles/<stamp>)")
+    rec.add_argument("--trace", default="batched", choices=("batched", "full", "off"),
+                     help="event trace: engine phases, D3D11 per pass (batched) or per call (full), OS waits")
+    rec.add_argument("--trace-no-os", action="store_true", help="leave OS waits and file reads out of the trace")
+    rec.add_argument("--trace-hooks", default=None, help="local JSON hook list (default .local/trace-hooks.json)")
     rec.add_argument("--gpu-counters", action="store_true",
                      help="after the profile, capture AMD GPUPerfAPI hardware counters (docs/profiling.md, AMD counters)")
     rec.add_argument("--gpa-dir", default=None, help="folder with GPUPerfAPIDX11-x64.dll on the game PC (or config gpaDir)")
@@ -1195,6 +1297,9 @@ def main(argv=None):
     exp.add_argument("--addrlib", default=None, help="versionlib-1-7-104-0.bin, to name profiles of other runtimes")
     exp.add_argument("--no-build-tables", action="store_true",
                     help="name other builds through --addrlib even when tables generated from their PDB exist")
+    exp.add_argument("--perfetto", default=None, help="trace file to write (.pftrace; .json writes Chrome trace JSON)")
+    exp.add_argument("--format", choices=("proto", "json"), default=None, help="Perfetto file format (default from the extension)")
+    exp.add_argument("--open-perfetto", action="store_true", help="serve the trace on 127.0.0.1 and open ui.perfetto.dev on it")
     exp.add_argument("--sqlite", default=None, help="also (or only) write the profile as a SQLite database")
     exp.add_argument("--recorder", default=None, help="skyrim-use timeline .jsonl whose tool calls and narration to add as markers")
     exp.add_argument("--symbols", default=None)
