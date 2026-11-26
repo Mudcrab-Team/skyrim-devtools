@@ -12,9 +12,13 @@ license = "MIT"
 license-files = ["licenses/MIT.txt"]
 dependencies = ["websockets==16.0", "mcp>=1.12,<2"]
 
+[project.optional-dependencies]
+video = ["Pillow>=10.1"]
+
 [project.scripts]
 skyrim-devtools-smoke = "skyrim_devtools.smoke:main"
 skyrim-use = "skyrim_devtools.use.server:main"
+skyrim-devtools-video = "skyrim_devtools.video:main"
 
 [tool.setuptools.packages.find]
 include = ["skyrim_devtools*"]

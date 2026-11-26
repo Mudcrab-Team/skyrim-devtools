@@ -1,10 +1,12 @@
 import asyncio
 import base64
 import json
+import tempfile
 import unittest
 
 from skyrim_devtools.use.manager import GameError, GameManager
 from skyrim_devtools.use.server import build_server, dig
+from skyrim_devtools.use.timeline import Recorder
 
 SESSION = "a" * 32
 TOKEN = "b" * 64
@@ -134,7 +136,9 @@ class Harness:
             return socket
 
         self.manager = GameManager({}, host=self.host, connect=connect, keepalive=keepalive)
-        self.server = build_server(self.manager)
+        self.timelines = tempfile.TemporaryDirectory()
+        self.recorder = Recorder(self.timelines.name)
+        self.server = build_server(self.manager, self.recorder)
 
     async def tool(self, tool_name, **args):
         result = await self.server.call_tool(tool_name, args)

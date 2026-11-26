@@ -62,6 +62,36 @@ fast path (and the one that works with muted audio). A trainer, merchant or gift
 the dialogue; `dialogue_wait` then answers `submenu` and the conversation stays frozen until that menu is closed
 so act in it first and leave it with the exit key (`press_control Cancel`) or `dialogue_close`; hiding a training menu with `close_menu` was followed by a frozen game within two minutes in two of two runs. Muted (headless) audio does not stall a conversation, but every line still lasts as long as its voice, so use `skip`. The plugin turns dialogue subtitles on so NPC lines can be read.
 
+## Showcase video
+
+For a non-technical audience: game footage beside an "agent view" panel (tool calls, status, captions).
+
+1. `game_start headless=false`, then `capture_start {fps=30, width=1920}`. The host records the desktop with
+   ffmpeg (winget `Gyan.FFmpeg`, user scope) from an interactive scheduled task, GDI capture first and
+   desktop duplication as fallback, GPU H.264 (AMF) with libx264 fallback, video only. It re-focuses the game
+   afterwards (an unfocused windowed game stops answering). Measured cost on the test PC: no change in
+   `Perf.frameStats` (59.95 fps before, 59.94 during). Install the task once with
+   `host.ps1 install-capture-task`.
+2. Every tool call is appended to a timeline JSONL (`$SKYRIM_USE_TIMELINE_DIR`, default
+   `~/.skyrim-use/timelines/<UTC stamp>.jsonl`): name, args that differ from defaults, start/end epoch ms,
+   a short result summary, errors. `narrate {text}` adds an on-screen caption, `track_quest {editor_id}`
+   chooses the quest shown in the status block, and a sampler adds a `status` line every 4 s when the
+   state changed (cell, position, health, quest stage and objective, nav).
+3. `capture_stop` stops the recording and copies the MP4 next to the timeline (about 40 MB per 30 s at 8 Mbit/s;
+   the copy dominates the call over a slow link). The footage start (UTC epoch ms, within about 0.2 s) is in
+   the timeline and in `<stamp>.capture.json`.
+4. Compose on the Mac (`pip install -e '.[video]'`, ffmpeg on PATH):
+
+~~~sh
+skyrim-devtools-video compose --footage x.mp4 --timeline x.jsonl -o out.mp4 \
+    --title "An AI agent plays Skyrim" --speedup-idle 4     # --dry-run prints the speed plan
+~~~
+
+Layout is 1920x1080: footage left, caption bar below it, agent panel right, intro and outro cards. Gaps longer
+than `--idle-threshold` (3 s) with no tool call or caption run at `--speedup-idle` (never longer than
+`--max-idle` seconds in the result); the middle of waits and walking tools (`wait_for`, `load_save`, `nav_*`,
+...) is sped up while their start and end stay at 1x; dialogue tools stay at 1x with padding.
+
 ## Example transcript
 
 ~~~text
