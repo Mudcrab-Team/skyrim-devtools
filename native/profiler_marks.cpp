@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Spans for the profile timeline: menus (loading screens are cell loads) and markers a client adds with
-// Profile.mark. Marks are kept only while a profile runs.
+// Profile.mark. Marks are kept only while a profile runs; both also go to NVTX when Nsight's DLL is present.
 #include "game.h"
 #include "methods.h"
+#include "nvtx.h"
 #include "perf.h"
 #include "profiler.h"
 
@@ -27,9 +28,10 @@ namespace
             const std::string menu = event->menuName.c_str();
             std::lock_guard lock(mutex);
             if (event->opening) {
-                opened[menu] = now;
+                opened[menu] = { now, nvtx::RangeStart(menu) };
             } else if (const auto it = opened.find(menu); it != opened.end()) {
-                profiler::Mark(menu == "Loading Menu" ? "load" : "menu", menu, it->second, now);
+                profiler::Mark(menu == "Loading Menu" ? "load" : "menu", menu, it->second.first, now);
+                nvtx::RangeEnd(it->second.second);
                 opened.erase(it);
             }
             return RE::BSEventNotifyControl::kContinue;
@@ -37,7 +39,7 @@ namespace
 
     private:
         std::mutex mutex;
-        std::unordered_map<std::string, double> opened;
+        std::unordered_map<std::string, std::pair<double, std::uint64_t>> opened;  // start, NVTX range
     };
 }
 
@@ -62,6 +64,7 @@ DEVTOOLS_MODULE(ProfilerMarks)
         }
         const double now = perf::Now();
         profiler::Mark(kind, name, now - duration / 1000.0, now);
-        return Json{ { "recorded", profiler::Profiling() } };
+        nvtx::Mark(kind + ": " + name);
+        return Json{ { "recorded", profiler::Profiling() }, { "nvtx", nvtx::Available() } };
     }, { .thread = Thread::Any });
 }

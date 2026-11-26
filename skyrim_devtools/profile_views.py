@@ -73,11 +73,25 @@ async def top_snapshot(call, symbols=None, seconds=3.0, top=15):
         "memory": raw.get("memory"), "threads": raw.get("threads"), "gpu": raw.get("gpu"),
         "costMs": {**(raw.get("costMs") or {}), "resolve": raw.get("resolveMs"), "rpc": round(rpc_ms, 1),
                    "resolverRebuilt": bool(raw.get("resolverRebuilt"))},
+        "gpuTiming": _gpu_timing(raw.get("gpuTiming"), stats.get("p50Ms"), on_cpu / samples if samples else None),
     }
     credits = profile.credits()
     if credits:
         snapshot["credits"] = credits
     return snapshot
+
+
+def _gpu_timing(timing, frame_ms, busy_share):
+    """GPU frame time next to the main thread's sampled busy time per frame, and which one limits the frame."""
+    if not timing:
+        return None
+    out = dict(timing)
+    gpu_ms = timing.get("gpuMsP50")
+    cpu_ms = round(frame_ms * busy_share, 2) if frame_ms and busy_share is not None else None
+    out["cpuMsP50"] = cpu_ms
+    if gpu_ms is not None and cpu_ms is not None and frame_ms:
+        out["bound"] = "capped" if max(gpu_ms, cpu_ms) < 0.85 * frame_ms else ("gpu" if gpu_ms > cpu_ms else "cpu")
+    return out
 
 
 def _bar(pct, width=20):
@@ -118,6 +132,13 @@ def render_top(snap, width=110):
                     + (f" ({engines})" if engines else "") + f"   VRAM {_mb(gpu.get('vramMb'))}")
     if line:
         out.append("   ".join(line))
+    timing = snap.get("gpuTiming") or {}
+    if timing.get("frames"):
+        passes = ", ".join(f"{p['pass']} {p['msPerFrame']}" for p in (timing.get("passes") or [])[:4])
+        out.append(f"GPU frame  p50 {timing.get('gpuMsP50')} ms  p95 {timing.get('gpuMsP95')} ms   main CPU ~{timing.get('cpuMsP50')} ms"
+                   f"   bound: {timing.get('bound') or '-'}   passes ms: {passes}")
+    elif timing:
+        out.append(f"GPU frame  not timed ({timing.get('reason') or 'no frames yet'})")
     out.append("")
     out.append(f"{'self%':>6} {'total%':>6}  {'function':<60} module")
     for row in snap["topSelf"]:
@@ -220,7 +241,23 @@ def timeline_data(profile):
                       f"frame {hitch.get('frame')}: {hitch.get('ms')} ms"])
     marks.sort(key=lambda m: (m[0] if m[0] is not None else 0))
     context = raw.get("context") or {}
+    from .profile_gpu import gpu_frames
+
+    timed, offset = gpu_frames(raw)
+    pass_names, pass_index = [], {}
+    gpu_rows = []
+    for f in timed:
+        passes = []
+        for label, kind, start, end in f["passes"]:
+            key = (label, kind)
+            if key not in pass_index:
+                pass_index[key] = len(pass_names)
+                pass_names.append([label, kind])
+            passes.append([start, end, pass_index[key]])
+        gpu_rows.append([f["gpuStart"], f["gpuEnd"], f["frame"], passes])
     return {
+        "gpu": {"frames": gpu_rows, "passes": pass_names, "offsetMs": offset,
+                "reason": None if gpu_rows else (raw.get("gpu") or {}).get("reason")},
         "title": context.get("phase") or "profile",
         "durationMs": round(raw.get("durationS", 0) * 1000.0, 2),
         "periodMs": 1000.0 / raw.get("hz", 1000.0),
@@ -337,6 +374,9 @@ const KIND_COLORS = { game: [28, 80], plugin: [212, 65], skse: [270, 50], "gpu-d
 const MARK_COLORS = { load: "#3a8fd8", hitch: "#d9443a", alert: "#e08b1a", narrate: "#7d5bd0", tool: "#2aa198",
   rpc: "#8a94a6", menu: "#b5a33a", marker: "#c45ab3" };
 const MARK_ORDER = ["load", "hitch", "alert", "narrate", "tool", "rpc", "menu", "marker"];
+const PASS_COLORS = { shadows: "#6b7fa8", main: "#3f9d6b", scene: "#55b37f", post: "#c98b3a", offscreen: "#9a7bc0",
+  frame: "#8a94a6", present: "#d0d4dc", other: "#a0a0a0" };
+const GPU = D.gpu || { frames: [], passes: [] };
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const canvas = document.getElementById("c"), ctx = canvas.getContext("2d");
 const ruler = document.getElementById("r"), rctx = ruler.getContext("2d");
@@ -458,6 +498,8 @@ function draw() {
   for (const lane of lanes) { layout.push({ type: "lane", lane, y, h: LANE_H }); y += LANE_H + 2; }
   y += 4;
   for (const t of threads) { const h = t.levels * LEVEL_H + 4; layout.push({ type: "thread", thread: t, y, h }); y += h + 3; }
+  if (GPU.frames.length) { y += 4; layout.push({ type: "gpu", y, h: FRAME_H }); y += FRAME_H + 2;
+    layout.push({ type: "passes", y, h: FRAME_H }); y += FRAME_H + 4; }
   const dpr = window.devicePixelRatio || 1, w = W(), h = Math.max(y + 10, view.clientHeight - AXIS_H);
   for (const [cv, ch] of [[canvas, h], [over, h], [ruler, AXIS_H]]) {
     cv.width = w * dpr; cv.height = ch * dpr; cv.style.width = w + "px"; cv.style.height = ch + "px"; }
@@ -471,6 +513,8 @@ function draw() {
     ctx.fillStyle = P.muted;
     if (row.type === "frames") { ctx.fillText("frames", 6, row.y + row.h / 2); drawFrames(row); }
     else if (row.type === "lane") { ctx.fillText(row.lane.label, 6, row.y + row.h / 2); drawLane(row); }
+    else if (row.type === "gpu") { ctx.fillStyle = P.ink; ctx.fillText("GPU frames", 6, row.y + row.h / 2); drawGpu(row, false); }
+    else if (row.type === "passes") { ctx.fillText("GPU passes", 6, row.y + row.h / 2); drawGpu(row, true); }
     else { const t = row.thread; ctx.fillStyle = P.ink;
       ctx.fillText((t.main ? "main thread" : (t.name || "thread") + (t.frameThread ? " (presents)" : "")).slice(0, 22), 6, row.y + 7);
       ctx.fillStyle = P.muted; ctx.fillText(`${t.tid}  ${(t.onCpu * D.periodMs / 1000).toFixed(2)} s cpu`, 6, row.y + 19);
@@ -499,6 +543,20 @@ function drawFrames(row) {
     ctx.strokeRect(x(selected.start) + 1, row.y + 1, Math.max(2, x(selected.end) - x(selected.start) - 2), row.h - 2); }
   ctx.restore();
 }
+function gpuFirst() { return lower(GPU.frames.map(f => f[1]), t0); }
+function drawGpu(row, passes) {
+  for (let i = gpuFirst(); i < GPU.frames.length && GPU.frames[i][0] <= t1; i++) {
+    const [s, e, n, ps] = GPU.frames[i];
+    if (!passes) { ctx.fillStyle = n % 2 ? P.a : P.b;
+      const xs = Math.max(LABEL_W, x(s)), xe = x(e); ctx.fillRect(xs, row.y, Math.max(1, xe - xs), row.h); continue; }
+    for (const [ps0, pe, pi] of ps) { const xs = Math.max(LABEL_W, x(ps0)), xe = x(pe); if (xe < LABEL_W || xe - xs < 0.3) continue;
+      ctx.fillStyle = PASS_COLORS[GPU.passes[pi][1]] || PASS_COLORS.other; ctx.fillRect(xs, row.y, Math.max(1, xe - xs - (xe - xs > 3 ? 1 : 0)), row.h);
+      if (xe - xs > 60) { ctx.save(); ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.rect(xs, row.y, xe - xs, row.h); ctx.clip();
+        ctx.fillText(GPU.passes[pi][1] + " " + GPU.passes[pi][0], xs + 3, row.y + row.h / 2); ctx.restore(); } }
+  }
+}
+function gpuAt(time) { for (let i = gpuFirst(); i < GPU.frames.length && GPU.frames[i][0] <= t1; i++) {
+  const f = GPU.frames[i]; if (f[0] <= time && time <= f[1]) return f; } return null; }
 function drawLane(row) {
   ctx.fillStyle = MARK_COLORS[row.lane.kind] || "#888";
   for (const m of row.lane.marks) { if (m[1] < t0 || m[0] > t1) continue;
@@ -588,6 +646,7 @@ function rowValue(row, time) {
   if (row.type === "frames") { const f = frameAt(time); if (f.frame === null) return null; const ms = f.end - f.start;
     return { text: `#${f.frame}  ${ms.toFixed(1)} ms`, color: ms > D.hitchMs ? P.hitch : null }; }
   if (row.type === "lane") { const m = markAt(row.lane, time); return m ? { text: m[3] } : null; }
+  if (row.type === "gpu" || row.type === "passes") { const f = gpuAt(time); return f ? { text: `${(f[1] - f[0]).toFixed(1)} ms` } : null; }
   if (row.type === "thread") { const t = row.thread, s = sampleAt(t, time); if (s < 0) return null; const p = path(t.node[s]);
     if (!p.length) return null; return { text: (t.wait[s] ? "waiting: " : "") + funcs[p[p.length - 1]][0], color: t.wait[s] ? P.muted : null }; }
   return null;
@@ -596,6 +655,11 @@ function rowValue(row, time) {
 function rowDetail(row, time, y) {
   if (row.type === "frames") { const f = frameAt(time); return f.frame !== null ? `frame ${f.frame}: ${(f.end - f.start).toFixed(2)} ms` : ""; }
   if (row.type === "lane") { const m = markAt(row.lane, time); return m ? `${m[2]}: ${m[3]} (${fmtDur(m[1] - m[0])})` : ""; }
+  if (row.type === "gpu" || row.type === "passes") { const f = gpuAt(time);
+    if (!f) return "";
+    const p = row.type === "passes" ? f[3].find(q => q[0] <= time && time <= q[1]) : null;
+    return p ? `${GPU.passes[p[2]][1]}: ${GPU.passes[p[2]][0]} ${(p[1] - p[0]).toFixed(3)} ms (frame ${f[2]})`
+             : `GPU frame ${f[2]}: ${(f[1] - f[0]).toFixed(2)} ms (alignment estimated)`; }
   if (row.type === "thread") { const t = row.thread, s = sampleAt(t, time); if (s < 0) return ""; const p = path(t.node[s]);
     const level = Math.floor((y - row.y - 2) / LEVEL_H), f = p[Math.min(level, p.length - 1)];
     return f === undefined ? "" : (t.wait[s] ? "[waiting] " : "") + `${funcs[f][0]}  (${funcs[f][1]}, depth ${Math.min(level, p.length - 1)} of ${p.length})`; }
@@ -607,6 +671,10 @@ function showSelection(threadFocus) {
   let html = `<h2>${frame !== null ? "Frame " + frame : "Window"}: ${(end - start).toFixed(1)} ms at ${(start / 1000).toFixed(3)} s</h2>`;
   const marks = D.marks.filter(m => m[1] >= start && m[0] <= end);
   if (marks.length) html += "<table>" + marks.slice(0, 12).map(m => `<tr><td class="n">${esc(m[2])}</td><td>${esc(m[3])}</td><td class="n">${(m[1] - m[0]).toFixed(1)} ms</td></tr>`).join("") + "</table>";
+  const gf = frame !== null ? GPU.frames.find(f => f[2] === frame) : null;
+  if (gf) { const sums = new Map(); for (const [s, e, pi] of gf[3]) sums.set(pi, (sums.get(pi) || 0) + e - s);
+    html += `<h2>GPU: ${(gf[1] - gf[0]).toFixed(2)} ms</h2><table>` + [...sums].sort((p, q) => q[1] - p[1]).slice(0, 8).map(([pi, ms]) =>
+      `<tr><td class="n">${ms.toFixed(2)} ms</td><td>${esc(GPU.passes[pi][1])} <span class="hint">${esc(GPU.passes[pi][0])}</span></td></tr>`).join("") + "</table>"; }
   const threads = threadFocus ? [threadFocus] : visibleThreads().slice(0, 3);
   for (const t of threads) {
     const a = lower(t.t, start), b = lower(t.t, end); const self = new Map(), stacks = new Map(); let waiting = 0;

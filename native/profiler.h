@@ -22,4 +22,17 @@ namespace devtools::profiler
     // Self/total/wait counts of the main thread over the last `seconds`, resolved like a profile's frames.
     // Each call keeps the main-thread sampler running for a further 10 s.
     Json TopSamples(double seconds);
+
+    // True while a profile runs or the live view's lease holds the sampler on.
+    bool Sampling();
+
+    // GPU timing (profiler_gpu.cpp), called from the Present detour on the render thread.
+    void GpuBeforePresent(void* swapChain);
+    void GpuAfterPresent(std::uint64_t nextFrame);
+    // Timed frames whose CPU span meets [from, to] (QPC seconds), CPU times in ms after `origin`.
+    Json GpuFrames(double from, double to, double origin);
+    // GPU frame-time percentiles and the costliest passes over the last `seconds`.
+    Json GpuRecent(double seconds);
+    // GPU utilisation and VRAM sampled once a second while a profile runs (profiler_top.cpp).
+    Json GpuCounters(double from, double to, double origin);
 }
