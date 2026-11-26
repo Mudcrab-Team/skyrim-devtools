@@ -285,11 +285,14 @@ class ToolTests(unittest.TestCase):
         self.saved = list(test_use.METHODS)
         test_use.METHODS.extend(TOOL_METHODS)
         self.hit_window = explore.HIT_WINDOW_S
+        self.settle = explore.SETTLE_S
         explore.HIT_WINDOW_S = 0
+        explore.SETTLE_S = 0
 
     def tearDown(self):
         test_use.METHODS[:] = self.saved
         explore.HIT_WINDOW_S = self.hit_window
+        explore.SETTLE_S = self.settle
 
     async def scenario(self, contents, visited=None):
         h = Harness()
@@ -410,6 +413,39 @@ class ToolTests(unittest.TestCase):
             self.assertEqual(goto[0][1]["onCombat"], "stop")
             await h.text("game_stop")
         run(go())
+
+    def test_explore_pulls_a_lever_when_the_way_is_shut_and_retries(self):
+        async def go():
+            lever = {"refID": "L1", "name": "Lever", "pos": [1000, 600, 0]}
+            torch = {"refID": "T1", "name": "Wall Torch", "pos": [800, 600, 0]}
+            h, socket = await self.scenario(empty_contents(actors=[actor("A1", "Bandit", 2800, 500)], activators=[torch, lever]))
+            dead_end = {"active": False, "last": {"state": "failed", "reason": "Dead end: no way closer",
+                                                  "blockers": {"stop": [900, 600, 0]}}}
+            statuses = iter([dead_end])
+            real_send = socket.send
+
+            async def send(text):
+                request = json.loads(text)
+                if request["method"] == "Nav.goto":
+                    socket.results["Nav.status"] = next(statuses, {"active": False, "last": {"state": "arrived"}})
+                await real_send(text)
+            socket.send = send
+            reply = json.loads(await h.text("explore", goal="clear", rooms=2))
+            goto = [c[1] for c in socket.calls if c[0] == "Nav.goto"]
+            self.assertEqual([g["goal"] for g in goto][:3], [{"refID": "A1"}, {"refID": "L1"}, {"refID": "A1"}])
+            self.assertTrue(goto[1]["activate"])
+            self.assertEqual([p["ref"] for p in reply["pulls"]], ["L1"])
+            self.assertEqual(reply["status"], "hostile_reached")
+            await h.text("game_stop")
+        run(go())
+
+    def test_a_torch_is_never_a_lever_candidate(self):
+        model = rooms.build_model(two_rooms(), empty_contents(activators=[
+            {"refID": "T1", "name": "Lever Torch Holder", "pos": [800, 600, 0]},
+            {"refID": "L1", "name": "Pull Chain", "pos": [900, 600, 0]},
+            {"refID": "F1", "name": "Far Lever", "pos": [90000, 600, 0]}]), player=[600, 600, 0])
+        picks = explore.lever_candidates(model, [600, 600, 0], explore.Memory())
+        self.assertEqual([a["refID"] for a in picks], ["L1"])
 
     def test_quest_targets_adds_the_explore_hint(self):
         async def go():
