@@ -70,7 +70,13 @@ tools/pc-build commonlib          # once per CommonLib pin: shared Release build
 tools/pc-build                    # incremental build, prints timings
 tools/pc-build --deploy --lock-wait 900   # build, then copy the DLL while holding agent.lock
 tools/pc-build lock --lock-wait 900       # hold agent.lock for a live run, release with: tools/pc-build unlock
+tools/pc-build lock --refresh             # heartbeat while holding it (exit 4 if the lock is no longer yours)
 ~~~
+
+`agent.lock` counts as stale 25 minutes after its last write when no game is running, and the next waiter
+takes it. A holder that works longer than that, or idles between game launches, must run
+`lock --refresh` at least every few minutes (`tools/soak.py` does so every cycle) and stop when it
+exits 4. Check the exit code of `lock`: 0 means held, 4 means not held.
 
 Without the shared CommonLib the build falls back to compiling it inside the build directory
 (`-DCOMMONLIB_PREFIX` selects the prebuilt one; `commonlib-options.cmake` keeps both paths on the

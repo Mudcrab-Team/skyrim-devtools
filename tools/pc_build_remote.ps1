@@ -9,7 +9,8 @@ param(
     [switch]$Reconfigure,
     [switch]$NoPrebuilt,
     [int]$LockWait = 0,
-    [switch]$KeepLock
+    [switch]$KeepLock,
+    [switch]$Refresh
 )
 $ErrorActionPreference = 'Continue'
 $root = Join-Path $env:USERPROFILE '.local\skyrim-devtools'
@@ -102,6 +103,14 @@ function Acquire-Lock([string]$who, [int]$waitSeconds) {
     }
 }
 
+if ($Action -eq 'lock' -and $Refresh) {
+    # Heartbeat: staleness counts from the lock file's last write, so a holder between game launches
+    # touches it to keep the lock. A holder that already lost it learns so from the exit code.
+    if (-not $Agent) { Write-Output 'lock --refresh needs an agent name'; exit 2 }
+    if ((Get-LockOwner) -eq $Agent) { (Get-Item $lockPath).LastWriteTime = Get-Date; Write-Output 'lock refreshed'; exit 0 }
+    Write-Output "agent.lock is held by '$(Get-LockOwner)', not '$Agent'; refresh failed"
+    exit 4
+}
 if ($Action -eq 'lock') {
     if (-not $Agent) { Write-Output 'lock needs an agent name'; exit 2 }
     if (Acquire-Lock $Agent $LockWait) { exit 0 }
