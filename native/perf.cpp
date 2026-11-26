@@ -7,6 +7,7 @@
 #include "logs.h"
 #include "methods.h"
 #include "perf.h"
+#include "profiler.h"
 #include "screen.h"
 
 #include <MinHook.h>
@@ -120,6 +121,7 @@ namespace
         FILETIME created, exited, kernel, user;
         float cpuMs = 0.0f;
         float kernelMs = 0.0f;
+        double frameStart = 0.0;
         if (GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) {
             const auto k = FileTime(kernel);
             const auto total = k + FileTime(user);
@@ -130,6 +132,7 @@ namespace
         }
         {
             std::lock_guard lock(ringMutex);
+            frameStart = lastPresent;
             if (lastPresent > 0.0) {
                 ms = static_cast<float>((now - lastPresent) * 1000.0);
                 if (ring.empty()) {
@@ -146,6 +149,9 @@ namespace
                 }
             }
             lastPresent = now;
+        }
+        if (frameStart > 0.0) {
+            profiler::OnFrame(frameStart, now, frame);
         }
         if (ms > hitchLogMs.load(std::memory_order_relaxed) && ms > 0.0f) {
             std::lock_guard lock(logMutex);

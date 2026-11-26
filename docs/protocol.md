@@ -81,6 +81,12 @@ finishes later, its result is dropped. Server notifications have no `id`:
 | Window.info | ui | none | Game window, client and monitor size, style, DPI awareness and swap chain `{width, height, windowed}`. |
 | Perf.reset | any | | Clears the frame-time ring and the hitch count |
 | Perf.configure | any | hitchMs? (0 or null is off, the default), ringSize? (64-1000000 frames, default 20000) | Returns the current settings. Changing `ringSize` clears the ring. |
+| Profile.start | any | threads? (`main` default, `frame`, `all`, or comma-separated ids / name fragments), hz? (10-4000, default 1000), durationS? (max 600, default 30) | Starts the sampling profiler (see [profiling](profiling.md)); `busy` while one runs. Returns `Profile.status`. |
+| Profile.stop | any | | Stops and serializes the profile: `{bytes, chunks, summary}`. Read it with `Profile.read`. |
+| Profile.read | any | chunk | `{chunk, data, last}`: 4 MiB slices of the profile JSON (raw addresses, unwind starts, Address Library IDs, modules); concatenate `data` in order. |
+| Profile.status | any | | `{profiling, watching, watchHz, hitchMs, mainThread, frameThread, hitchesCaptured}` |
+| Profile.watch | any | enabled?, hz? (default 250), hitchMs? (default 100) | Low-rate main-thread sampling kept in a ring so every slow frame keeps its stacks. |
+| Profile.hitches | any | limit? (default 10), sinceFrame?, clear? | `{hitches[], frames[], modules[], status}`; each hitch `{frame, ms, startMs, stacks[], samples[[ms, stack, flags]], waitChain}`; flags 1 = the thread was not running. |
 | Window.place | ui | mode | `offscreen`, `hide`, `minimize` or `restore` |
 
 Mutations that take `loadEpoch` fail with `-32005` and the current epoch when the world was
