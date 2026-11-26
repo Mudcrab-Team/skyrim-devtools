@@ -24,7 +24,7 @@ finishes later, its result is dropped. Server notifications have no `id`:
 | Session.ping | any | payload? | `{pong, payload}`. Keeps an idle link alive. |
 | Session.pingMain / pingUI | main / ui | | Round trip through the game's task queues |
 | Session.close | any | | Replies `{closing}`, then closes the game window |
-| Session.listSaves | any | | `[{name, bytes}]` in the isolated Saves directory |
+| Session.listSaves | any | | `[{name, bytes}]` in the isolated Saves directory, or in the saves folder of an MO2 test profile with local saves (see profiling.md) |
 | Session.loadSave | main | name, wait? | Loads any save in Saves, in game or from the main menu. Increments `loadEpoch`. With `wait`, replies after the load finishes. |
 | Session.reload | main | wait? | Loads the last loaded save again |
 | Events.snapshot | any (deferred) | | `{seq, loadEpoch, dataLoaded, loadCompleted, loadSucceeded, playable, menus:[{name, ready}], foreground, headless, lastSave, uiBusy}`. The UI thread answers; if it runs no tasks for 1.5 s (a long load, a paused window) the connection thread replies with the last known `menus` and `playable` and `uiBusy: true`. |

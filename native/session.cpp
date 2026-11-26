@@ -6,6 +6,7 @@
 #include "events.h"
 #include "game.h"
 #include "methods.h"
+#include "save_path.h"
 
 #include <Windows.h>
 
@@ -38,13 +39,28 @@ namespace
         return name;
     }
 
-    void RequireIsolatedSavePath()
+    const char* LocalSavePath()
     {
         const auto settings = RE::INISettingCollection::GetSingleton();
         const auto setting = settings ? settings->GetSetting("sLocalSavePath:General") : nullptr;
-        const auto path = setting ? setting->GetString() : nullptr;
-        if (!path || _stricmp(path, "Saves\\") != 0) {
-            throw RpcError(code::notReady, "The isolated save path is not active");
+        return setting ? setting->GetString() : nullptr;
+    }
+
+    savepath::Layout CurrentSaveLayout()
+    {
+        const auto path = LocalSavePath();
+        const auto& dir = GetConfig().savesDir;
+        std::error_code ignored;
+        const bool marker = !dir.empty() && std::filesystem::exists(dir.parent_path() / savepath::profileMarker, ignored);
+        return path ? savepath::Classify(path, dir, marker) : savepath::Layout::Refused;
+    }
+
+    void RequireIsolatedSavePath()
+    {
+        if (CurrentSaveLayout() == savepath::Layout::Refused) {
+            throw RpcError(code::notReady,
+                           "The isolated save path is not active (a Saves folder, or an MO2 local-saves profile whose "
+                           "name ends in -devtools or that holds the marker file, with the host naming its saves folder)");
         }
     }
 
@@ -213,6 +229,11 @@ DEVTOOLS_MODULE(Session)
         const auto& dir = GetConfig().savesDir;
         if (dir.empty()) {
             throw RpcError(code::notReady, "The host did not name the saves directory");
+        }
+        // Under MO2 the game's own saves folder is virtual, so a folder that is not a test profile's would
+        // list somebody else's saves.
+        if (const auto path = LocalSavePath(); path && savepath::Lower(savepath::TrimSeparators(path)) == "__mo_saves") {
+            RequireIsolatedSavePath();
         }
         auto saves = Json::array();
         for (const auto& entry : std::filesystem::directory_iterator(dir)) {
