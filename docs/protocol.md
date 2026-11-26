@@ -30,7 +30,7 @@ finishes later, its result is dropped. Server notifications have no `id`:
 | Events.snapshot | any (deferred) | | `{seq, loadEpoch, dataLoaded, loadCompleted, loadSucceeded, playable, menus:[{name, ready}], foreground, headless, lastSave, uiBusy}`. The UI thread answers; if it runs no tasks for 1.5 s (a long load, a paused window) the connection thread replies with the last known `menus` and `playable` and `uiBusy: true`. |
 | Events.list | any | | Declared event types with descriptions |
 | Events.subscribe / unsubscribe | any | types (`"*"` for all) | Selects pushed event types. Resets on every connection. |
-| UI.openMenu / closeMenu | ui | name, wait?, anyState?, loadEpoch? | Any registered menu. `wait` replies once the menu actually opens or closes. Unless `anyState` is set, the world must be playable. |
+| UI.openMenu / closeMenu | ui | name, wait?, anyState?, loadEpoch?, force? | Any registered menu. `wait` replies once the menu actually opens or closes. Unless `anyState` is set, the world must be playable.  Trainer, barter, gift, container, lockpicking, crafting, dialogue and book menus need the engine's own context: `openMenu` refuses them unless `force`, and `closeMenu` leaves them with the Cancel control (hiding one directly froze the game).|
 | UI.listMenus | ui | | `[{name, open}]` for every registered menu |
 | UI.isMenuOpen | ui | name | `{menu, open, ready}` |
 | UI.getVariable / dump | ui | menu, path, depth? | Bounded read of a Scaleform value of an open menu, from `_root` (`Menu_mc.ItemCard_mc`, numeric steps index arrays). Objects deeper than `depth` come back as `"[Object]"` and `truncated` marks the node cap. |
@@ -114,8 +114,16 @@ The host enables Papyrus logging, tracing and debug information in the per-run S
 removes earlier Papyrus logs. A crashed, forced or unexpectedly exited run gets
 `runs/<session>/evidence/` (Papyrus, SKSE, plugin and RPC tails plus Windows crash events);
 `host.ps1 evidence` prints a summary, and state.json carries `hung` and `evidence`.
-A separate crash-logging DLL would give stack traces but is not used while the plugin
-stays the only SKSE DLL.
+The isolated profile also carries the CrashLoggerSSE plugin (with its `msdia140.dll`), the one other
+DLL the host accepts. Its `crash-<time>.log` files land in the profile's `SKSE` folder on the host and are
+never copied off it; `host.ps1 crashes` lists the newest five as JSON (`name`, `time`, `exception`,
+`topFrames` as module+offset with the Address Library id, no instruction bytes or register values), the
+evidence summary carries `crashLogs`, and `game_status`/`game_stop` put the same frames under `crash.log`.
+The plugin's own watchdog adds hang evidence: when the main thread runs no queued task for 6 s it
+logs `main thread has not run a queued task ... frames: module+offset ...` to the plugin log (`Logs.tail
+source=plugin`), at most six times per run.
+`host.ps1 stop <session> -Grace N` asks the game to quit and kills it after N seconds (default 12);
+state.json then carries `stopPath`: `graceful`, `killed-after-Ns` or `closing-crashed`.
 
 ### Movement, camera, navigation and recording
 

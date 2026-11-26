@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('install-task', 'start', 'run', 'status', 'stop', 'evidence',
+    [ValidateSet('install-task', 'start', 'run', 'status', 'stop', 'evidence', 'crashes',
                  'install-capture-task', 'capture-start', 'capture-run', 'capture-stop', 'capture-status')]
     [string] $Action,
     [ValidatePattern('^[a-f0-9]{32}$')]
@@ -10,7 +10,9 @@ param(
     [ValidateRange(5, 60)]
     [int] $Fps = 30,
     [ValidateRange(320, 3840)]
-    [int] $Width = 1920
+    [int] $Width = 1920,
+    [ValidateRange(1, 120)]
+    [int] $Grace = 12
 )
 $ErrorActionPreference = 'Stop'
 $taskName = 'SkyrimDevTools'
@@ -248,6 +250,32 @@ function Get-CrashEvents($Since) {
     }
 }
 
+function Get-CrashLogs($Since, $Count) {
+    # CrashLogger writes crash-<time>.log into the profile's SKSE folder (the isolated profile, not Documents).
+    $dir = Join-Path $profile 'SKSE'
+    if (!(Test-Path -LiteralPath $dir)) { return @() }
+    $files = Get-ChildItem -LiteralPath $dir -File -Filter 'crash-*.log' | Sort-Object LastWriteTime -Descending
+    if ($Since) { $files = $files | Where-Object { $_.LastWriteTime -ge $Since } }
+    foreach ($file in ($files | Select-Object -First $Count)) { Read-CrashLog $file }
+}
+
+function Read-CrashLog($File) {
+    # Names of modules and functions only: the top frames of the probable call stack, never memory contents.
+    $lines = @(Get-Content -LiteralPath $File.FullName -TotalCount 400 -ErrorAction SilentlyContinue)
+    $header = @($lines | Where-Object { $_ -match '^Unhandled exception' } | Select-Object -First 1)
+    $start = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^CALL STACK') { $start = $i; break } }
+    $frames = @()
+    if ($start -ge 0) {
+        # keep module, offset and the Address Library id of each probable frame; drop the instruction text
+        $frames = @($lines[($start + 1)..([Math]::Min($lines.Count - 1, $start + 40))] |
+            Where-Object { $_ -match '^\s*\[\s*\d+\]\[P\]' } | Select-Object -First 12 |
+            ForEach-Object { (($_.Trim() -replace '^\[\s*(\d+)\]\[P\]\s+0x[0-9A-Fa-f]+\s+', '$1 ') -split "`t")[0] })
+    }
+    @{ name = $File.Name; time = $File.LastWriteTimeUtc.ToString('o'); bytes = $File.Length
+       exception = if ($header) { [string] $header[0] } else { $null }; topFrames = $frames }
+}
+
 function Save-Tail($Source, $Destination, $Lines) {
     if (Test-Path -LiteralPath $Source) {
         Get-Content -LiteralPath $Source -Tail $Lines -ErrorAction SilentlyContinue |
@@ -271,6 +299,7 @@ function Save-Evidence($Run, $Phase, $Reason, $ExitCode, $Started, $Hung) {
         phase = $Phase; reason = $Reason; exitCode = $ExitCode; hung = $Hung
         exitCodeHex = if ($null -ne $ExitCode) { '0x{0:X8}' -f [uint32] ([BitConverter]::ToUInt32([BitConverter]::GetBytes([int] $ExitCode), 0)) } else { $null }
         crashEvents = @(if ($Started) { Get-CrashEvents $Started })
+        crashLogs = @(if ($Started) { Get-CrashLogs $Started.AddSeconds(-5) 3 })
         files = @(Get-ChildItem -LiteralPath $evidence -File | ForEach-Object Name)
     }
     Write-Json $summary (Join-Path $evidence 'evidence.json')
@@ -298,6 +327,13 @@ function Stage-Saves {
         }
     }
     (Get-FileHash -LiteralPath $destination).Hash.ToLowerInvariant()
+}
+
+function Read-Grace($StopFile) {
+    # The stop request carries how many seconds the game gets to quit by itself before it is killed.
+    $text = if (Test-Path -LiteralPath $StopFile) { ([IO.File]::ReadAllText($StopFile)).Trim() } else { '' }
+    $value = 0
+    if ([int]::TryParse($text, [ref] $value) -and $value -ge 1 -and $value -le 120) { $value } else { 12 }
 }
 
 function Read-Seconds($Value, $Default) {
@@ -347,9 +383,10 @@ function Preflight($Config, $Headless) {
     if (!(Test-Path -LiteralPath (Join-Path $plugins 'versionlib-1-7-104-0.bin') -PathType Leaf)) {
         throw 'The pinned Address Library table is missing'
     }
-    $dlls = @(Get-ChildItem -LiteralPath $plugins -File -Filter '*.dll')
-    if ($dlls.Count -ne 1 -or $dlls[0].Name -ne 'SkyrimDevTools.dll') {
-        throw 'The test plugin must be the only SKSE plugin DLL'
+    # The crash logger is the one diagnostic plugin allowed next to the test plugin.
+    $dlls = @(Get-ChildItem -LiteralPath $plugins -File -Filter '*.dll' | ForEach-Object Name)
+    if ($dlls -notcontains 'SkyrimDevTools.dll' -or @($dlls | Where-Object { $_ -notin @('SkyrimDevTools.dll', 'CrashLogger.dll', 'msdia140.dll') }).Count) {
+        throw 'The test plugin and the crash logger (with its symbol reader) must be the only SKSE plugin DLLs'
     }
     Stage-Saves
 }
@@ -368,6 +405,7 @@ function Run-Game {
     $digest = $null
     $started = $null
     $hung = $false
+    $stopPath = $null
     try {
         if (Test-Path -LiteralPath $stop) {
             $phase = 'cancelled'
@@ -427,10 +465,12 @@ function Run-Game {
             }
             if ((Test-Path -LiteralPath $stop) -or [DateTime]::UtcNow -ge $deadline) {
                 $reason = if (Test-Path -LiteralPath $stop) { 'requested' } else { 'watchdog' }
-                if ($game.CloseMainWindow() -and $game.WaitForExit(12000)) { break }
+                $grace = Read-Grace $stop
+                if ($game.CloseMainWindow() -and $game.WaitForExit($grace * 1000)) { $stopPath = 'graceful'; break }
                 $game.Refresh()
                 if (!$game.HasExited -and !$game.Responding) { $hung = $true }
                 $phase = 'forced'
+                $stopPath = "killed-after-${grace}s"
                 return
             }
         }
@@ -469,6 +509,10 @@ function Run-Game {
         $final = Result $phase $reason $exitCode
         if ($digest) { $final.fixtureSha256 = $digest }
         $final.hung = $hung
+        if ($stopPath) {
+            # graceful: the game quit within the grace period; killed-after-Ns: it did not; closing-crashed: it died while quitting
+            $final.stopPath = if ($stopPath -eq 'graceful' -and $phase -eq 'crashed') { 'closing-crashed' } else { $stopPath }
+        }
         if ($game -and ($phase -in @('crashed', 'forced') -or ($phase -eq 'exited' -and $reason -eq 'unrequested-exit'))) {
             try {
                 Save-Evidence $run $phase $reason $exitCode $started $hung
@@ -644,6 +688,12 @@ switch ($Action) {
         $token = [BitConverter]::ToString($bytes).Replace('-', '').ToLowerInvariant()
         $config = Read-Json (Join-Path $root 'config.json')
         if ((Get-ScheduledTask -TaskName $taskName).State -ne 'Ready') { throw 'Interactive task is busy' }
+        # Never start next to somebody else's game or capture: refusing is the only action taken.
+        if (Get-Process SkyrimSE, skse64_loader -ErrorAction SilentlyContinue) { throw 'A game or loader process is already running; start refused' }
+        if ((Test-Path -LiteralPath $captureLease) -or (Get-ScheduledTask -TaskName $captureTask -ErrorAction SilentlyContinue).State -eq 'Running' -or
+            (Get-Process ffmpeg -ErrorAction SilentlyContinue)) {
+            throw 'A capture is running; start refused'
+        }
         $stream = [IO.File]::Open($lease, 'CreateNew', 'Write', 'None')
         try {
             $id = [Text.Encoding]::ASCII.GetBytes($Session)
@@ -712,6 +762,10 @@ switch ($Action) {
         }
         $current | ConvertTo-Json -Compress
     }
+    'crashes' {
+        # The latest crash logs of the isolated profile, newest first (read-only, safe during a run).
+        ConvertTo-Json -InputObject @(Get-CrashLogs $null 5) -Compress -Depth 5
+    }
     'status' {
         if (!$Session) { throw 'Session id is required' }
         Get-Content -LiteralPath (Join-Path $runs "$Session\state.json") -Raw
@@ -737,7 +791,7 @@ switch ($Action) {
         $run = Join-Path $runs $Session
         $state = Read-Json (Join-Path $run 'state.json')
         if ($state.phase -in @('starting', 'running')) {
-            [IO.File]::WriteAllText((Join-Path $run 'stop'), '')
+            [IO.File]::WriteAllText((Join-Path $run 'stop'), "$Grace")
         }
         if ($state.phase -eq 'starting' -and (Get-ScheduledTask -TaskName $taskName).State -eq 'Ready' -and
             (Test-Path -LiteralPath $lease) -and [IO.File]::ReadAllText($lease) -eq $Session) {

@@ -17,6 +17,7 @@ from ..client import MAX_MESSAGE, TIMEOUT, ConnectionLost, RpcError, Session, ob
 from ..smoke import ACTIVE, WindowsHost
 
 KEEPALIVE_SECONDS = 15
+START_RETRIES = 2
 EVENT_BUFFER = 5000
 # console lines are already returned by the console tool, so subscribing would only add noise
 QUIET_EVENTS = {"console"}
@@ -137,34 +138,78 @@ class GameManager:
         return taken, lost, len(items) - consumed
 
     async def start(self, headless=True, save=None):
+        """Launch the game. The engine occasionally dies within a second of launch (a null call on its audio
+        thread, before any plugin code runs); such a start is repeated up to START_RETRIES times and reported
+        under `startRetries`."""
         async with self.lock:
             if self.alive:
                 return await self._status_locked(note="game already running; reusing the session")
-            await self._teardown()
-            self.reset()
-            self.phase = "starting"
-            self.mode = "headless" if headless else "windowed"
+            retries = []
+            for attempt in range(START_RETRIES + 1):
+                await self._teardown()
+                self.reset()
+                self.phase = "starting"
+                self.mode = "headless" if headless else "windowed"
+                try:
+                    await self._launch(save)
+                    break
+                except BaseException as error:
+                    early = await self._died_early(error)
+                    if early and attempt < START_RETRIES:
+                        retries.append(early)
+                        await self._close_link()
+                        continue
+                    await self._abort(error)
+                    if isinstance(error, (GameError, asyncio.CancelledError)):
+                        raise
+                    raise GameError(f"game_start failed: {type(error).__name__}: {error}") from error
+            result = await self._status_locked(note="game started")
+            if retries:
+                result["startRetries"] = retries
+            return result
+
+    async def _died_early(self, error):
+        """The crash summary when the game died during startup (so a fresh launch is worth trying), else None."""
+        if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt)) or not self.session_id:
+            return None
+        status = await self._host_status()
+        if isinstance(error, (ConnectionLost, OSError)):
+            # the socket drops a moment before the host notices the process is gone
+            for _ in range(10):
+                if status.get("phase") != "running":
+                    break
+                await asyncio.sleep(0.5)
+                status = await self._host_status()
+        if status.get("phase") != "crashed":
+            return None
+        self.crash = {"hostPhase": "crashed", "reason": status.get("reason"), "exitCode": status.get("exitCode")}
+        await self._attach_crash_log(status)
+        crash, self.crash = self.crash, None
+        return crash
+
+    async def _launch(self, save):
+        bootstrap = await self.host.command("start", mode=self.mode)
+        self.session_id, self.token, self.port = bootstrap["sessionId"], bootstrap["token"], bootstrap["port"]
+        if not re.fullmatch("[a-f0-9]{32}", self.session_id) or not re.fullmatch("[a-f0-9]{64}", self.token):
+            raise GameError("Invalid session bootstrap from the host")
+        await self.host.wait_ready(self.session_id)
+        # a link that drops while the plugin is still coming up is reopened; a dead game is left to start()
+        for attempt in range(4):
             try:
-                bootstrap = await self.host.command("start", mode=self.mode)
-                self.session_id, self.token, self.port = bootstrap["sessionId"], bootstrap["token"], bootstrap["port"]
-                if not re.fullmatch("[a-f0-9]{32}", self.session_id) or not re.fullmatch("[a-f0-9]{64}", self.token):
-                    raise GameError("Invalid session bootstrap from the host")
-                await self.host.wait_ready(self.session_id)
                 await self._attach()
                 self.info = await observe(self._get_info, lambda s: s["dataLoaded"], "Game data", 120)
                 await self._subscribe()
-                await observe(self._snapshot_raw, lambda s: any(m["name"] == "Main Menu" for m in s["menus"]),
-                              "Main menu", 60)
-                self.phase = "running"
-                self.keepalive_task = asyncio.create_task(self._keepalive())
-                if save:
-                    await self._load_save_locked(save)
-            except BaseException as error:
-                await self._abort(error)
-                if isinstance(error, (GameError, asyncio.CancelledError)):
+                break
+            except (ConnectionLost, OSError):
+                if attempt == 3 or (await self._host_status()).get("phase") != "running":
                     raise
-                raise GameError(f"game_start failed: {type(error).__name__}: {error}") from error
-            return await self._status_locked(note="game started")
+                await self._close_link()
+                await asyncio.sleep(1)
+        await observe(self._snapshot_raw, lambda s: any(m["name"] == "Main Menu" for m in s["menus"]), "Main menu", 60)
+        self.phase = "running"
+        self.keepalive_task = asyncio.create_task(self._keepalive())
+        if save:
+            await self._load_save_locked(save)
 
     async def _get_info(self):
         info = await self.session.call("Session.getInfo")
@@ -239,9 +284,29 @@ class GameManager:
                 status = {**status, "reason": f"reconnect failed: {error}"}
         self.crash = {"hostPhase": status.get("phase"), "reason": status.get("reason"),
                       "exitCode": status.get("exitCode")}
+        await self._attach_crash_log(status)
         self.phase = "crashed"
         await self._close_link()
         return False
+
+    async def _attach_crash_log(self, status):
+        """Add the crash logger's verdict (exception and top frames, by module and Address Library id) to self.crash."""
+        if not self.session_id or not self.crash:
+            return
+        log = None
+        try:
+            evidence = {}
+            if status.get("evidence"):
+                evidence = await self.host.command("evidence", self.session_id)
+            logs = evidence.get("crashLogs") or []
+            if not logs and status.get("phase") in {"crashed", "exited", "forced"}:
+                logs = (await self.host.command("crashes"))[:1]
+            log = logs[0] if logs else None
+        except Exception:
+            return
+        if log:
+            exception = (log.get("exception") or "").split("\t")[0]
+            self.crash["log"] = {"file": log.get("name"), "exception": exception, "topFrames": log.get("topFrames", [])}
 
     async def _close_link(self):
         session, self.session = self.session, None
@@ -286,7 +351,9 @@ class GameManager:
         except Exception:
             pass
 
-    async def stop(self):
+    async def stop(self, grace=12):
+        """Quit the game; the host asks it to close and kills it when it has not exited after `grace` seconds.
+        The result's `path` says which way it ended: graceful, killed-after-Ns, closing-crashed or crashed."""
         async with self.lock:
             if self.session_id is None or self.phase in {"idle", "stopped"}:
                 return {"phase": self.phase, "note": "no game is running"}
@@ -297,13 +364,21 @@ class GameManager:
             # stop through the host first: dropping the socket beforehand makes the game exit on its own,
             # which the host then records as an unrequested exit instead of a clean stop
             try:
-                result = await self.host.stop(self.session_id)
+                result = await self.host.stop(self.session_id, grace=grace)
             except Exception as error:
                 result = {"phase": "unknown", "reason": str(error)}
             await self._close_link()
             self.phase = "stopped"
             clean = result.get("phase") == "stopped" and result.get("exitCode") == 0
-            return {"phase": "stopped", "cleanExit": clean, "host": {k: result.get(k) for k in ("phase", "exitCode", "reason")}}
+            path = result.get("stopPath") or ("graceful" if clean else result.get("phase") or "unknown")
+            outcome = {"phase": "stopped", "cleanExit": clean, "path": path,
+                       "host": {k: result.get(k) for k in ("phase", "exitCode", "reason")}}
+            if result.get("phase") == "crashed":
+                self.crash = {"hostPhase": result.get("phase"), "reason": result.get("reason"),
+                              "exitCode": result.get("exitCode")}
+                await self._attach_crash_log(result)
+                outcome["crash"] = self.crash
+            return outcome
 
     async def call(self, method, timeout=None, **params):
         """Call a native method; transparently recovers a dropped link once."""

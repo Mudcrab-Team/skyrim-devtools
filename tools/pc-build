@@ -5,6 +5,7 @@
   tools/pc-build --config mac.json --deploy          build, then copy the DLL while holding agent.lock
   tools/pc-build --config mac.json commonlib         (re)build the shared CommonLibSSE-NG once
   tools/pc-build --config mac.json lock|unlock       hold agent.lock around a live run
+  tools/pc-build --config mac.json lock --refresh    heartbeat: agent.lock goes stale 25 min after its last refresh
 
 With --lock-wait, waiting agents queue by ticket next to agent.lock and are served oldest first.
 """
@@ -131,6 +132,8 @@ def main():
     parser.add_argument("--deploy", action="store_true", help="copy the DLL into the game while holding agent.lock")
     parser.add_argument("--keep-lock", action="store_true", help="with --deploy: keep agent.lock for the live run")
     parser.add_argument("--lock-wait", type=int, default=0, metavar="SECONDS", help="wait this long for agent.lock")
+    parser.add_argument("--refresh", action="store_true",
+                        help="with lock: touch agent.lock if this agent holds it (non-zero exit if not); long holders call it every few minutes")
     parser.add_argument("--full", action="store_true", help="resend every source file")
     parser.add_argument("--reconfigure", action="store_true", help="delete the build directory first")
     parser.add_argument("--no-prebuilt", action="store_true", help="compile CommonLib inside the build directory")
@@ -143,7 +146,8 @@ def main():
     started = time.monotonic()
 
     if options.command in {"lock", "unlock"}:
-        sys.exit(run_remote(host, f"-Action {options.command} -Agent {options.name} -LockWait {options.lock_wait}"))
+        refresh = " -Refresh" if options.refresh and options.command == "lock" else ""
+        sys.exit(run_remote(host, f"-Action {options.command} -Agent {options.name} -LockWait {options.lock_wait}{refresh}"))
 
     t = time.monotonic()
     changed, removed = sync(host, options.name, options.full)
