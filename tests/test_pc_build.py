@@ -81,5 +81,66 @@ class HoldTests(unittest.TestCase):
         self.assertTrue(any("unlock" in c for c in calls))
 
 
+class LeaseTests(unittest.TestCase):
+    def test_hold_takes_the_lock_as_a_lease(self):
+        calls = []
+        with mock.patch.object(pc_build, "run_remote", lambda host, args: calls.append(args) or 0):
+            pc_build.hold(FakeHost(), options(1), [sys.executable, "-c", "pass"])
+        self.assertIn("-Action lock", calls[0])
+        self.assertIn(" -Lease", calls[0])
+
+    def test_heartbeat_outpaces_the_remote_staleness_window(self):
+        self.assertLessEqual(pc_build.HEARTBEAT_SECONDS * 3, 90)
+
+    def hold_with_refresh_codes(self, codes):
+        scripts = []
+        codes = list(codes)
+
+        class Host(FakeHost):
+            def run_powershell(self, script, **kwargs):
+                scripts.append(script)
+                return types.SimpleNamespace(returncode=codes.pop(0) if codes else 0, stderr="")
+
+        with mock.patch.object(pc_build, "run_remote", lambda host, args: 0), \
+                mock.patch.object(pc_build, "HEARTBEAT_SECONDS", 0.01):
+            status = pc_build.hold(Host(), options(1), [sys.executable, "-c", "import time; time.sleep(0.5)"])
+        return status, scripts
+
+    def test_heartbeats_keep_flowing_while_the_command_runs(self):
+        status, scripts = self.hold_with_refresh_codes([])
+        self.assertEqual(status, 0)
+        self.assertGreater(len(scripts), 2)
+        self.assertTrue(all("-Refresh" in s for s in scripts))
+
+    def test_a_network_failure_on_a_heartbeat_does_not_mean_the_lock_was_lost(self):
+        status, _ = self.hold_with_refresh_codes([255, 255, 0])
+        self.assertEqual(status, 0)
+
+    def test_a_lock_taken_over_by_someone_else_fails_the_hold(self):
+        status, _ = self.hold_with_refresh_codes([4])
+        self.assertEqual(status, 125)
+
+
+class RemoteScriptTests(unittest.TestCase):
+    """The lock logic is PowerShell and cannot run on the Mac; these pin the rules the Mac side relies on."""
+
+    script = (SOURCE.parent / "pc_build_remote.ps1").read_text()
+
+    def test_stale_lease_is_taken_over_and_logged(self):
+        self.assertIn("$leaseSeconds = 90", self.script)
+        self.assertIn("if (Test-LeaseLock) { return (Get-LockAge) -gt $leaseSeconds }", self.script)
+        self.assertIn("is stale (no heartbeat for", self.script)
+
+    def test_locks_without_a_lease_keep_the_slow_rule(self):
+        self.assertIn("(Get-LockAge) -gt (25 * 60)) -and -not (Get-Process SkyrimSE", self.script)
+
+    def test_stale_queue_entries_are_pruned_and_logged(self):
+        self.assertIn("$ticketTtlSeconds = $leaseSeconds", self.script)
+        self.assertIn("dropping stale queue entry", self.script)
+
+    def test_orphaned_waiter_gives_up(self):
+        self.assertIn("Test-ParentAlive", self.script)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5,10 +5,10 @@
   tools/pc-build --config mac.json --deploy          build, then copy the DLL while holding agent.lock
   tools/pc-build --config mac.json commonlib         (re)build the shared CommonLibSSE-NG once
   tools/pc-build --config mac.json lock|unlock       hold agent.lock around a live run
-  tools/pc-build --config mac.json lock --refresh    heartbeat: agent.lock goes stale 25 min after its last refresh
+  tools/pc-build --config mac.json lock --refresh    heartbeat: a manual lock goes stale 25 min after its last refresh
   tools/pc-build --config mac.json hold --lock-wait 1200 -- CMD ARGS...
-                                                     take the lock (queued), run CMD with a background heartbeat
-                                                     every 4 min, release the lock when CMD ends; CMD is stopped
+                                                     take the lock (queued) as a lease, run CMD with a background
+                                                     heartbeat every 20 s (a hold silent for 90 s is taken over), release the lock when CMD ends; CMD is stopped
                                                      after --max-minutes (default 20) so one hold stays bounded; the
                                                      lock is released on timeout, on exit and on SIGTERM/SIGHUP
   --lock-file probe.lock                             with lock/unlock/hold: use another lock file (tests of the lock
@@ -146,7 +146,7 @@ def run_remote(host, args):
     return host.run_powershell(remote_script(args), stream=True)
 
 
-HEARTBEAT_SECONDS = 240
+HEARTBEAT_SECONDS = 20  # the remote treats a leased hold as dead after 90 s of silence
 UNLOCK_ATTEMPTS = 3
 LOCK_ARGS = ""  # set from --lock-file
 RETRY_DELAY = 2
@@ -189,7 +189,7 @@ def supervise(argv, max_seconds, env=None):
 
 
 def release_lock(host, name, remote=None):
-    """Give agent.lock back, retrying: a lock left behind blocks every other agent for 25 minutes."""
+    """Give agent.lock back, retrying: a lock left behind blocks every other agent until its lease lapses."""
     remote = remote or run_remote
     for attempt in range(UNLOCK_ATTEMPTS):
         code = remote(host, f"-Action unlock -Agent {name} -LockWait 0{LOCK_ARGS}")
@@ -199,7 +199,7 @@ def release_lock(host, name, remote=None):
             # the lock belongs to someone else now: ours is already gone, nothing to retry
             return False
         time.sleep(RETRY_DELAY)
-    print(f"pc-build: could not release agent.lock for {name}; it goes stale 25 min after its last refresh", file=sys.stderr)
+    print(f"pc-build: could not release agent.lock for {name}; it is taken over once its heartbeat is 90 s old", file=sys.stderr)
     return False
 
 
@@ -210,7 +210,7 @@ def hold(host, options, argv):
     # The remote lock is re-entrant by agent name, so two holds sharing --name would both run at once; each hold
     # takes it under its own name and hands that name to nested pc-build calls (a --deploy inside the command).
     name = f"{options.name}.{os.getpid()}"
-    wait = f"-Action lock -Agent {name} -LockWait {options.lock_wait}{LOCK_ARGS}"
+    wait = f"-Action lock -Agent {name} -LockWait {options.lock_wait} -Lease{LOCK_ARGS}"
     code = run_remote(host, wait)
     if code:
         fail(f"could not take agent.lock (exit {code}); it is held by another agent", code)
@@ -220,9 +220,12 @@ def hold(host, options, argv):
     def beat():
         while not stop.wait(HEARTBEAT_SECONDS):
             result = host.run_powershell(remote_script(f"-Action lock -Agent {name} -LockWait 0 -Refresh{LOCK_ARGS}"), check=False)
-            if result.returncode:
+            if result.returncode == 4:
+                # the remote says another agent owns it now (our lease lapsed); other failures are network trouble
                 lost.set()
                 print("pc-build: agent.lock refresh failed; the lock is no longer ours", file=sys.stderr)
+            elif result.returncode:
+                print(f"pc-build: agent.lock refresh could not reach the PC (exit {result.returncode}); retrying", file=sys.stderr)
 
     # a terminate or hangup of pc-build itself must still run the release below
     previous = {}
