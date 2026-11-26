@@ -30,7 +30,8 @@ server speaks plain stdio. When the client exits the server stops the game, so a
 * The game ignores all input while the load fade is on screen, and a menu ignores input for about 0.3 s after it
   opens. `wait_for(playable=true)` accounts for the fade; after `open_menu` wait for the menu, then give it a beat.
 * Do not close the socket without stopping through the host: the game exits on its own, and the host records
-  that as `unrequested-exit`. `game_stop` closes open gameplay menus (shutting down with the inventory open crashed the game), stops through the host and reports `cleanExit`.
+  that as `unrequested-exit`. `game_stop(grace_seconds=12)` closes open gameplay menus (quitting with the inventory open crashes the engine on one of its worker threads), asks the game to quit, kills it after the grace period, and reports `cleanExit` and `path` (`graceful`, `killed-after-Ns`, `closing-crashed`). A crash comes with `crash.log`: the crash logger's exception and top frames by module and Address Library id.
+* The engine sometimes dies about a second after launch (null call on its audio thread, before any plugin code runs; about 1 start in 15). `game_start` repeats such a start up to twice and lists the crashes under `startRetries`.
 
 ## Tools
 
@@ -76,7 +77,7 @@ one. Loop: `dialogue_start` -> `dialogue_wait` (greeting and topics) -> `dialogu
 ... -> `dialogue_close`. `dialogue_wait skip=true` skips each line as soon as its text was captured and is the
 fast path (and the one that works with muted audio). A trainer, merchant or gift topic opens another menu over
 the dialogue; `dialogue_wait` then answers `submenu` and the conversation stays frozen until that menu is closed
-so act in it first and leave it with the exit key (`press_control Cancel`) or `dialogue_close`; hiding a training menu with `close_menu` was followed by a frozen game within two minutes in two of two runs. Muted (headless) audio does not stall a conversation, but every line still lasts as long as its voice, so use `skip`. The plugin turns dialogue subtitles on so NPC lines can be read.
+so act in it first and leave it with the exit key (`press_control Cancel`) or `dialogue_close`; hiding a training menu with `close_menu` was followed by a frozen game within two minutes in two of two runs, so `open_menu` now refuses trainer, barter, gift, container, lockpicking, crafting, dialogue and book menus (pass `force` to override) and `close_menu` leaves them with the Cancel control. Muted (headless) audio does not stall a conversation, but every line still lasts as long as its voice, so use `skip`. The plugin turns dialogue subtitles on so NPC lines can be read.
 
 ## Showcase video
 
