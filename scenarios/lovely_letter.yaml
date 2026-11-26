@@ -1,0 +1,10 @@
+# A Lovely Letter at its start: Faendal and Sven both want Camilla.
+name: lovely_letter_start
+quest: FreeformRiverwood01
+stage: 10
+kit: light
+level: 3
+time: 10
+clearBounty: true
+position:
+  ref: "00013491"   # Sven, in Riverwood

@@ -15,6 +15,7 @@
 #include "nav_graph.h"
 #include "nav_path.h"
 #include "quest_targets.h"
+#include "speed.h"
 
 #include <deque>
 #include <set>
@@ -68,6 +69,7 @@ namespace
         double started = 0.0;
         double timeout = 300.0;
         bool run = true;
+        float fast = 0.0F;  // walk speed percent for long walks, 0 = off
         bool sprint = false;
         float aiSpeed = 1.0F;
         std::optional<bool> restoreRunning;
@@ -499,7 +501,7 @@ namespace
     {
         Json out{ { "id", p.id }, { "state", p.state }, { "mode", p.mode }, { "goal", p.goal.describe },
             { "elapsedS", Round((p.ended > 0 ? p.ended : Now()) - p.started, 10.0) }, { "stuckCount", p.stuckCount },
-            { "replans", p.replans }, { "travelled", Round(p.travelled) }, { "combat", p.combat },
+            { "replans", p.replans }, { "travelled", Round(p.travelled) }, { "fast", p.fast > 0.0F ? Json(p.fast) : Json(nullptr) }, { "combat", p.combat },
             { "reason", p.reason.empty() ? Json(nullptr) : Json(p.reason) }, { "blockers", p.blockers.is_null() ? Json(nullptr) : p.blockers }, { "teleports", p.teleports }, { "unsticks", p.unsticks } };
         if (const auto player = RE::PlayerCharacter::GetSingleton()) {
             const auto pos = player->GetPosition();
@@ -569,6 +571,9 @@ namespace
 
     void Finish(Process& p, const std::string& state, const std::string& reason)
     {
+        if (p.fast > 0.0F) {
+            speed::Boost(0.0F);
+        }
         p.state = state;
         p.reason = reason;
         p.ended = Now();
@@ -1710,6 +1715,8 @@ namespace
             return;
         }
         p.combat = player->IsInCombat();
+        // Fast only while walking undisturbed: combat, dialogue, doors, loading and recovery run at normal speed.
+        speed::Boost(p.fast > 0.0F && p.state == "moving" && p.interruption.empty() && !p.combat ? p.fast : 0.0F);
 
         Json details;
         const auto reason = DetectInterruption(p, *player, now, details);
@@ -1976,7 +1983,7 @@ DEVTOOLS_MODULE(NavGoto)
 
     Register("Nav.goto", [](const Json& params) {
         AllowOnly(params, { "goal", "mode", "timeoutS", "run", "sprint", "onCombat", "onDialogue", "onMessageBox", "onMenu", "invulnerable", "via",
-            "route", "routeSpacing", "activate", "loadEpoch" });
+            "route", "routeSpacing", "activate", "fast", "loadEpoch" });
         RequirePlayable(params);
         std::lock_guard lock(Lock());
         if (active) {
@@ -2026,6 +2033,16 @@ DEVTOOLS_MODULE(NavGoto)
         p.invulnerable = Optional<bool>(params, "invulnerable", false);
         p.timeout = Optional<double>(params, "timeoutS", 300.0);
         p.run = Optional<bool>(params, "run", true);
+        if (params.contains("fast") && !params["fast"].is_null()) {
+            const auto& fast = params["fast"];
+            if (fast.is_boolean()) {
+                p.fast = fast.get<bool>() ? speed::defaultFast : 0.0F;
+            } else if (fast.is_number() && fast.get<float>() >= 100.0F && fast.get<float>() <= speed::maxWalk) {
+                p.fast = fast.get<float>();
+            } else {
+                throw RpcError(code::invalidParams, "fast is true or a walk speed percent from 100 to 400");
+            }
+        }
         p.sprint = Optional<bool>(params, "sprint", false);
         p.aiSpeed = p.run ? 1.0F : 0.0F;
         if (params.contains("via")) {

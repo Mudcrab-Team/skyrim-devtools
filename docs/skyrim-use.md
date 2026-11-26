@@ -46,6 +46,7 @@ server speaks plain stdio. When the client exits the server stops the game, so a
 | Move and camera | `walk {direction, duration_ms or distance, run?, sprint?}`, `turn_to {heading_deg or x,y or ref_id}`, `jump`, `sneak {on}`, `camera_state`, `camera_set {mode, yaw_deg, pitch_deg, zoom, fov}`, `camera_look_at {ref_id or x,y,z}` |
 | Combat | `combat_state {radius}`, `combat_target`, `combat_face`, `combat_draw`, `combat_equip {name, hand}`, `combat_unequip`, `combat_attack {kind=light\|power, hand}`, `combat_block`, `combat_cast`, `combat_drink {kind}`, `combat_fight {style, rounds, drink_below}` (a bounded loop over the primitives), `player_equipped`, `player_spells` |
 | Navigate | `nav_nearby {radius, kind}`, `nav_places {contains}`, `nav_goto {goal, mode=input\|ai, timeout_s, on_combat, on_dialogue, on_message_box, on_menu, invulnerable, via, route, activate}`, `nav_plan {ref_id \| x, y, z, route}`, `nav_status`, `nav_wait {timeout_s}`, `nav_cancel` |
+| Setup and speed | `scenario_setup {quest?, stage?, complete_stages_before?, stage_path?, position?, items?, kit?, level?, skills?, perks?, spells?, time?, weather?, clear_bounty?, file?}`, `game_speed {walk?, timescale?, reset?}`, `fast_travel {to, force?}`, `wait {hours}`; `nav_goto {fast: true}` |
 | Record | `record_start {hz, fields, name}`, `record_stop`, `record_fetch {name, dest_dir?, plot}`, `trajectory_plot {file, color_by, route}`, `record_replay_camera {name, speed}` |
 | Generic | `rpc_methods`, `rpc_call {method, params}` |
 
@@ -68,6 +69,43 @@ keys. With a worldspace graph built by `skyrim-devtools-navgraph build` (see doc
 `skyrim-devtools-trajectory plot <file> -o out.svg [--color speed|frame]`. A long trip can be
 sped up with `console sgtm 4` (and `sgtm 1` afterwards); see docs/protocol.md for the navigation
 modes and their limits.
+
+## Scenarios and fast boring parts
+
+Starting a test deep in a questline by walking from the first save costs minutes per attempt. Two tools remove it.
+
+**`scenario_setup`** (also `skyrim-devtools-scenario run <file>`) applies, in this order: character (kit, items, level,
+skills, perks, spells, weather, bounty), game hour, quest stage, position, then reads `quest_targets` back as a check.
+It never stops at the first failed step: the reply is `{ok, applied, failures, warnings, questTargets, player}`, so
+read `failures` and `warnings` before trusting the setup.
+
+* Items, perks and spells are given by displayed name ("Steel Sword") or form id. `kit` is `light`, `medium` or `heavy`
+  (armor set, weapon, shield, bow and arrows, potions, lockpicks, gold; the armor and main weapon are equipped).
+  Explicit `items` replace a kit entry for the same item.
+* `position` is `{ref}`, `{cell, x?, y?, z?}`, `{x, y, z}`, `{place}` (a map-marker name from `nav_places`) or
+  `{questTarget: <quest>}`. A quest target stands you at the way to the marker (the dungeon door when the target is
+  inside); `exact: true` uses the marker's own reference.
+* Quests that need earlier stages: the engine does not expose a quest's stage list, so `complete_stages_before` runs
+  `stage_path` (an explicit list) below `stage`, or, without one, multiples of 10, which is a guess and reported as such.
+  Jumping straight to a stage warns that the skipped stages' scripts never ran (aliases unfilled, objectives not shown,
+  scripts firing out of order); a stage that leaves `quest_targets` empty warns too.
+  Stages go through the console `setstage`, so stage fragments run as for a player. Quests do not rewind: for an earlier
+  point load a save from before the quest.
+* A scenario file is JSON or YAML with the same field names (`completeStagesBefore`, `stagePath`, `clearBounty`);
+  see `scenarios/*.yaml`. `skyrim-devtools-scenario check <file>` validates it and prints the plan without a game;
+  `run <file> --config devtools.json [--save Fixture] [--headless] [--keep-running]` starts the game, loads the save,
+  applies the scenario and prints the report as JSON.
+
+**Speed.** `game_speed {walk, timescale, reset}` sets the player's walk speed (percent of normal, 25-400) and the clock
+scale; `nav_goto {fast: true}` raises the walk speed to 300% only while the walk is undisturbed and restores it on arrival,
+failure, cancel, combat, dialogue, doors and loading (`fast: 200` picks the percent, 100-400). `fast_travel {to}` goes to a
+discovered map marker (name or id; `force` for an undiscovered one) and advances the clock by the estimated travel time; the
+map UI is not driven. `wait {hours}` skips game time. Time skips move the calendar; they do not simulate the hours, so timers
+and NPC schedules catch up on their next update.
+
+All four are ordinary tools, so the session timeline records each call with its arguments and result (for example
+`wait {hours: 3}` with `waitedHours`, `fast_travel {to: Whiterun}`, `nav_goto {fast: true}`); the video composer labels them
+in the panel and runs them at the fast-forward rate like other waiting.
 
 ## Perception
 
