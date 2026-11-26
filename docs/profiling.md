@@ -47,7 +47,7 @@ skyrim-devtools-profile export DIR --firefox OUT.json[.gz] [--open]
 skyrim-devtools-profile diff A B [--threads main|all] [--json]
 skyrim-devtools-profile top --config host.json [--save NAME] [--cell C] [--phase P] [--window 3] [--count N] [--json]
 skyrim-devtools-profile timeline DIR [--recorder TIMELINE.jsonl] [--out FILE]
-skyrim-devtools-profile export DIR [--sqlite OUT.sqlite] [--perfetto OUT.pftrace [--format proto|json] [--open]]
+skyrim-devtools-profile export DIR [--sqlite OUT.sqlite] [--perfetto OUT.pftrace [--format proto|json] [--open-perfetto]]
                                [--recorder TIMELINE.jsonl]
 skyrim-devtools-profile query DB.sqlite "SELECT ..." [--limit 200] [--json]
 ```
@@ -313,7 +313,7 @@ Every `record` and `profile_stop` also writes `trace.pftrace`, a [Perfetto](http
 (protobuf TrackEvent) with the whole profile on one time axis; `export DIR --perfetto OUT.pftrace` writes one
 from a saved profile (`OUT.json` or `--format json` writes Chrome trace JSON instead, without the call-stack
 samples). Open it in [ui.perfetto.dev](https://ui.perfetto.dev) with **Open trace file**: the UI runs in the
-browser and loads the file locally. `export ... --open` serves the file on `127.0.0.1:9001` and opens the UI
+browser and loads the file locally. `export ... --open-perfetto` serves the file on `127.0.0.1:9001` and opens the UI
 on it, which does the same without a file dialog.
 
 **Never share or upload a trace.** It holds game function names from the local symbol tables, like every
