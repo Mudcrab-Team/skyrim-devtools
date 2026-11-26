@@ -37,7 +37,7 @@ server speaks plain stdio. When the client exits the server stops the game, so a
 
 | Group | Tools |
 | --- | --- |
-| Lifecycle | `game_start {headless=true, save?}`, `game_stop`, `game_status` |
+| Lifecycle | `game_start {headless=true, save?}`, `game_stop`, `game_status`, `game_save {name, keep=true}` (the host wipes its Saves folder on every launch; `game_save` also copies the file to the fixtures folder so `game_start {save: name}` finds it later) |
 | Observe | `snapshot`, `list_menus {open_only}`, `events_list`, `events_subscribe`, `events_drain {types?, limit}`, `wait_for` |
 | Act | `open_menu`, `close_menu`, `console {command, target}`, `press_key`, `press_control`, `mouse`, `release_all_input`, `look {yaw_deg, pitch_deg}` |
 | Saves and world | `list_saves`, `load_save`, `reload`, `center_on_cell` |
