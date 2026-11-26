@@ -522,6 +522,7 @@ class CellModel:
         return rid in self.reached or self.visited.get(rid, 0.0) >= VISITED_SHARE or rid == self.player_room
 
     def add_contents(self, contents, player):
+        player = player or contents.get("player")
         self.player = tuple(player) if player else None
         self.god_mode = bool(contents.get("godMode"))
         self.player_room = self.nearest_room(self.player) if self.player else None
