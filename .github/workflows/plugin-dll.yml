@@ -25,7 +25,8 @@ jobs:
       # The pins in README.md. nlohmann/json 3.12.0 comes from the pinned vcpkg tree.
       COMMONLIB_COMMIT: 7c27a75da3eb0db080c1f1f63f6df1b7cd733c2a
       HTTPLIB_COMMIT: 7800c3dc5b33285cbb18baa5998de4ff7ef63515
-      VCPKG_COMMIT: 5d4a3dc90c0b3773f3bac81bf41297b54328f471
+      # vcpkg tag 2026.10.16. README.md names its annotated tag object (5d4a3dc).
+      VCPKG_COMMIT: 9eec002df1cd109f8f104cd966a763daf9751489
       JSON_VERSION: 3.12.0
       TRIPLET: x64-windows-static-md
       VCPKG_ROOT: ${{ github.workspace }}/deps/vcpkg
@@ -120,8 +121,14 @@ jobs:
             "vcpkg: $env:VCPKG_COMMIT (nlohmann-json $env:JSON_VERSION)"
           ) | Set-Content artifact/BUILD.txt
           $hash = (Get-FileHash artifact/SkyrimDevTools.dll).Hash.ToLowerInvariant()
-          "$hash  SkyrimDevTools.dll" | Set-Content artifact/SHA256SUMS
+          # LF only, so that sha256sum and shasum can check the file on any system.
+          "$hash  SkyrimDevTools.dll`n" | Set-Content artifact/SHA256SUMS -NoNewline
           Get-Content artifact/BUILD.txt, artifact/SHA256SUMS
+
+      - name: Verify the checksum file
+        shell: bash
+        working-directory: artifact
+        run: sha256sum --strict --check SHA256SUMS && ! grep -q $'\r' SHA256SUMS
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
