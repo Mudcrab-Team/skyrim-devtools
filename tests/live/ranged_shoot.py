@@ -73,7 +73,7 @@ async def case(ctx, native, label, where, expect_reposition):
     return {"label": label, "pass": all(v for k, v in checks.items() if k not in ("startedBlocked", "repositioned")),
             "checks": checks, "hitRate600to1500": rate, "hitRate800to1500": far_rate, "shotsOver1500": sum(1 for s in shots if s["range"] > 1500), "shots": result.get("shots"), "hits": result.get("hits"),
             "ranges": [s["range"] for s in shots], "heldS": [s["heldS"] for s in shots], "repositions": result.get("repositions"),
-            "model": result.get("model"), "error": result.get("error"), "suggestedPosition": result.get("suggestedPosition"),
+            "model": result.get("model"), "detail": result.get("detail"), "error": result.get("error"), "suggestedPosition": result.get("suggestedPosition"),
             "firstLine": {k: first.get(k) for k in ("clear", "hitDistance", "hitLayer", "distance")}}
 
 
