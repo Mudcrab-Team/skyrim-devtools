@@ -56,6 +56,12 @@ class SaveTests(unittest.TestCase):
             await h.text("game_stop")
         run(scenario())
 
+    def test_scripts_emit_json_through_powershell_not_hand_quoted_text(self):
+        for remove in (True, False):
+            script = saves.keep_script("gc4", remove)
+            self.assertIn("ConvertTo-Json", script)
+            self.assertNotIn('\\"', script)
+
 
 if __name__ == "__main__":
     unittest.main()

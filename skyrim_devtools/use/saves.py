@@ -21,12 +21,12 @@ def keep_script(name, remove):
     root = r"Join-Path $env:USERPROFILE '.local\skyrim-devtools'"
     if remove:
         return (rf"$r = {root}; $f = Join-Path $r 'fixtures\{name}.ess'; "
-                rf"if (Test-Path -LiteralPath $f) {{ Remove-Item -LiteralPath $f }}; '{{\"kept\":false}}'")
+                rf"if (Test-Path -LiteralPath $f) {{ Remove-Item -LiteralPath $f }}; ConvertTo-Json -Compress @{{kept = $false}}")
     return (rf"$r = {root}; $s = Join-Path $r 'profile\Saves\{name}.ess'; "
             rf"if (-not (Test-Path -LiteralPath $s)) {{ throw 'save file not found' }}; "
             rf"New-Item -ItemType Directory -Force (Join-Path $r 'fixtures') | Out-Null; "
             rf"Copy-Item -LiteralPath $s -Destination (Join-Path $r 'fixtures\{name}.ess') -Force; "
-            rf"'{{\"kept\":true,\"bytes\":' + (Get-Item -LiteralPath $s).Length + '}}'")
+            rf"ConvertTo-Json -Compress @{{kept = $true; bytes = (Get-Item -LiteralPath $s).Length}}")
 
 
 def register(mcp, manager, native):
