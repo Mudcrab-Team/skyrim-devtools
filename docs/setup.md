@@ -73,8 +73,9 @@ scratch root with the following layout.
   versionlib-1-7-104-0.bin. Use a clean load order and one plugin DLL.
 - **profile/** with private Skyrim.ini and SkyrimPrefs.ini copies and a Saves subdirectory.
   Set [General] sLocalSavePath=Saves\ in Skyrim.ini. Set bSaveOnPause, bSaveOnRest, bSaveOnTravel
-  and bSaveOnWait to 0 in SkyrimPrefs.ini. On this test account only, point the Documents
-  My Games\Skyrim Special Edition junction to the private profile so logs and saves land there.
+  and bSaveOnWait to 0 in SkyrimPrefs.ini. The game offers no switch to move
+  My Games\Skyrim Special Edition (sLocalSavePath moves saves only), so each run reaches the private profile
+  through a Documents junction that host.ps1 creates when the run starts and removes when it ends.
 - **fixture.ess** with a locally owned vanilla save that loads with that load order and starts
   in a quiet location with prompts dismissed. Each launch empties the scratch save directory,
   so saves the game wrote in an earlier run are discarded. It then copies this file in as
@@ -98,9 +99,14 @@ rendering there with bAlwaysActive. Preflight reports an inactive or locked desk
 unavailable Steam, unconfirmed Offline Mode or unconfirmed Steam Cloud settings before it
 starts the loader. Headless runs on a locked desktop have not been tested yet.
 
-Keep the original Documents profile backed up while the junction is active.
-After Skyrim closes, remove the junction and restore the original profile if
-you are done with the isolated setup.
+The junction exists only while a run owns the game. Entering a run renames an existing real
+My Games\Skyrim Special Edition folder to `Skyrim Special Edition.DevTools-Real` (a rename, contents untouched)
+and creates the junction. Leaving the run (stop, crash, kill or failed preflight) removes the junction link
+with `rmdir` and renames the backup back. The next `start` and `host.ps1 restore-profile` finish that
+restore if a host died mid-run. If a real folder and the backup both exist, or the folder is a junction to
+anywhere else, the host stops with an error and changes nothing. The files directly inside
+%LOCALAPPDATA%\Skyrim Special Edition (Plugins.txt, ContentCatalog.txt) cannot be redirected, so they are
+copied aside at run start and restored afterwards.
 
 ~~~powershell
 Copy-Item windows/host.ps1 "$scratch/host.ps1"
