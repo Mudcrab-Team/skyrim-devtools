@@ -4,9 +4,9 @@
 profile Skyrim Special Edition 1.7.104 (1.6.1170 also loads; see [profiling](docs/profiling.md#other-runtimes)). The plugin exposes a JSON-RPC API inside the game; the MCP server turns it
 into tools Claude can call, the way browser-use does for a browser.
 
-[![skyrim-use teaser](docs/media/teaser.jpg)](https://github.com/Mudcrab-Team/skyrim-devtools/releases/download/showcase-teaser/skyrim-use-teaser-public.mp4)
+[![skyrim-use teaser](docs/media/teaser.jpg)](https://www.youtube.com/watch?v=AEZf616ZMGM)
 
-*Teaser (60 s): an agent sets up a character, fights, gets stuck on purpose, explores dialogue and watches the live profiler. Click to play.*
+*Teaser (60 s): an agent sets up a character, fights, gets stuck on purpose, explores dialogue and watches the live profiler. Click to watch on YouTube.*
 
 ## Features
 
