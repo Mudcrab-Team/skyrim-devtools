@@ -179,6 +179,10 @@ $usePrefix = (-not $NoPrebuilt) -and (Test-Path (Join-Path $prefix 'lib\cmake\Co
 if (-not $usePrefix) { Write-Output 'note: no prebuilt CommonLib, building it inside this build dir (slow); run tools/pc-build commonlib' }
 $stamp = Join-Path $build 'pc-build.prefix'
 $mode = if ($usePrefix) { 'prefix' } else { 'source' }
+# The ADLX helper is built only from a local ADLX checkout in deps\adlx (its SDK licence keeps it out of Git).
+$adlxSdk = Join-Path $deps 'adlx\SDK'
+$withAdlx = Test-Path (Join-Path $adlxSdk 'Include\ADLX.h')
+if ($withAdlx) { $mode += '+adlx' }
 if ((Test-Path $stamp) -and ((Get-Content $stamp -Raw).Trim() -ne $mode)) { $Reconfigure = $true }
 if ($Reconfigure -and (Test-Path $build)) { Remove-Item -Recurse -Force $build }
 if (-not (Test-Path (Join-Path $build 'build.ninja'))) {
@@ -187,6 +191,7 @@ if (-not (Test-Path (Join-Path $build 'build.ninja'))) {
             "-DCMAKE_TOOLCHAIN_FILE=$vcpkg", '-DVCPKG_MANIFEST_MODE=OFF', $triplet,
             "-DCOMMONLIB_SOURCE=$(Join-Path $deps 'commonlib')", "-DHTTPLIB_SOURCE=$(Join-Path $deps 'httplib')")
         if ($usePrefix) { $args += "-DCOMMONLIB_PREFIX=$prefix" }
+        if ($withAdlx) { $args += "-DADLX_SDK=$adlxSdk" }
         & $cmake @args 2>&1
     }
     New-Item -ItemType Directory -Force $build | Out-Null
@@ -197,13 +202,18 @@ Step 'build' { & $cmake --build $build 2>&1 }
 $dll = Join-Path $build 'SkyrimDevTools.dll'
 if (-not (Test-Path $dll)) { Write-Output "missing $dll"; exit 1 }
 Write-Output ("dll {0} bytes" -f (Get-Item $dll).Length)
+$adlxDll = Join-Path $build 'SkyrimDevToolsAdlx.dll'
+if (Test-Path $adlxDll) { Write-Output ("adlx helper {0} bytes" -f (Get-Item $adlxDll).Length) }
 
 if ($Deploy) {
     $heldBefore = (Get-LockOwner) -eq $Agent
     if (-not (Acquire-Lock $Agent $LockWait)) { Write-Output "agent.lock is held by '$(Get-LockOwner)'; not deploying"; exit 4 }
     try {
         $dest = Join-Path $root 'game\Data\SKSE\Plugins'
-        Step 'deploy' { Copy-Item $dll (Join-Path $dest 'SkyrimDevTools.dll') -Force }
+        Step 'deploy' {
+            Copy-Item $dll (Join-Path $dest 'SkyrimDevTools.dll') -Force
+            if (Test-Path $adlxDll) { Copy-Item $adlxDll (Join-Path $dest 'SkyrimDevToolsAdlx.dll') -Force }
+        }
     } finally {
         if (-not $KeepLock -and -not $heldBefore) { Remove-Item $lockPath -Force -ErrorAction SilentlyContinue; Write-Output 'lock released' }
     }

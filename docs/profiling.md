@@ -38,6 +38,7 @@ of symbol tables and the same raw profile can be re-symbolised later as names im
 skyrim-devtools-profile record --config host.json --seconds 30 [--phase idle|walk|coc:<cell>[,<back>]]
                                [--threads all|main|frame|<ids or names>] [--hz 1000] [--other-hz 250]
                                [--suspend-budget 2.5] [--save NAME] [--cell Riverwood] [--out DIR] [--keep]
+                               [--gpu-counters [--gpa-dir DIR] [--gpa-counters A,B,...] [--gpa-frames 600]]
 skyrim-devtools-profile report DIR [--rewrite] [--json]
 skyrim-devtools-profile export DIR --firefox OUT.json[.gz] [--open]
 skyrim-devtools-profile diff A B [--threads main|all] [--json]
@@ -60,6 +61,7 @@ applies a load (`walk` turns and walks, `coc:` loads a cell and returns, repeate
 | `timeline.html` | Self-contained timeline viewer (see below) |
 | `profile.sqlite` | The profile as SQL tables (see SQLite export) |
 | `raw.json.gz` | The raw profile; `report --rewrite` regenerates everything from it |
+| `gpu-counters.json` | Only with `--gpu-counters`: the GPUPerfAPI capture (see AMD hardware counters) |
 
 ### Firefox Profiler
 
@@ -80,10 +82,11 @@ each hitch. The file layout is described in [profile-data.md](profile-data.md).
 `diff` compares two profiles (for example the same scene with and without a mod) and lists the largest
 changes in self and total share and in the module split.
 
-MCP tools in `skyrim-use`: `profile_start {threads, hz, duration_s}` (threads `all` by default), `profile_stop` (returns the report and
+MCP tools in `skyrim-use`: `profile_start {threads, hz, duration_s, gpu_counters}` (threads `all` by default), `profile_stop` (returns the report and
 writes the files on the MCP host), `profile_status`, `profile_watch`, `profile_hitches`, `profile_top` (one
 live snapshot), `profile_mark` (a named span on the running profile) and `profile_query {sql, path?, limit?}`
-(read-only SQL on the last `profile_stop`'s `profile.sqlite`, or on `path`). Raw RPC methods are listed in
+(read-only SQL on the last `profile_stop`'s `profile.sqlite`, or on `path`) and `profile_gpu_counters
+{action: capture|list, counters?, max_frames?, gpa_dir?}` (a GPUPerfAPI capture on its own). Raw RPC methods are listed in
 [protocol.md](protocol.md).
 
 ### Live view: `top`
@@ -124,7 +127,9 @@ browser without a server. It has one time axis with:
 * one row per sampled thread with its samples as a stacked flame strip (root at the top, coloured by module
   kind, grey while waiting);
 * below the threads, `GPU frames` (each frame's GPU span) and `GPU passes` (spans between clears, coloured by
-  pass kind), placed on the CPU time axis as described under GPU timing.
+  pass kind), placed on the CPU time axis as described under GPU timing;
+* counter rows: GPU utilisation, and on AMD the board's clocks, power, temperatures, fan and VRAM (see AMD
+  board metrics), then process CPU, working set and page faults. Hover shows the nearest value.
 
 Dragging over the rows or the ruler selects a time range, shows its length, and zooms to it on release. The
 ruler moves from whole seconds to milliseconds and, when zoomed in below 10 ms, labels one tick with the
@@ -174,7 +179,8 @@ frames is counted as stale and dropped. It is plain D3D11, so it works the same 
 * **Overhead**: about 35 queries per frame and two hooked context calls; `hookUs` per frame is in the
   report. The CPU overhead budget (under 3% fps at 1 kHz) includes it.
 * **Counters**: profiles also carry page faults/s, I/O MB/s, process CPU, working set and free memory every
-  250 ms and GPU utilisation and VRAM every second, as `Counters` rows in the SQLite export.
+  250 ms and GPU utilisation and VRAM every second (Windows PDH GPU counters, any vendor), as `Counters` rows
+  in the SQLite export. On AMD the driver's own numbers replace them where they overlap (next section).
 
 Not covered: async compute and copy queues, the driver's own scheduling (an ETW `DxgKrnl` trace through WPR
 shows that), and D3D12 games.
@@ -185,6 +191,107 @@ When `nvToolsExt64_1.dll` is loaded in the game or found through `NVTOOLSEXT_PAT
 the plugin emits NVTX ranges for RPC handlers that run on the game or UI thread and for menus, and an NVTX
 mark for each `Profile.mark`, so Nsight Systems shows them next to its own trace. Without the DLL these
 calls do nothing.
+
+### AMD board metrics (ADLX)
+
+On a Radeon driver the plugin reads the board through AMD's ADLX library (`amdadlx64.dll`, installed with the
+driver) once a second while a profile, the hitch watch or `top` runs. ADLX's SDK headers carry AMD's own
+licence, so the reader is a separate helper, `SkyrimDevToolsAdlx.dll`, built only when a local ADLX checkout
+is present (`-DADLX_SDK=<checkout>/SDK`, or `deps\adlx` for `tools/pc-build`) and installed next to
+`SkyrimDevTools.dll`. Without the helper, or on NVIDIA or Intel, nothing is loaded and the PDH counters stay.
+
+| Counter | Unit | ADLX source |
+|---------|------|-------------|
+| `gpu_util_pct` | % | GPU usage |
+| `gpu_clock_mhz` | MHz | GPU clock speed |
+| `gpu_vram_clock_mhz` | MHz | VRAM clock speed |
+| `gpu_temp_c`, `gpu_hotspot_c` | C | edge and hotspot temperature |
+| `gpu_power_w`, `gpu_board_power_w` | W | GPU (ASIC) power and total board power |
+| `gpu_fan_rpm` | rpm | fan speed |
+| `gpu_vram_mb` | MB | VRAM used on the card (all processes) |
+| `gpu_voltage_mv` | mV | GPU voltage |
+
+The driver reports which of these the card supports; the others are absent rather than zero. When ADLX gives
+`gpu_util_pct`, the PDH utilisation is dropped; when it gives `gpu_vram_mb`, the PDH value is kept as
+`gpu_process_vram_mb` (the game's own share). The report prints one `== GPU board` line with mean and max,
+`top` shows a `GPU board` line, the timeline draws one row per metric, and the raw profile keeps them as
+`gpuMetrics`. One read costs well under a millisecond on a background thread (`sampleUs` in the raw data).
+
+### AMD hardware counters (GPUPerfAPI)
+
+`record --gpu-counters` (or `profile_start {gpu_counters: true}`, or `profile_gpu_counters` on its own)
+captures hardware counters with AMD's GPUPerfAPI (GPA 4.x, MIT) after the CPU profile, under the same load,
+so the capture's slower frames never land in the CPU profile. GPA is not shipped: download a GPUPerfAPI 4.x
+release on the game PC, unpack it outside the repository, and pass the folder that holds
+`GPUPerfAPIDX11-x64.dll` and `GPUPerfAPICounters-x64.dll` with `--gpa-dir`, the config key `gpaDir` or
+`SKYRIM_DEVTOOLS_GPA_DIR`. Nothing is loaded until the first request.
+
+GPA opens its context on the game's existing D3D11 device (`GpaOpenContext`), so it needs no hook at device
+creation. The hardware counts only a few counters at once, so GPA splits the request into passes and the
+plugin spends one frame per pass: after a 60-frame baseline, each pass's frame is cut into samples at the
+frame start and at every render-target or depth clear (the GPU timing pass boundaries). The first pass fixes
+the sample count; later frames with more clears have the extras merged into the last sample, frames with
+fewer are padded, and both are counted (`mergedClears`, `paddedSamples`, `mismatchedFrames`). **Values
+therefore combine consecutive frames of the same scene, not one frame**: use a steady scene (`idle`, or a
+slow `walk`), not a cell load. `--gpa-frames` (default 600) bounds the frames spent.
+
+The report's `== GPU counters` block gives one value per counter for a frame: times, bytes, cycles and counts
+are summed over the samples, percentages are averaged weighted by each sample's `GPUTime`. The five heaviest
+samples are listed with their busy and cache numbers. `gpu-counters.json` holds every per-sample value, and
+the SQLite export has them in `GpaCounters`/`GpaCountersV`.
+
+Default set (missing names are skipped and listed): `GPUTime`, `GPUBusy`, `VsGsBusy`, `PSBusy`, `CSBusy`,
+`TexUnitBusy`, `DepthStencilTestBusy`, `PrimitiveAssemblyBusy`, `PAStalledOnRasterizer`, `PSExportStalls`,
+`L0CacheHit`, `L2CacheHit`, `ScalarCacheHit`, `InstCacheHit`, `FetchSize`, `WriteSize`, `MemUnitBusy`,
+`MemUnitStalled`, `CulledPrims`, `PrimitivesIn`, `PSPixelsOut`, `HiZQuadsCulled`, `PreZQuadsCulled`. Pick
+others with `--gpa-counters`; `profile_gpu_counters {action: "list"}` prints what the device offers.
+
+Counters GPA 4.4 offers for D3D11 on RDNA4 (gfx12, for example the RX 9070 XT), from the release's
+`graphics_counter_tables_gfx12.html`. All of these work in the discrete per-sample mode used here except the
+two last groups, which GPA lists for streaming mode only:
+
+| Group | Counters |
+|-------|----------|
+| Timing | `GPUTime`, `GPUBusy`, `TessellatorBusy`, `VsGsBusy`, `VsGsTime`, `PreTessellationBusy`, `PreTessellationTime`, `PostTessellationBusy`, `PostTessellationTime`, `PSBusy`, `PSTime`, `CSBusy`, `CSTime`, `PrimitiveAssemblyBusy`, `TexUnitBusy`, `DepthStencilTestBusy`, `ExecutionDuration`, `ExecutionStart`, `ExecutionEnd` (each `...Busy` also as `...BusyCycles`) |
+| VertexGeometry | `VsGsVerticesIn`, `VsGsPrimsIn` |
+| Pre/PostTessellation | `PreTessVerticesIn`, `PostTessPrimsOut` |
+| PrimitiveAssembly | `PrimitivesIn`, `CulledPrims`, `ClippedPrims`, `PAStalledOnRasterizer`, `PAStalledOnRasterizerCycles` |
+| PixelShader | `PSPixelsOut`, `PSExportStalls`, `PSExportStallsCycles` |
+| ComputeShader | `CSThreadGroupsLaunched`, `CSWavefrontsLaunched`, `CSThreadsLaunched`, `CSThreadGroupSize`, `CSLDSBankConflict`, `CSLDSBankConflictCycles` |
+| TextureUnit | `TexTriFilteringPct`, `TexTriFilteringCount`, `NoTexTriFilteringCount`, `TexVolFilteringPct`, `TexVolFilteringCount`, `NoTexVolFilteringCount`, `TexAveAnisotropy` |
+| DepthAndStencil | `HiZQuadsCulled`, `HiZQuadsCulledCount`, `HiZQuadsAcceptedCount`, `PreZQuadsCulled`, `PreZQuadsCulledCount`, `PreZQuadsSurvivingCount`, `PostZQuads`, `PostZQuadCount`, `PreZSamplesPassing`, `PreZSamplesFailingS`, `PreZSamplesFailingZ`, `PostZSamplesPassing`, `PostZSamplesFailingS`, `PostZSamplesFailingZ`, `ZUnitStalled`, `ZUnitStalledCycles` |
+| ColorBuffer | `CBMemRead`, `CBMemWritten` |
+| MemoryCache | `L0CacheHit`, `ScalarCacheHit`, `InstCacheHit`, `L2CacheHit`, `L2CacheMiss`, each with `...RequestCount`, `...HitCount`, `...MissCount`; `L0TagConflictReadStalledCycles`, `L0TagConflictWriteStalledCycles`, `L0TagConflictAtomicStalledCycles` |
+| GlobalMemory | `FetchSize`, `WriteSize`, `MemUnitBusy`, `MemUnitStalled`, `WriteUnitStalled` (each also `...Cycles`), `LocalVidMemBytes`, `PcieBytes` |
+| RayTracing | `RayTriTests`, `RayBoxTests`, `TotalRayTests`, `RayTestsPerWave` |
+| WaveDistribution (streaming only) | `WaveOccupancyPct` |
+| WaveOccupancyLimiters (streaming only) | `{HS,GS,PS,CS}LimitedBy{Vgpr,Lds,Scratch}`, `HSLimitedByBarriers`, `CSLimitedByBarriers`, `CSLimitedByThreadGroupLimit` |
+
+GPA 4.4 has no VALU utilisation counter for RDNA4 on D3D11 (its RDNA1 and RDNA2 graphics tables have them,
+RDNA3 and RDNA4 do not); `PSBusy`/`VsGsBusy`/`CSBusy` and the cache and memory-unit counters are the nearest. Memory bandwidth
+is `FetchSize` + `WriteSize` (KB) over `GPUTime`.
+
+Overhead: GPA's init (loading the DLLs, opening the context, building the pass list) is reported as
+`overhead.initMs`; while capturing, the frame rate drops by roughly the pass count (one frame per pass plus
+GPA's per-sample begin/end), reported as `baselineFps` and `captureFps` with the CPU cost per frame
+(`cpuUsPerFrame`). Nothing is loaded or hooked when `--gpu-counters` is not given. If GPA refuses the device
+(`GpaOpenContext` fails, for example on an older driver), the capture returns `ok: false` with GPA's status
+and the CPU profile is written as usual.
+
+### Radeon GPU Profiler through DXVK (manual deep dive)
+
+AMD's Radeon GPU Profiler (RGP) captures D3D12 and Vulkan only, not D3D11. For a wavefront-level view of
+one frame (shader occupancy, barriers, per-draw timing), the game can run under DXVK, which translates D3D11
+to Vulkan, and be captured with the Radeon Developer Panel and RGP:
+
+1. Put DXVK's x64 `d3d11.dll` and `dxgi.dll` next to `SkyrimSE.exe` in a copy of the install (or remove them
+   afterwards); this is not part of the skyrim-devtools setup.
+2. Start the Radeon Developer Panel, connect to the local machine and enable the profiling workflow.
+3. Launch the game as usual, reach the scene and trigger a capture from the panel; open it in RGP.
+
+DXVK changes the CPU and GPU cost of every call (translation, its own pipeline cache, different driver
+paths), so frame times and CPU profiles taken under it say nothing about the D3D11 game. Use it only for GPU-
+side questions about a scene, and profile CPU and frame time without it.
 
 ## SQLite export
 
@@ -203,8 +310,9 @@ profile. The layout follows Nsight Systems' export. Times are milliseconds from 
 | `Markers` | id, kind (`load`, `menu`, `rpc`, `hitch`, client kinds), start, end, textId |
 | `GpuRanges` | frame, passId, kind, start, end, ms |
 | `Counters` | timestamp, nameId, value |
+| `GpaCounters` | sample, labelId, nameId, groupId, usage, value (only with `--gpu-counters`) |
 
-Views with the strings joined in: `SymbolsV`, `ThreadsV`, `MarkersV`, `GpuRangesV`, `CountersV` and
+Views with the strings joined in: `SymbolsV`, `ThreadsV`, `MarkersV`, `GpuRangesV`, `CountersV`, `GpaCountersV` and
 `LeafSamplesV` (each sample with its leaf function). Query with any SQLite client, `query DB "SQL"`, or
 `profile_query` (read-only: writes, `ATTACH` and `PRAGMA` are refused, 10 s time limit).
 

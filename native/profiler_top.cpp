@@ -4,6 +4,8 @@
 // call, so the first call after a pause reports them as null. GPU counters come from a background collector,
 // because one WDDM GPU Engine collection walks every engine instance on the system and can take longer than a
 // dashboard refresh.
+#include "adlx/devtools_adlx.h"
+
 #include "methods.h"
 #include "perf.h"
 #include "profiler.h"
@@ -15,6 +17,7 @@
 #include <psapi.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -325,6 +328,111 @@ namespace
             }
         }
     } gpuCollector;
+
+    using AdlxValues = std::array<double, DEVTOOLS_ADLX_METRICS>;
+
+    // AMD board metrics (utilisation, clocks, power, temperatures, fan, VRAM) through the optional
+    // SkyrimDevToolsAdlx.dll helper next to the plugin. Without the helper or an AMD driver this stays a no-op.
+    struct Adlx
+    {
+        std::mutex mutex;
+        bool tried = false;
+        bool open = false;
+        std::string reason = "not opened yet";
+        std::string gpuName;
+        unsigned supported = 0;
+        DevtoolsAdlxSampleFn sample = nullptr;
+        double sampleSeconds = 0.0;
+        std::uint64_t samples = 0;
+
+        static std::wstring PluginDirectory()
+        {
+            HMODULE self = nullptr;
+            if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    reinterpret_cast<LPCWSTR>(&PluginDirectory), &self)) {
+                return {};
+            }
+            std::wstring path(MAX_PATH, L'\0');
+            const DWORD size = GetModuleFileNameW(self, path.data(), static_cast<DWORD>(path.size()));
+            path.resize(size);
+            const auto slash = path.find_last_of(L"\\/");
+            return slash == std::wstring::npos ? std::wstring() : path.substr(0, slash + 1);
+        }
+
+        // Called with the mutex held.
+        bool Open()
+        {
+            if (tried) {
+                return open;
+            }
+            tried = true;
+            const HMODULE helper = LoadLibraryExW((PluginDirectory() + DEVTOOLS_ADLX_DLL).c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+            if (!helper) {
+                reason = "SkyrimDevToolsAdlx.dll is not installed next to the plugin";
+                return false;
+            }
+            const auto version = reinterpret_cast<DevtoolsAdlxVersionFn>(GetProcAddress(helper, "DevtoolsAdlxVersion"));
+            const auto openFn = reinterpret_cast<DevtoolsAdlxOpenFn>(GetProcAddress(helper, "DevtoolsAdlxOpen"));
+            sample = reinterpret_cast<DevtoolsAdlxSampleFn>(GetProcAddress(helper, "DevtoolsAdlxSample"));
+            if (!version || !openFn || !sample || version() != DEVTOOLS_ADLX_VERSION) {
+                reason = "SkyrimDevToolsAdlx.dll does not match this plugin";
+                return false;
+            }
+            char name[128]{};
+            const int status = openFn(name, sizeof(name), &supported);
+            if (status < 0) {
+                reason = status == -1 ? "no AMD driver (amdadlx64.dll not found)" : "ADLX refused (" + std::to_string(status) + ")";
+                return false;
+            }
+            gpuName = name;
+            reason.clear();
+            open = true;
+            return true;
+        }
+
+        bool Read(AdlxValues& values)
+        {
+            std::lock_guard lock(mutex);
+            if (!Open()) {
+                return false;
+            }
+            const double started = perf::Now();
+            const bool ok = sample(values.data(), static_cast<int>(values.size())) == 0;
+            sampleSeconds += perf::Now() - started;
+            ++samples;
+            return ok;
+        }
+
+        Json Describe()
+        {
+            std::lock_guard lock(mutex);
+            Json out{ { "source", open ? Json("adlx") : Json(nullptr) }, { "reason", reason } };
+            if (open) {
+                static constexpr const char* names[] = DEVTOOLS_ADLX_NAMES;
+                auto supportedNames = Json::array();
+                for (int i = 0; i < DEVTOOLS_ADLX_METRICS; ++i) {
+                    if (supported >> i & 1u) {
+                        supportedNames.push_back(names[i]);
+                    }
+                }
+                out["gpu"] = gpuName;
+                out["names"] = Json(std::vector<std::string>(std::begin(names), std::end(names)));
+                out["supported"] = std::move(supportedNames);
+                out["sampleUs"] = samples ? Round(sampleSeconds / static_cast<double>(samples) * 1e6) : 0.0;
+            }
+            return out;
+        }
+    } adlx;
+
+    Json AdlxRow(const AdlxValues& values)
+    {
+        auto row = Json::array();
+        for (const double value : values) {
+            row.push_back(std::isnan(value) ? Json(nullptr) : Json(Round(value, 100.0)));
+        }
+        return row;
+    }
+
     // A second PDH query for profiles, so the live view's deltas and the profile's series do not disturb
     // each other.
     struct GpuSample
@@ -332,6 +440,8 @@ namespace
         double at;
         Json utilPct;
         Json vramMb;
+        bool hasAdlx;
+        AdlxValues adlx;
     };
 
     std::mutex sessionGpuMutex;
@@ -347,11 +457,14 @@ namespace
                 continue;
             }
             Json sample = counters.Sample();
-            if (!sample.is_object()) {
+            AdlxValues board{};
+            const bool hasAdlx = adlx.Read(board);
+            if (!sample.is_object() && !hasAdlx) {
                 continue;
             }
+            const auto field = [&](const char* key) { return sample.is_object() ? sample.value(key, Json(nullptr)) : Json(nullptr); };
             std::lock_guard lock(sessionGpuMutex);
-            sessionGpu.push_back({ perf::Now(), sample.value("utilPct", Json(nullptr)), sample.value("vramMb", Json(nullptr)) });
+            sessionGpu.push_back({ perf::Now(), field("utilPct"), field("vramMb"), hasAdlx, board });
             if (sessionGpu.size() > 3600) {
                 sessionGpu.pop_front();
             }
@@ -370,6 +483,24 @@ namespace devtools::profiler
                 out.push_back({ std::round((sample.at - origin) * 1e5) / 100.0, sample.utilPct, sample.vramMb });
             }
         }
+        return out;
+    }
+
+    Json GpuMetrics(double from, double to, double origin)
+    {
+        Json out = adlx.Describe();
+        auto rows = Json::array();
+        {
+            std::lock_guard lock(sessionGpuMutex);
+            for (const auto& sample : sessionGpu) {
+                if (sample.hasAdlx && sample.at >= from && sample.at <= to) {
+                    auto row = AdlxRow(sample.adlx);
+                    row.insert(row.begin(), std::round((sample.at - origin) * 1e5) / 100.0);
+                    rows.push_back(std::move(row));
+                }
+            }
+        }
+        out["rows"] = std::move(rows);
         return out;
     }
 }
@@ -393,7 +524,26 @@ DEVTOOLS_MODULE(ProfilerTop)
         const double memoryDone = perf::Now();
         out["threads"] = Threads(memoryDone, threadLimit);
         const double threadsDone = perf::Now();
-        out["gpu"] = Optional<bool>(params, "gpu", true) ? gpuCollector.Get(threadsDone) : Json(nullptr);
+        const bool wantGpu = Optional<bool>(params, "gpu", true);
+        out["gpu"] = wantGpu ? gpuCollector.Get(threadsDone) : Json(nullptr);
+        if (wantGpu) {
+            AdlxValues board{};
+            if (adlx.Read(board)) {
+                // PDH can be missing (old Windows, counters disabled) while the driver still reports the board.
+                if (!out["gpu"].is_object()) {
+                    out["gpu"] = { { "utilPct", nullptr }, { "engines", Json::object() }, { "vramMb", nullptr } };
+                }
+                static constexpr const char* names[] = DEVTOOLS_ADLX_NAMES;
+                Json metrics = Json::object();
+                for (std::size_t i = 0; i < board.size(); ++i) {
+                    if (!std::isnan(board[i])) {
+                        metrics[names[i]] = Round(board[i], 100.0);
+                    }
+                }
+                Json described = adlx.Describe();
+                out["gpu"]["board"] = { { "source", "adlx" }, { "gpu", described["gpu"] }, { "metrics", std::move(metrics) } };
+            }
+        }
         out["gpuTiming"] = profiler::GpuRecent(seconds);
         out["profiling"] = profiler::Profiling();
         const auto ms = [](double a, double b) { return Round((b - a) * 1000.0); };

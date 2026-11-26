@@ -156,6 +156,9 @@ def gpu_summary(profile, top=10):
     out = {"available": bool(gpu.get("available")), "reason": gpu.get("reason") or None, "frames": len(frames),
            "presented": len(raw.get("frameMarks", [])), "alignmentOffsetMs": offset,
            "disjointFrames": gpu.get("disjointFrames"), "staleFrames": gpu.get("staleFrames")}
+    board = board_summary(raw)
+    if board is not None:
+        out["board"] = board
     if not frames:
         return out
     table = [r for r in frame_table(profile) if r["gpuMs"] is not None]
@@ -183,6 +186,31 @@ def gpu_summary(profile, top=10):
     return out
 
 
+def board_series(raw):
+    """Vendor board metrics (AMD ADLX) as [(ms, name, value)], or nothing without the helper."""
+    metrics = raw.get("gpuMetrics") or {}
+    names = metrics.get("names") or []
+    out = []
+    for row in metrics.get("rows") or []:
+        for name, value in zip(names, row[1:]):
+            if value is not None:
+                out.append((row[0], name, value))
+    return out
+
+
+def board_summary(raw):
+    """Which board metrics the driver reported, with mean and max over the profile; None without a source."""
+    metrics = raw.get("gpuMetrics") or {}
+    if not metrics.get("source"):
+        return {"source": None, "reason": metrics.get("reason")} if metrics else None
+    values = {}
+    for _, name, value in board_series(raw):
+        values.setdefault(name, []).append(value)
+    return {"source": metrics["source"], "gpu": metrics.get("gpu"), "supported": metrics.get("supported"),
+            "sampleUs": metrics.get("sampleUs"), "samples": len(metrics.get("rows") or []),
+            "metrics": {name: {"mean": round(sum(v) / len(v), 2), "max": round(max(v), 2)} for name, v in values.items()}}
+
+
 def counter_series(raw):
     """Counters as [(ms, name, value)]: rates per second between 250 ms samples, levels as they were."""
     out = []
@@ -199,11 +227,16 @@ def counter_series(raw):
     for row in rows:
         out.append((row[0], "working_set_mb", round(row[2] / 1048576.0, 1)))
         out.append((row[0], "available_physical_mb", round(row[6] / 1048576.0, 1)))
+    board = set()
+    for at, name, value in board_series(raw):
+        board.add(name)
+        out.append((at, name, value))
+    # The driver's own numbers win over the generic PDH ones; PDH VRAM stays as the game's share of the card.
     for at, util, vram in raw.get("gpuCounters") or []:
-        if util is not None:
+        if util is not None and "gpu_util_pct" not in board:
             out.append((at, "gpu_util_pct", util))
         if vram is not None:
-            out.append((at, "gpu_vram_mb", vram))
+            out.append((at, "gpu_process_vram_mb" if "gpu_vram_mb" in board else "gpu_vram_mb", vram))
     out.sort(key=lambda r: (r[0], r[1]))
     return out
 

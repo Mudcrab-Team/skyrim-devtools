@@ -412,6 +412,10 @@ class Profile:
             from .profile_gpu import gpu_summary
 
             report["gpu"] = gpu_summary(self)
+        if self.raw.get("gpaCounters"):
+            from .profile_gpa import summarize
+
+            report["gpuCounters"] = summarize(self.raw["gpaCounters"])
         if "context" in self.raw:
             report["context"] = self.raw["context"]
         return report
@@ -671,6 +675,9 @@ def save_outputs(profile, out_dir, title="Skyrim SE"):
     (out_dir / "report.json").write_text(json.dumps(summary, indent=1), encoding="utf-8")
     (out_dir / "report.txt").write_text(render_text(summary), encoding="utf-8")
     paths["report"] = out_dir / "report.txt"
+    if profile.raw.get("gpaCounters"):
+        (out_dir / "gpu-counters.json").write_text(json.dumps(profile.raw["gpaCounters"], indent=1), encoding="utf-8")
+        paths["gpuCounters"] = out_dir / "gpu-counters.json"
     from .profile_firefox import write
 
     paths["firefox"] = write(profile_firefox_data(profile), out_dir / "profile.json.gz")
@@ -743,6 +750,10 @@ def render_text(summary, top=10):
     gpu = summary.get("gpu")
     if gpu:
         lines.append("")
+        board = gpu.get("board") or {}
+        if board.get("source"):
+            shown = ", ".join(f"{name.removeprefix('gpu_')} {m['mean']} (max {m['max']})" for name, m in board["metrics"].items())
+            lines.append(f"== GPU board ({board['source']}, {board.get('gpu')}, mean over {board['samples']} samples): {shown}")
         if not gpu.get("frames"):
             lines.append(f"== GPU: no timed frames ({gpu.get('reason') or 'none in this window'})")
         else:
@@ -761,6 +772,11 @@ def render_text(summary, top=10):
                              + (f" from {gpu['utilPctMean']}% utilisation" if gpu.get("utilPctMean") is not None else ""))
             for r in gpu["passes"]:
                 lines.append(f"  {r['pct']:6.2f}%  {r['msPerFrame']:7.3f} ms  {r['pass']}  ({r['kind']})")
+    if summary.get("gpuCounters"):
+        from .profile_gpa import render
+
+        lines.append("")
+        lines.extend(render(summary["gpuCounters"]))
     for hitch in summary.get("hitches", [])[:10]:
         lines.append("")
         lines.append(f"hitch frame {hitch['frame']}: {hitch['ms']} ms, {hitch['samples']} samples, waiting {hitch['waitingPct']}%")
@@ -867,6 +883,8 @@ async def record(args):
         raw, summary = await fetch(manager.call)
         raw["context"] = {"phase": args.phase, "fps": stats.get("fps"), "p50Ms": stats.get("p50Ms"),
                           "p99Ms": stats.get("p99Ms"), "frames": stats.get("count"), "sinceFrame": frame}
+        if args.gpu_counters:
+            raw["gpaCounters"] = await gpa_window(manager, args, config)
         with_name = Profile(raw, symbols)
         paths, report = save_outputs(with_name, out, title=f"Skyrim SE {args.phase}")
         print(render_text(report))
@@ -874,6 +892,23 @@ async def record(args):
     finally:
         if not args.keep:
             await manager.stop()
+
+
+async def gpa_window(manager, args, config):
+    """GPUPerfAPI counters after the CPU profile, under the same load, so its replay passes never land in it."""
+    from .profile_gpa import capture, gpa_dir
+
+    directory = gpa_dir(args.gpa_dir, config)
+    if not directory:
+        return {"ok": False, "error": "--gpu-counters needs --gpa-dir, config gpaDir or SKYRIM_DEVTOOLS_GPA_DIR"}
+    counters = [c for c in (args.gpa_counters or "").split(",") if c] or None
+    load = asyncio.create_task(drive(manager, args.phase))
+    try:
+        return await capture(manager.call, directory, counters, args.gpa_frames)
+    except Exception as error:  # noqa: BLE001 - the CPU profile is still worth writing
+        return {"ok": False, "error": f"{type(error).__name__}: {error}"}
+    finally:
+        load.cancel()
 
 
 async def top(args):
@@ -975,6 +1010,11 @@ def main(argv=None):
     rec.add_argument("--attach", action="store_true", help=argparse.SUPPRESS)
     rec.add_argument("--symbols", default=None, help="skyrim-research checkout with the symbol tables")
     rec.add_argument("--out", default=None, help="output directory (default .local/profiles/<stamp>)")
+    rec.add_argument("--gpu-counters", action="store_true",
+                     help="after the profile, capture AMD GPUPerfAPI hardware counters (docs/profiling.md, AMD counters)")
+    rec.add_argument("--gpa-dir", default=None, help="folder with GPUPerfAPIDX11-x64.dll on the game PC (or config gpaDir)")
+    rec.add_argument("--gpa-counters", default=None, help="comma-separated GPA counter names (default: a busy/cache/stall set)")
+    rec.add_argument("--gpa-frames", type=int, default=600, help="give up after this many frames")
     rep = sub.add_parser("report", help="re-symbolise a saved profile and print or rewrite its report")
     rep.add_argument("profile", help="output directory or raw.json.gz")
     rep.add_argument("--symbols", default=None)

@@ -648,3 +648,111 @@ class GpuTests(unittest.TestCase):
         self.assertEqual(timing["bound"], "gpu")
         capped = profile_views._gpu_timing({"frames": 50, "gpuMsP50": 16.2, "passes": []}, 16.7, 0.3, util_pct=24.0)
         self.assertEqual(capped["bound"], "capped")
+
+
+def amd_raw():
+    raw = gpu_raw()
+    raw["gpuMetrics"] = {"source": "adlx", "reason": None, "gpu": "Toy Radeon", "sampleUs": 900,
+                         "names": ["gpu_util_pct", "gpu_clock_mhz", "gpu_vram_mb", "gpu_fan_rpm"],
+                         "supported": ["gpu_util_pct", "gpu_clock_mhz", "gpu_vram_mb"],
+                         "rows": [[0.0, 90.0, 2500, 6000, None], [1000.0, 80.0, 2400, 6100, None]]}
+    raw["gpaCounters"] = {
+        "ok": True, "device": "Toy Radeon", "passCount": 3, "framesUsed": 4, "sampleCount": 2,
+        "samples": ["clear 1", "clear 2"], "missingCounters": ["VALUUtilization"],
+        "overhead": {"initMs": 40.0, "cpuUsPerFrame": 120.0, "baselineFps": 60.0, "captureFps": 30.0},
+        "counters": [
+            {"name": "GPUTime", "group": "Timing", "usage": "milliseconds", "values": [3.0, 1.0]},
+            {"name": "GPUBusy", "group": "Timing", "usage": "percentage", "values": [100.0, 60.0]},
+            {"name": "FetchSize", "group": "GlobalMemory", "usage": "kilobytes", "values": [10.0, None]},
+            {"name": "TexAveAnisotropy", "group": "TextureUnit", "usage": "items", "values": [None, None]},
+        ]}
+    return raw
+
+
+class AmdTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        write_symbols(self.root)
+        self.profile = profiling.Profile(amd_raw(), profiling.GameSymbols(self.root))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_board_metrics_replace_pdh(self):
+        from skyrim_devtools.profile_gpu import counter_series
+
+        series = counter_series(self.profile.raw)
+        util = [(at, v) for at, name, v in series if name == "gpu_util_pct"]
+        self.assertEqual(util, [(0.0, 90.0), (1000.0, 80.0)])  # PDH's 70 % is dropped
+        self.assertIn((500.0, "gpu_process_vram_mb", 2048.0), series)
+        self.assertFalse(any(name == "gpu_fan_rpm" for _, name, _ in series))
+        board = self.profile.summary()["gpu"]["board"]
+        self.assertEqual(board["source"], "adlx")
+        self.assertEqual(board["metrics"]["gpu_clock_mhz"], {"mean": 2450.0, "max": 2500})
+        text = profiling.render_text(self.profile.summary())
+        self.assertIn("== GPU board (adlx, Toy Radeon", text)
+
+    def test_pdh_only_without_board(self):
+        from skyrim_devtools.profile_gpu import counter_series
+
+        raw = gpu_raw()
+        raw["gpuMetrics"] = {"source": None, "reason": "no AMD driver"}
+        series = counter_series(raw)
+        self.assertIn((500.0, "gpu_util_pct", 70.0), series)
+        self.assertIn((500.0, "gpu_vram_mb", 2048.0), series)
+        summary = profiling.Profile(raw, profiling.GameSymbols(self.root)).summary()
+        self.assertEqual(summary["gpu"]["board"], {"source": None, "reason": "no AMD driver"})
+
+    def test_gpa_summary(self):
+        from skyrim_devtools.profile_gpa import render, summarize
+
+        summary = summarize(self.profile.raw["gpaCounters"])
+        rows = {r["name"]: r for r in summary["counters"]}
+        self.assertEqual(rows["GPUTime"]["value"], 4.0)
+        self.assertEqual(rows["GPUBusy"]["value"], 90.0)  # weighted by GPU time: (100*3 + 60*1) / 4
+        self.assertEqual(rows["FetchSize"]["value"], 10.0)
+        self.assertIsNone(rows["TexAveAnisotropy"]["value"])
+        self.assertEqual(summary["heaviestSamples"][0]["label"], "clear 1")
+        text = "\n".join(render(summary))
+        self.assertIn("3 passes over 4 frames", text)
+        self.assertIn("not offered on this GPU: VALUUtilization", text)
+        failed = summarize({"ok": False, "error": "no device"})
+        self.assertIn("failed: no device", render(failed)[0])
+
+    def test_gpa_in_sqlite_and_outputs(self):
+        from skyrim_devtools.profile_sqlite import export_sqlite, query
+
+        path = self.root / "amd.sqlite"
+        counts = export_sqlite(self.profile, path)
+        self.assertEqual(counts["GpaCounters"], 5)
+        busy = query(path, "SELECT label, value FROM GpaCountersV WHERE name = 'GPUBusy' ORDER BY sample")
+        self.assertEqual(busy["rows"], [["clear 1", 100.0], ["clear 2", 60.0]])
+        meta = dict(query(path, "SELECT key, value FROM Meta")["rows"])
+        self.assertEqual(meta["gpuBoardSource"], "adlx")
+        self.assertEqual(meta["gpaPassCount"], "3")
+        paths, report = profiling.save_outputs(self.profile, self.root / "saved")
+        self.assertTrue(Path(paths["gpuCounters"]).is_file())
+        self.assertTrue(report["gpuCounters"]["ok"])
+
+    def test_timeline_counter_rows(self):
+        data = profile_views.timeline_data(self.profile)
+        names = [c[0] for c in data["counters"]]
+        self.assertEqual(names[:3], ["gpu_util_pct", "gpu_clock_mhz", "gpu_vram_mb"])
+        self.assertIn("gpu_process_vram_mb", names)
+        self.assertIn("drawCounter", profile_views.timeline_html(self.profile))
+
+    def test_top_board_line(self):
+        board = {"source": "adlx", "gpu": "Toy", "metrics": {"gpu_util_pct": 97, "gpu_clock_mhz": 2900,
+                                                            "gpu_board_power_w": 250, "gpu_vram_mb": 6000}}
+        reply = {"seconds": 3.0, "hz": 250.0, "ready": True, "warm": True, "samples": 10, "waiting": 0,
+                 "self": [dict(FRAMES[0], n=10)], "total": [dict(FRAMES[0], n=10)], "waits": [], "modules": MODULES,
+                 "gpu": {"utilPct": None, "engines": {}, "vramMb": None, "board": board}, "profiling": True}
+
+        async def call(method, **params):
+            return reply if method == "Profile.top" else {"fps": 60.0}
+
+        text = profile_views.render_top(asyncio.run(profile_views.top_snapshot(call, profiling.GameSymbols(self.root))))
+        self.assertIn("GPU board  97 %  core 2900 MHz", text)
+        self.assertIn("power 250 W", text)
+        self.assertIn("VRAM used 5.86 GB", text)

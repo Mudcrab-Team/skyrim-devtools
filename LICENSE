@@ -10,5 +10,9 @@ linking exceptions in README.md.
 Project documentation is dedicated under CC0 1.0 Universal. See
 licenses/CC0-1.0.txt.
 
+native/third_party/gpa holds the GPUPerfAPI headers, MIT, Copyright Advanced
+Micro Devices, Inc.; see native/third_party/gpa/LICENSE.txt. The GPUPerfAPI
+DLLs and the AMD ADLX SDK are not included; they are fetched locally when used.
+
 Third-party dependencies retain their licenses. Skyrim and related game assets
 and trademarks are the property of their respective owners.
