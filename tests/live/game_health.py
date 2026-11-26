@@ -15,6 +15,7 @@ Cases, one JSON verdict on the last stdout line ({"pass": bool, "details": {...}
 
 import argparse
 import asyncio
+import base64
 import json
 import subprocess
 import sys
@@ -48,7 +49,9 @@ class Rig:
     async def powershell(self, script):
         host = self.manager.host
         process = await asyncio.create_subprocess_exec(
-            *host.ssh, "-T", host.destination, "powershell", "-NoProfile", "-NonInteractive", "-Command", script,
+            # the host's login shell is PowerShell, which would expand $variables in a plain -Command argument
+            *host.ssh, "-T", host.destination, "powershell", "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-EncodedCommand",
+            base64.b64encode(("$ProgressPreference = 'SilentlyContinue'; " + script).encode("utf-16-le")).decode(),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         data, _ = await process.communicate()
         return data.decode(errors="replace").strip()
@@ -104,7 +107,7 @@ async def case_restart(rig, save, details):
     details["stop"] = {"path": stopped.get("path"), "cleanExit": stopped.get("cleanExit"),
                        "s": round(time.monotonic() - began, 1)}
     leftover = await rig.powershell(
-        rf"$r = {REMOTE}; 'lease=' + (Test-Path \"$r\active\"); "
+        "$r = Join-Path $env:USERPROFILE '.local\\skyrim-devtools'; 'lease=' + (Test-Path (Join-Path $r 'active')); "
         "'task=' + (Get-ScheduledTask -TaskName SkyrimDevTools).State; "
         "'game=' + [bool](Get-Process SkyrimSE -ErrorAction SilentlyContinue)")
     details["hostAfterStop"] = leftover.replace("\r", "").split("\n")
@@ -119,7 +122,7 @@ async def case_restart(rig, save, details):
 async def case_stale(rig, save, details):
     await rig.json("game_stop")
     made = await rig.powershell(
-        rf"$r = {REMOTE}; $f = Join-Path $r 'active'; Set-Content $f ('c' * 32); "
+        "$r = Join-Path $env:USERPROFILE '.local\\skyrim-devtools'; $f = Join-Path $r 'active'; Set-Content $f ('c' * 32); "
         "(Get-Item $f).LastWriteTime = (Get-Date).AddMinutes(-10); Test-Path $f")
     details["staleLeaseWritten"] = made
     started = await rig.json("game_start", headless=False, save=save)
