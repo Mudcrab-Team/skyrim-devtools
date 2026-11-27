@@ -42,6 +42,14 @@ class ProfileLifecycleStructure(unittest.TestCase):
         self.assertIn("'logon'", TEXT[:TEXT.index("[string] $Action")])
         self.assertIn("'Disc'", function_body("Get-LogonSession"))
 
+    def test_start_refuses_busy_task_and_foreign_steam_before_launching(self):
+        start = TEXT.index("    'start' {")
+        body = TEXT[start:TEXT.index("    'health' {", start)]
+        self.assertIn("Interactive task is busy", body)
+        self.assertLess(body.index("Get-ForeignSteam"), body.index("Start-ScheduledTask"))
+        self.assertIn("steam-other-account", function_body("Assert-OfflineSteam"))
+        self.assertIn("GetOwner", function_body("Get-ForeignSteam"))
+
     def test_restore_action_exists(self):
         self.assertIn("'restore-profile'", TEXT)
 

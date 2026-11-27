@@ -272,9 +272,23 @@ function Assert-LocalProfile {
     }
 }
 
+function Get-ForeignSteam {
+    # Steam processes owned by another Windows account. The game's Steam API then cannot reach Steam (a launcher
+    # such as Mod Organizer shows a restart dialog instead of starting the game), so a launch is refused up front.
+    $name = ($account -split '\\')[-1]
+    @(Get-CimInstance Win32_Process -Filter "Name='steam.exe'" -ErrorAction SilentlyContinue | ForEach-Object {
+        $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction SilentlyContinue
+        if ($owner -and $owner.User -and $owner.User -ne $name) { "$($owner.User) (session $($_.SessionId))" }
+    })
+}
+
 function Assert-OfflineSteam {
     $steam = @(Get-Process steam -ErrorAction SilentlyContinue |
         Where-Object SessionId -EQ (Get-Process -Id $PID).SessionId)
+    $foreign = @(Get-ForeignSteam)
+    if ($steam.Count -eq 0 -and $foreign.Count) {
+        Refuse-Launch 'steam-other-account' "Steam runs under another account ($($foreign -join ', ')), not on the test desktop"
+    }
     if ($steam.Count -ne 1 -or !$steam[0].Path) {
         Refuse-Launch 'steam-unavailable' 'Steam must already be running on the interactive test desktop'
     }
@@ -873,7 +887,10 @@ switch ($Action) {
         $token = [BitConverter]::ToString($bytes).Replace('-', '').ToLowerInvariant()
         $config = Read-Json (Join-Path $root 'config.json')
         $stale = Reset-StaleHost -MinAgeSeconds 90
-        if ((Get-ScheduledTask -TaskName $taskName).State -ne 'Ready') { throw 'Interactive task is busy' }
+        $taskState = (Get-ScheduledTask -TaskName $taskName).State
+        if ($taskState -ne 'Ready') { throw "Interactive task is busy ($taskState): the previous launch has not finished; start refused" }
+        $foreign = @(Get-ForeignSteam)
+        if ($foreign.Count) { throw "Steam runs under another account ($($foreign -join ', ')); the game cannot reach it; start refused" }
         $logon = Get-LogonSession
         if (!$logon.active) { throw "The test account's logon session is not active ($($logon.state)); start refused" }
         # Never start next to somebody else's game or capture: refusing is the only action taken.

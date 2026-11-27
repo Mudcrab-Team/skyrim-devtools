@@ -6,6 +6,7 @@ import asyncio
 import base64
 from contextlib import suppress
 from dataclasses import asdict, dataclass
+import html
 import json
 from pathlib import Path
 import re
@@ -28,6 +29,21 @@ def encode_powershell(script):
     """UTF-16LE base64 for -EncodedCommand: the remote login shell never sees the script text, so `$variables`
     and quotes in it are not expanded or mangled on the way."""
     return base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+
+
+def host_error(stderr):
+    """The message of a PowerShell failure. With -EncodedCommand the error stream arrives as CLIXML, whose error
+    strings are <S S="Error"> elements with escaped line breaks; plain text is used as it is."""
+    text = stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else str(stderr or "")
+    parts = re.findall(r'<S S="Error">(.*?)</S>', text, flags=re.S)
+    if parts:
+        text = "".join(parts)
+        text = re.sub(r"_x([0-9A-Fa-f]{4})_", lambda m: chr(int(m.group(1), 16)), text)
+        text = html.unescape(text)
+    lines = [line.strip() for line in text.splitlines() if line.strip() and not line.startswith("#< CLIXML")]
+    # PowerShell puts the thrown message first, then "At line:..." position lines
+    message = next((line for line in lines if not line.startswith(("At ", "+ ", "At line"))), "")
+    return message[:300]
 
 
 def powershell_argv(script, policy="RemoteSigned"):
@@ -88,17 +104,19 @@ class WindowsHost:
     async def _command_once(self, action, script):
         process = await asyncio.create_subprocess_exec(
             *self.ssh, "-T", self.destination, *powershell_argv(script),
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         try:
             async with asyncio.timeout(45):
-                data, _ = await process.communicate()
+                data, errors = await process.communicate()
         finally:
             if process.returncode is None:
                 process.kill()
                 await process.wait()
         if process.returncode:
-            raise RuntimeError(f"Windows host {action} failed")
+            # the host's own refusal (busy task, Steam under another account, ...) is the useful part
+            reason = host_error(errors)
+            raise RuntimeError(f"Windows host {action} failed" + (f": {reason}" if reason else ""))
         try:
             return json.loads(data)
         except ValueError as error:
