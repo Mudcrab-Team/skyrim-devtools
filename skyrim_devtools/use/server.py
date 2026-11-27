@@ -11,7 +11,7 @@ import time
 
 from mcp.server.fastmcp import FastMCP, Image
 
-from . import capture, combat, modtest, perception, profile_tools, saves
+from . import capture, combat, modtest, perception, profile_tools, saves, scenario
 from .alerts import AlertBoard
 from .manager import STUCK_CODE, GameError, GameManager
 from .timeline import Recorder
@@ -727,6 +727,7 @@ def build_server(manager, recorder=None, board=None):
     combat.register(mcp, native, manager)
     perception.register(mcp, native, manager)
     saves.register(mcp, manager, native)
+    scenario.register(mcp, manager, native)
     profile_tools.register(mcp, native, manager)
     modtest.register(mcp, native, manager, recorder)
 
@@ -813,7 +814,7 @@ def build_server(manager, recorder=None, board=None):
                        sprint: bool | None = None, on_combat: str | None = None, on_dialogue: str | None = None,
                        on_message_box: str | None = None, on_menu: str | None = None,
                        invulnerable: bool | None = None, via: list | None = None, route: str | None = None,
-                       activate: bool | None = None, stuck: dict | bool | None = None) -> str:
+                       activate: bool | None = None, fast: bool | float | None = None, stuck: dict | bool | None = None) -> str:
         """Start walking the player to a goal in the background (Nav.goto); returns at once. goal is one of
         {"refID": "0001A2B3"}, {"x":..,"y":..,"z":..}, {"cell": "<editor id>"}, {"place": "Riverwood"} (a
         location name or id from nav_places), {"questTarget": "<quest editor id, id or name>"} (where the compass
@@ -834,17 +835,18 @@ def build_server(manager, recorder=None, board=None):
         knockdown and paralysis are waited out; death fails the trip. A trip resumes from wherever the player is
         once the interruption clears.
         invulnerable: true turns on god mode for the trip and restores it after. via: [[x,y,z], ...] waypoints; route: "global",
-        "local" or a recording name to follow (input mode). Follow with nav_status / nav_wait; stop with nav_cancel. Speed long
-        trips with the console: `sgtm 4` (also speeds everything else; set back with `sgtm 1`).
+        "local" or a recording name to follow (input mode). Follow with nav_status / nav_wait; stop with nav_cancel.
         Stuck handling: the trip steps back, jumps and replans (marking the spot and any door as blocked) when
         it stops getting anywhere, when the distance to the goal stops shrinking (15 s) or when it keeps
         re-entering the same door, and then fails with `stuck` (nav_wait shows it under "stuck"). `stuck`
         tunes it: {"distance": 40, "windowS": 3, "maxFailures": 3, "totalS": 20, "progressWindowS": 15,
-        "progressGain": 100, "doorRepeat": 2, "doorWindowS": 60}, or false to turn it off."""
+        "progressGain": 100, "doorRepeat": 2, "doorWindowS": 60}, or false to turn it off.
+        fast: true (or a walk speed percent, 100-400; true is 300) raises the player's walk speed on long walks and puts it
+        back on arrival, failure, cancel, combat, dialogue, doors and loading; see game_speed for a manual setting."""
         return dumps(await native("Nav.goto", goal=goal, mode=mode, timeoutS=timeout_s, run=run, sprint=sprint,
                                   onCombat=on_combat, onDialogue=on_dialogue, onMessageBox=on_message_box,
                                   onMenu=on_menu, invulnerable=invulnerable, via=via, route=route,
-                                  activate=True if activate else None, stuck=stuck))
+                                  activate=True if activate else None, fast=fast, stuck=stuck))
 
     @mcp.tool()
     async def nav_plan(ref_id: str | None = None, x: float | None = None, y: float | None = None,

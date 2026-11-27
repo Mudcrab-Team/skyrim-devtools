@@ -6,6 +6,8 @@
 #include "events.h"
 #include "methods.h"
 #include "nav_common.h"
+#include "speed.h"
+#include "speed_math.h"
 
 #include <Windows.h>
 
@@ -100,6 +102,7 @@ namespace
         RE::NiPoint3 start;
         RE::NiPoint3 last;
         double travelled = 0.0;
+        devtools::speed::math::SpeedSamples samples;
         stuck::Detector det;
         ReplyPtr reply;
     };
@@ -168,6 +171,14 @@ namespace
             { "displacement", Round(Dist2D(walk->start, player.GetPosition())) },
             { "durationMs", static_cast<std::int64_t>((Now() - walk->started) * 1000.0) },
             { "start", Point(walk->start) }, { "end", Point(player.GetPosition()) }, { "stoppedByLimit", timedOut } };
+        // The first moments are acceleration and the engine adopting a new walk speed; the median after them is
+        // the speed the movement code delivers, which a single distance over a short walk (obstacles, ramp) hides.
+        if (walk->samples.Count() >= 8) {
+            const double steady = walk->samples.Steady(0.9);
+            result["speed"] = { { "steadyUnitsPerSecond", Round(steady, 1) }, { "peakUnitsPerSecond", Round(walk->samples.Peak(), 1) },
+                { "walkPercent", Round(devtools::speed::AppliedPercent()) }, { "samples", walk->samples.Count() } };
+            devtools::speed::Observe(steady);
+        }
         walk->reply->Ok(std::move(result));
         walk.reset();
         if (CurrentDrive().owner == "walk") {
@@ -188,6 +199,9 @@ namespace
                 const auto pos = player->GetPosition();
                 const auto step = Dist3D(pos, walk->last);
                 walk->travelled += step < 1000.0 ? step : 0.0;  // a teleport is not walking
+                if (step < 1000.0) {
+                    walk->samples.Add(tick.now - walk->started, tick.dt, Dist2D(pos, walk->last));
+                }
                 walk->last = pos;
                 if (step >= 1000.0) {
                     walk->det.Reset(tick.now);
