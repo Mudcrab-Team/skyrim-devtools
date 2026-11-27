@@ -11,7 +11,7 @@ import time
 
 from mcp.server.fastmcp import FastMCP, Image
 
-from . import capture, combat, modtest, perception, profile_tools, saves
+from . import capture, combat, explore, modtest, perception, profile_tools, saves
 from .alerts import AlertBoard
 from .manager import STUCK_CODE, GameError, GameManager
 from .timeline import Recorder
@@ -533,9 +533,14 @@ def build_server(manager, recorder=None, board=None):
         id or name; omitted: every running quest, the tracked one first) the target reference the compass is on
         and, when it lies in another cell, the `tracking` reference to reach first (usually a load door), each
         with refID, name, position, cell and distance from the player (null when in another cell). Use
-        nav_goto {"questTarget": quest} to walk there. An empty list means the quest shows no marker now."""
-        return dumps(await native("Quest.targets", quest=quest, limit=limit,
-                                  includeCompleted=True if include_completed else None))
+        nav_goto {"questTarget": quest} to walk there. An empty list means the quest shows no marker now; then
+        (or when every target is in another cell with no door marked) the reply carries inThisCell:false and a
+        hint to use explore (clear / exit / find:<name>) or cell_map to look for the objective."""
+        reply = await native("Quest.targets", quest=quest, limit=limit,
+                             includeCompleted=True if include_completed else None)
+        if isinstance(reply, dict):
+            reply = {**reply, **explore.quest_hint(reply)}
+        return dumps(reply)
 
     @mcp.tool()
     async def quest_active(limit: int | None = None) -> str:
@@ -729,6 +734,7 @@ def build_server(manager, recorder=None, board=None):
     saves.register(mcp, manager, native)
     profile_tools.register(mcp, native, manager)
     modtest.register(mcp, native, manager, recorder)
+    explore.register(mcp, native, manager, is_busy_error)
 
     # ---- movement, camera, navigation, recording ----------------------------------------------
 

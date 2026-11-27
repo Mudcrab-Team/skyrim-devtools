@@ -338,6 +338,16 @@ server adds actionLoop, a screenshot-based blindCamera and moveStuck (from `move
 `Screen.capture` replies also carry `meanLuma` (0-255) and `dominantShare` of the encoded frame. See
 docs/skyrim-use.md, Alerts.
 
+### Cell map (raw material for exploration)
+
+Read-only views of the player's cell for the client's room clustering (`skyrim_devtools/rooms.py`); the navigation planner is not involved.
+
+| Method | Thread | Params | Result and meaning |
+| --- | --- | --- | --- |
+| Cell.navmesh | main | radius? (6000, exteriors only), maxTriangles? (30000) | The navmesh triangles of the player's cell (in an exterior, of the loaded cells within `radius` of the player): `{cell, interior, origin, meshes, triangles, truncated, v, t, n}`. `v` is a flat list of integer x,y,z per vertex, `t` three vertex indices per triangle, `n` the triangle across each of its three edges (edge i runs from vertex i to i+1) or -1 at a wall; cross-mesh portals are resolved. |
+| Cell.contents | main | radius? (6000, exteriors only) | What lies in the cell: `{cell, interior, player, godMode, actors, deadActors, containers, doors, activators, items, minorItemsSkipped}`. Entries are World.nearby-style reference views (`refID, name, pos, baseID, form`); living actors add `level, hostile, unique, essential`, containers `locked, lockLevel, size` (largest bound dimension) and `entries` (rows in the base container list), doors the Ref.get door fields (`teleports`, `destination`), items `value`. Items are only those of note (keys, books, notes, scrolls, soul gems, weapons, armour, or worth 40 gold or more); activators only the named ones. Dead actors are counted, not listed. |
+| Cell.visited | main | reset? | Where the player has stood in the current cell, sampled about four times a second while the world is playable and kept per cell for the session: `{cell, samples, points:[[x,y,z]], binXY, binZ, cellsTracked}`. A point is kept once per 90 x 90 x 160 bin, in the order first reached, up to 6000. `reset` clears this cell's record. |
+
 ## Errors
 
 | Code | Meaning |

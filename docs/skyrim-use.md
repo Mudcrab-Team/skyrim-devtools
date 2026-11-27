@@ -47,6 +47,7 @@ server speaks plain stdio. When the client exits the server stops the game, so a
 | Move and camera | `walk {direction, duration_ms or distance, run?, sprint?}`, `turn_to {heading_deg or x,y or ref_id}`, `jump`, `sneak {on}`, `camera_state`, `camera_set {mode, yaw_deg, pitch_deg, zoom, fov}`, `camera_look_at {ref_id or x,y,z}` |
 | Combat | `combat_state {radius}`, `combat_target`, `combat_face`, `combat_draw`, `combat_equip {name, hand}`, `combat_unequip`, `combat_attack {kind=light\|power, hand}`, `combat_block`, `combat_cast`, `combat_drink {kind}`, `combat_shoot {target, shots, draw_s, part, reposition, weapon}`, `combat_fight {style, rounds, drink_below}` (a bounded loop over the primitives), `player_equipped`, `player_spells` |
 | Navigate | `nav_nearby {radius, kind}`, `nav_places {contains}`, `nav_goto {goal, mode=input\|ai, timeout_s, on_combat, on_dialogue, on_message_box, on_menu, invulnerable, via, route, activate}`, `nav_plan {ref_id \| x, y, z, route}`, `nav_status`, `nav_wait {timeout_s}`, `nav_cancel` |
+| Explore | `cell_map {format=text\|json, plot, radius, refresh}`, `explore {goal=unvisited\|clear\|loot\|exit\|find:<name>, fight, invulnerable, rooms, timeout_s, activate, style, stand_ground}` |
 | Record | `record_start {hz, fields, name}`, `record_stop`, `record_fetch {name, dest_dir?, plot}`, `trajectory_plot {file, color_by, route}`, `record_replay_camera {name, speed}` |
 | Alerts | `agent_alerts {history, limit, dismiss, dismiss_seconds, configure}` (every other reply also carries the active alerts, see Alerts) |
 | Generic | `rpc_methods`, `rpc_call {method, params}` |
@@ -135,6 +136,36 @@ perception tools close that gap without handing over engine-only answers:
 
 `events_drain` returns compact `{type, seq, epoch, data}` records since the previous drain. After
 `game_start` every declared event is buffered except `console` (the `console` tool already returns its lines).
+
+## Objectives without a marker
+
+"Clear Embershard Mine" or "find the missing prospector" show no compass marker inside the dungeon, so there is
+no `quest_targets` entry to follow. When `quest_targets` has nothing usable in the cell it answers
+`inThisCell: false` with a hint; the playtest then explores like a player with a map:
+
+1. `cell_map` first. It clusters the cell's navmesh into rooms (tunnels are cut where they pinch or get too
+   long), and lists per room: where it is, its size and level, which rooms it joins (`open`, `passage` or
+   `door`), living hostiles with levels and a likely boss, containers (a locked or large chest near the boss
+   is flagged `BOSS CHEST`), doors (load doors, the one to the exterior marked `EXIT`), levers and other
+   activators, valuable items, and whether the room was visited. `plot=true` also writes a top-down SVG next
+   to the recordings. The exit door is found by where its destination lies; when the destination is not
+   loaded and the cell has a single load door, that door is marked as a guess.
+2. `explore goal=clear fight=true invulnerable=true rooms=99` walks to the nearest living hostile, fights what
+   it meets with `combat_fight`, and repeats until it reports `cleared`. `goal=unvisited` (the default) walks
+   to the nearest unvisited room, so an objective such as "find the miner" can be answered by looking.
+   `goal=find:<name>` goes to the nearest reference whose name matches, `goal=loot` to each container and
+   valuable item in turn, `goal=exit` to the way out (`activate=true` goes through it). The reply says
+   `fully_explored` when no reachable room is left, and `stuck` after repeated failed legs; a target that
+   fails twice is skipped.
+3. Between calls, `quest_targets` shows whether a marker appeared (a quest often updates on entering a room or
+   killing the boss) and `quest_active` has the objective text. A cleared cell with no new marker means the
+   objective is somewhere `explore goal=find:<name>` can look for, or in another cell.
+
+Rooms are estimates from navmesh geometry: a room is a stretch of tunnel or a chamber, not an authored area,
+and the same cell gives the same ids on every call. "Visited" means the player was within about 380 units of
+30 percent of the room (or explore arrived there), so a hostile sleeping in a side room can still hide in a
+room marked visited; `goal=clear` therefore trusts the live hostile list, not the visited flag. Hostile means
+what `combat_state` calls hostile; neutral and sleeping non-hostile actors are listed as `neutral`.
 
 ## Dialogue
 
