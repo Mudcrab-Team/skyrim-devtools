@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from skyrim_devtools.client import BUILD, IMAGE_SHA256, INVENTORY, TIMEOUT, ConnectionLost, RpcError, Session
-from skyrim_devtools.smoke import Counts, exercise, run
+from skyrim_devtools.smoke import Counts, LogonInactive, exercise, run
 
 
 SESSION_ID = "0" * 32
@@ -138,8 +138,13 @@ class ToyHost:
         self.start_fails = start_fails
         self.stop_phase = stop_phase
         self.returncode = None
+        self.logon = {"active": True, "state": "Active", "account": "tester"}
 
     async def command(self, action, session_id="", mode=""):
+        if action == "logon":
+            if isinstance(self.logon, Exception):
+                raise self.logon
+            return dict(self.logon)
         self.events.append(action)
         return {"sessionId": SESSION_ID, "port": 48682, "token": "a" * 64}
 
@@ -306,6 +311,28 @@ class DevToolsSmokeTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_startup_failure_still_requests_stop(self):
         host = ToyHost(start_fails=True, stop_phase="failed")
+
+        async def connect(*args, **kwargs):
+            self.fail("Refused startup must never connect")
+
+        with self.assertRaisesRegex(RuntimeError, "Toy preflight"):
+            await run(host, connect, Counts(), 3, session_only=True)
+        self.assertEqual(host.events, ["start", "ready", "stop"])
+
+    async def test_disconnected_logon_session_refuses_before_start(self):
+        host = ToyHost()
+        host.logon = {"active": False, "state": "Disc", "account": "tester"}
+
+        async def connect(*args, **kwargs):
+            self.fail("A refused launch must never connect")
+
+        with self.assertRaisesRegex(LogonInactive, "logon session is not active \\(state Disc\\)"):
+            await run(host, connect, Counts(), 3, session_only=True)
+        self.assertEqual(host.events, [])
+
+    async def test_host_without_logon_action_still_starts(self):
+        host = ToyHost(start_fails=True, stop_phase="failed")
+        host.logon = RuntimeError("Windows host logon failed")
 
         async def connect(*args, **kwargs):
             self.fail("Refused startup must never connect")

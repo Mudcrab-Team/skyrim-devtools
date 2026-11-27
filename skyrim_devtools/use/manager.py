@@ -14,7 +14,7 @@ import subprocess
 import time
 
 from ..client import MAX_MESSAGE, TIMEOUT, ConnectionLost, RpcError, Session, observe
-from ..smoke import ACTIVE, WindowsHost
+from ..smoke import ACTIVE, LogonInactive, WindowsHost, require_active_logon
 from .health import HealthWatch
 
 KEEPALIVE_SECONDS = 15
@@ -247,6 +247,10 @@ class GameManager:
         with contextlib.suppress(Exception):
             # the previous game may still be exiting; an older host script has no idle action
             await self.host.wait_idle()
+        try:
+            await require_active_logon(self.host)
+        except LogonInactive as error:
+            raise GameError(str(error)) from None
         bootstrap = await self.host.command("start", mode=self.mode)
         self.session_id, self.token, self.port = bootstrap["sessionId"], bootstrap["token"], bootstrap["port"]
         self.stale_cleared = list(bootstrap.get("staleCleared") or [])
