@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from skyrim_devtools.client import BUILD, IMAGE_SHA256, INVENTORY, TIMEOUT, ConnectionLost, RpcError, Session
-from skyrim_devtools.smoke import Counts, LogonInactive, exercise, run
+from skyrim_devtools.smoke import Counts, LogonInactive, WindowsHost, exercise, host_error, run
 
 
 SESSION_ID = "0" * 32
@@ -369,3 +369,35 @@ class DevToolsSmokeTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+CLIXML_ERROR = (b'#< CLIXML\r\n<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04">'
+                b'<S S="Error">Steam runs under another account (Other (session 2)); the game cannot reach it; '
+                b'start refused_x000D__x000A_</S><S S="Error">At line:1 char:1_x000D__x000A_</S>'
+                b'<S S="Error">+ &amp; (Join-Path ...)_x000D__x000A_</S></Objs>')
+
+
+class HostErrorTest(unittest.IsolatedAsyncioTestCase):
+    def test_clixml_error_is_reduced_to_the_thrown_message(self):
+        self.assertEqual(host_error(CLIXML_ERROR),
+                         "Steam runs under another account (Other (session 2)); the game cannot reach it; start refused")
+
+    def test_plain_text_and_empty_stderr(self):
+        self.assertEqual(host_error(b"Interactive task is busy (Running)\nAt line:3 char:5\n"),
+                         "Interactive task is busy (Running)")
+        self.assertEqual(host_error(b""), "")
+
+    async def test_failed_host_command_carries_the_refusal(self):
+        class Failed:
+            returncode = 1
+
+            async def communicate(self):
+                return b"", CLIXML_ERROR
+
+        async def spawn(*args, **kwargs):
+            return Failed()
+
+        host = WindowsHost({"sshDestination": "tester@host"})
+        with patch("skyrim_devtools.smoke.asyncio.create_subprocess_exec", spawn):
+            with self.assertRaisesRegex(RuntimeError, "^Windows host start failed: Steam runs under another account"):
+                await host.command("start", mode="headless")
