@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('install-task', 'start', 'run', 'status', 'stop', 'evidence', 'crashes', 'active', 'idle',
+    [ValidateSet('install-task', 'start', 'run', 'status', 'stop', 'evidence', 'crashes', 'active', 'idle', 'logon',
                  'install-capture-task', 'capture-start', 'capture-run', 'capture-stop', 'capture-status',
                  'health', 'reset', 'restore-profile')]
     [string] $Action,
@@ -27,6 +27,20 @@ $lease = Join-Path $root 'active'
 $captureLease = Join-Path $root 'capture-active'
 $pin = '846efccf0c1374d71f892907f46549560f2fcb0a75cb87a3eed438baa0f1402f'
 $account = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+
+function Get-LogonSession {
+    # The interactive task runs in this account's own logon session. When that session is disconnected (another
+    # account holds the console) the game starts but has no display for its window and swap chain, and hangs
+    # before the main menu, headless or not. quser lists the session; a missing row or "Disc" is not usable, any
+    # other state (Active, or a localized word for it) is let through.
+    $name = ($account -split '\\')[-1]
+    # through cmd so the "no user exists" stderr and exit code cannot trip $ErrorActionPreference = 'Stop'
+    $rows = @(cmd.exe /c "quser `"$name`" 2>nul" | Select-Object -Skip 1)
+    $row = $rows | Where-Object { $_ -match ('^\s*>?' + [regex]::Escape($name) + '\s') } | Select-Object -First 1
+    if (!$row) { return @{ active = $false; state = 'none'; account = $name } }
+    $state = if ($row -match '\sDisc\s') { 'Disc' } elseif ($row -match '\sActive\s') { 'Active' } else { 'other' }
+    @{ active = ($state -ne 'Disc'); state = $state; account = $name }
+}
 
 function Read-Json($Path) {
     Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
@@ -860,6 +874,8 @@ switch ($Action) {
         $config = Read-Json (Join-Path $root 'config.json')
         $stale = Reset-StaleHost -MinAgeSeconds 90
         if ((Get-ScheduledTask -TaskName $taskName).State -ne 'Ready') { throw 'Interactive task is busy' }
+        $logon = Get-LogonSession
+        if (!$logon.active) { throw "The test account's logon session is not active ($($logon.state)); start refused" }
         # Never start next to somebody else's game or capture: refusing is the only action taken.
         if (Get-Process SkyrimSE, skse64_loader -ErrorAction SilentlyContinue) { throw 'A game or loader process is already running; start refused' }
         if ((Test-Path -LiteralPath $captureLease) -or (Get-ScheduledTask -TaskName $captureTask -ErrorAction SilentlyContinue).State -eq 'Running' -or
@@ -976,6 +992,9 @@ switch ($Action) {
             if ($text -match '^[a-f0-9]{32}$') { $id = $text }
         }
         @{ sessionId = $id } | ConvertTo-Json -Compress
+    }
+    'logon' {
+        Get-LogonSession | ConvertTo-Json -Compress
     }
     'idle' {
         # Idle means the lease is released and no game or loader process is left holding files.

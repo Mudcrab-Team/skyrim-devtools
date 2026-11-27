@@ -115,8 +115,11 @@ class FakeHost:
         self.grace = None
         self.health = {"running": False}
         self.stale = []
+        self.logon = {"active": True, "state": "Active", "account": "tester"}
 
     async def command(self, action, session_id="", mode="", grace=None, force=False):
+        if action == "logon":
+            return dict(self.logon)
         self.commands.append((action, mode))
         if action == "start":
             started = {"sessionId": SESSION, "token": TOKEN, "port": 4000}
@@ -194,6 +197,17 @@ class UseTests(unittest.TestCase):
             self.assertTrue(h.host.stopped)
             with self.assertRaises(Exception):
                 await h.text("snapshot")
+        run(scenario())
+
+    def test_start_refused_when_logon_session_is_disconnected(self):
+        async def scenario():
+            h = Harness()
+            h.host.logon = {"active": False, "state": "Disc", "account": "tester"}
+            with self.assertRaises(Exception) as caught:
+                await h.text("game_start")
+            self.assertIn("logon session is not active (state Disc)", str(caught.exception))
+            self.assertNotIn(("start", "headless"), h.host.commands)
+            self.assertEqual(h.sockets, [])
         run(scenario())
 
     def test_start_is_idempotent(self):

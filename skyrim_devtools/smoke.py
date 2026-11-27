@@ -18,7 +18,7 @@ from .logs import classify_outcome
 ACTIVE = {"starting", "running"}
 MENU_SETTLE = 0.4
 # read-only host actions are safe to repeat; the host can be briefly unreachable or mid-write of its state file
-READ_ONLY_ACTIONS = {"status", "evidence", "crashes", "active", "idle"}
+READ_ONLY_ACTIONS = {"status", "evidence", "crashes", "active", "idle", "logon"}
 READ_ATTEMPTS = 4
 READ_SETTLE = 1.5
 IDLE_TIMEOUT = 40.0
@@ -64,7 +64,7 @@ class WindowsHost:
             raise ValueError("Local port must be between 1024 and 65535")
 
     async def command(self, action, session_id="", mode="", grace=None, force=False):
-        if action not in {"start", "status", "stop", "evidence", "crashes", "health", "reset", "active", "idle"} or (session_id and not re.fullmatch("[a-f0-9]{32}", session_id)):
+        if action not in {"start", "status", "stop", "evidence", "crashes", "health", "reset", "active", "idle", "logon"} or (session_id and not re.fullmatch("[a-f0-9]{32}", session_id)):
             raise ValueError("Invalid Windows session operation")
         if mode not in {"", "headless", "windowed"}:
             raise ValueError("Invalid display mode")
@@ -170,6 +170,26 @@ class WindowsHost:
             "-L", f"127.0.0.1:{self.local_port}:127.0.0.1:{port}", self.destination,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+
+
+class LogonInactive(RuntimeError):
+    """The test account's Windows logon session cannot show a game (disconnected, or not logged on)."""
+
+
+async def require_active_logon(host):
+    """Refuse a launch up front when the test account's logon session is not active: the game would start in a
+    session without a display and hang before the main menu, headless or windowed. A host script without the
+    logon action (older install) is let through, as before."""
+    try:
+        logon = await host.command("logon")
+    except (RuntimeError, TimeoutError, ValueError, OSError):
+        return None
+    if isinstance(logon, dict) and logon.get("active") is False:
+        raise LogonInactive(
+            f"the test account's Windows logon session is not active (state {logon.get('state')}): the game cannot "
+            "create its window there, headless or not. Log that account on at the PC (or reconnect its session), "
+            "then start again")
+    return logon
 
 
 async def stop_outcome(host, state, session_id):
@@ -297,6 +317,7 @@ async def connect(connect_ws, local_port, token):
 async def run(host, connect_ws, counts, cycles, session_only, tab_trials=20, mode="", timings=None, screenshot=None):
     timings = {} if timings is None else timings
     began = asyncio.get_running_loop().time()
+    await require_active_logon(host)
     bootstrap = await host.command("start", mode=mode)
     session_id = bootstrap["sessionId"]
     token = bootstrap["token"]

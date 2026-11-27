@@ -31,6 +31,7 @@ server speaks plain stdio. When the client exits the server stops the game, so a
   opens. `wait_for(playable=true)` accounts for the fade; after `open_menu` wait for the menu, then give it a beat.
 * Do not close the socket without stopping through the host: the game exits on its own, and the host records
   that as `unrequested-exit`. `game_stop(grace_seconds=12)` closes open gameplay menus (quitting with the inventory open crashes the engine on one of its worker threads), asks the game to quit, kills it after the grace period, and reports `cleanExit` and `path` (`graceful`, `killed-after-Ns`, `closing-crashed`). A crash comes with `crash.log`: the crash logger's exception and top frames by module and Address Library id.
+* `game_start` and `skyrim-devtools-smoke` refuse at once when the test account's Windows logon session is not active (for example disconnected because another account holds the console): a game started there has no display and hangs before the main menu, headless or windowed. Log that account on at the PC, then start again. A host script without the `logon` action is not checked.
 * The engine sometimes dies about a second after launch (null call on its audio thread, before any plugin code runs; about 1 start in 15). `game_start` repeats such a start up to twice and lists the crashes under `startRetries`.
 
 ## Tools

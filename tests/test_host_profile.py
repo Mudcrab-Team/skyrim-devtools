@@ -35,6 +35,13 @@ class ProfileLifecycleStructure(unittest.TestCase):
     def test_stale_host_reset_restores_the_profile(self):
         self.assertIn("Exit-IsolatedProfile", function_body("Reset-StaleHost"))
 
+    def test_start_refuses_an_inactive_logon_session_before_launching(self):
+        start = TEXT.index("    'start' {")
+        body = TEXT[start:TEXT.index("    'health' {", start)]
+        self.assertLess(body.index("Get-LogonSession"), body.index("Start-ScheduledTask"))
+        self.assertIn("'logon'", TEXT[:TEXT.index("[string] $Action")])
+        self.assertIn("'Disc'", function_body("Get-LogonSession"))
+
     def test_restore_action_exists(self):
         self.assertIn("'restore-profile'", TEXT)
 
